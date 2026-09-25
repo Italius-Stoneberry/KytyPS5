@@ -1167,6 +1167,13 @@ void TestNativeShaderResourceDependencies() {
 }
 
 void TestNormalizedImageContracts() {
+  using Libs::Graphics::ImageSubresources;
+  Check(!ImageSubresources{2, 1}.Contains({1, 360}) &&
+            !ImageSubresources{1, 360}.Contains({2, 1}) &&
+            ImageSubresources{2, 360}.Contains({1, 360}) &&
+            ImageSubresources{2, 360}.Contains({2, 1}) &&
+            ImageSubresources{2, 360}.Contains({2, 360}),
+        "independent mip/layer capacity check failed");
   ImageInfo container{};
   container.data = {0x10000, 0x15000};
   container.pixel_format = vk::Format::eR8G8B8A8Unorm;

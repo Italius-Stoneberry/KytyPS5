@@ -34,6 +34,9 @@ struct ImageSubresources {
 	uint32_t levels                                      = 1;
 	uint32_t layers                                      = 1;
 	auto     operator<=>(const ImageSubresources&) const = default;
+	[[nodiscard]] constexpr bool Contains(const ImageSubresources& other) const noexcept {
+		return levels >= other.levels && layers >= other.layers;
+	}
 };
 
 struct ImageSubresourceRange {

@@ -710,7 +710,7 @@ static bool GrowImageToLayers(ImageInfo& info, uint32_t layers) {
 		if (range.Empty()) {
 			return true;
 		}
-		if (range.size % current != 0) {
+		if (range.size % current != 0 || range.size / current > UINT64_MAX / layers) {
 			return false;
 		}
 		range.size = range.size / current * layers;
@@ -765,7 +765,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	        cached.info.data.size / cached.info.resources.layers &&
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    !cached.info.HasMetadata();
-	bool recreate = cached.info.resources < requested.resources;
+	bool recreate = !cached.info.resources.Contains(requested.resources);
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
@@ -788,13 +788,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.data       = cached.info.data;
 		info.resources  = cached.info.resources;
 		info.mip_layout = cached.info.mip_layout;
-	} else {
-		auto merged = std::max(requested.resources, cached.info.resources);
-		if (merged.layers > requested.resources.layers &&
-		    !GrowImageToLayers(info, merged.layers)) {
-			merged.layers = requested.resources.layers;
-		}
-		info.resources = merged;
+	} else if (cached.info.resources.layers > requested.resources.layers) {
+		// Extend only a layout whose byte ranges can actually be grown. Mip and
+		// layer counts are independent capacities, not a lexicographic maximum;
+		// importing cached mip counts would leave the requested layout invalid.
+		(void)GrowImageToLayers(info, cached.info.resources.layers);
 	}
 	info.htile_clear_mask     = 0;
 	const auto replacement_id = InsertImage(info);
@@ -804,6 +802,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		cached.binding.needs_rebind = true;
 	}
 	if (cached.backing.samples == replacement.backing.samples) {
+		if (!cached.info.resources.Contains(info.resources)) {
+			// A copy covers only common subresources. Seed newly added layers/mips
+			// from their guest backing before retaining the existing native contents.
+			InitializeImage(replacement_id);
+		}
 		const bool copy_supported =
 		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
 		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
@@ -893,7 +896,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
-		if (requested.type == cached.info.type && requested.resources > cached.info.resources) {
+		if (requested.type == cached.info.type && !cached.info.resources.Contains(requested.resources)) {
 			return {ExpandImage(requested, cached_id)};
 		}
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
@@ -1375,7 +1378,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (!resolved.info.resources.Contains(desc.info.resources)) {
 				FreeImage(result);
 				result = {};
 			}

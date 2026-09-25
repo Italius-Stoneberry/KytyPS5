@@ -4515,6 +4515,45 @@ public:
       Require(name, "resampled array", resampled_id == target_id,
               "the sampled array no longer matches the grown depth image");
 
+      // Regression for the observed D16 view crash: two mips in one layer
+      // cannot satisfy a one-mip, 360-layer view even at the same address/size.
+      ImageDesc narrow{};
+      narrow.type = BindingType::Texture;
+      narrow.info.data = {base + 0x2000000, 360 * 256};
+      narrow.info.pixel_format = vk::Format::eD16Unorm;
+      narrow.info.guest_format = Prospero::BufferFormat::k16UNorm;
+      narrow.info.type = Prospero::ImageType::kColor2D;
+      narrow.info.extent = {2, 2, 1};
+      narrow.info.resources = {2, 1};
+      narrow.info.pitch = 2;
+      narrow.info.bytes_per_block = 2;
+      narrow.info.samples = 1;
+      narrow.info.tile_mode = Prospero::TileMode::kLinear;
+      narrow.info.mip_layout[0] = {0, 8, 2, 2};
+      narrow.info.mip_layout[1] = {8, 2, 1, 1};
+      narrow.view_info.format = vk::Format::eD16Unorm;
+      narrow.view_info.type = vk::ImageViewType::e2D;
+      narrow.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      narrow.view_info.level_count = 2;
+      narrow.view_info.layer_count = 1;
+      narrow.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      std::memset(reinterpret_cast<void *>(narrow.info.data.address), 0, narrow.info.data.size);
+      const auto narrow_id = texture_cache.FindImage(narrow);
+      (void)texture_cache.FindTexture(narrow_id, narrow);
+      auto array = narrow;
+      array.info.resources = {1, 360};
+      array.info.mip_layout = {};
+      array.info.mip_layout[0] = {0, array.info.data.size, 2, 2};
+      array.view_info.type = vk::ImageViewType::e2DArray;
+      array.view_info.level_count = 1;
+      array.view_info.layer_count = 360;
+      const auto array_id = texture_cache.FindImage(array);
+      const auto array_view = texture_cache.FindTexture(array_id, array);
+      Require(name, "D16 360-layer view", array_id != narrow_id && array_view != nullptr &&
+                  texture_cache.GetImage(array_id).backing.layers == 360 &&
+                  texture_cache.GetImage(array_id).backing.mip_levels >= 1,
+              "mip count hid insufficient native layers when creating a real D16 array view");
+
       resources.SetGpu(nullptr);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -6350,6 +6389,16 @@ public:
                                                  0.5f, 0.625f, 0.75f, 0.875f,
                                                  1.0f, 0.0625f};
       std::memset(memory + layered_offset, 0, layered_guest_size);
+      // The requested one-mip depth layout has four 512-byte slices. Extra
+      // layers must be uploaded from guest memory, not left undefined by the
+      // copy of the two existing native layers.
+      for (uint32_t layer = 2; layer < 4; ++layer) {
+        for (uint32_t pixel = 0; pixel < 4; ++pixel) {
+          const float value = layer == 2 ? 0.8125f : 0.9375f;
+          std::memcpy(memory + layered_offset + layer * (layered_guest_size / 4) + pixel * 4,
+                      &value, sizeof(value));
+        }
+      }
       const auto layered_layout = TextureCalcUploadLayout(
           Prospero::BufferFormat::k32Float, 2, 2, 2, 2,
           Prospero::TileMode::kLinear, layered_guest_size, true, false,
@@ -6377,6 +6426,15 @@ public:
           }
         }
       }
+      std::array<float, 16> layered_expected{};
+      std::copy_n(layered_values.begin(), 8, layered_expected.begin());
+      // Color mip rows are padded and overlap some of the seeded depth bytes.
+      // Snapshot the final guest bytes before GPU ownership, using the requested
+      // depth layout, rather than assuming the earlier seeds survived that write.
+      for (uint32_t layer = 2; layer < 4; ++layer) {
+        std::memcpy(layered_expected.data() + layer * 4,
+                    memory + layered_offset + layer * (layered_guest_size / 4), 4 * sizeof(float));
+      }
       auto layered_color = MakeLinearDesc(
           base + layered_offset, layered_guest_size, vk::Format::eR32Sfloat,
           Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
@@ -6391,23 +6449,27 @@ public:
       auto layered_depth = layered_color;
       layered_depth.type = BindingType::DepthTarget;
       layered_depth.info.resources = {1, 4};
+      layered_depth.info.mip_layout = {};
+      layered_depth.info.mip_layout[0] = {0, layered_guest_size, 2, 2};
       layered_depth.view_info.level_count = 1;
+      layered_depth.view_info.layer_count = 4;
       layered_depth.info.pixel_format = vk::Format::eD32Sfloat;
       layered_depth.view_info.format = vk::Format::eD32Sfloat;
       layered_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       layered_depth.view_info.usage =
           vk::ImageUsageFlagBits::eDepthStencilAttachment;
       const auto layered_depth_image = texture_cache.FindImage(layered_depth);
+      const auto layered_depth_view = texture_cache.FindDepthTarget(layered_depth_image, layered_depth);
       const auto &layered_native = texture_cache.GetImage(layered_depth_image);
       Require(name, "layered mipped depth alias",
               layered_depth_image != layered_color_image &&
-                  layered_native.backing.layers == 2 &&
-                  layered_native.backing.mip_levels == 2 &&
+                  layered_depth_view != nullptr &&
+                  layered_native.backing.layers == 4 &&
+                  layered_native.backing.mip_levels == 1 &&
                   layered_native.info.resources ==
-                      layered_color.info.resources &&
+                      layered_depth.info.resources &&
                   layered_native.IsGpuModified(),
-              "depth/color conversion did not use the lexicographic "
-              "resource maximum");
+              "depth/color conversion did not provide the requested mip/layer capacity");
       const volatile auto layered_guest_byte =
           *reinterpret_cast<const volatile uint8_t *>(memory + layered_offset);
       (void)layered_guest_byte;
@@ -6698,25 +6760,19 @@ public:
                       vk::AccessFlagBits::eTransferWrite);
 
       auto layered_readback = CreateHostBuffer(
-          name, sizeof(layered_values), vk::BufferUsageFlagBits::eTransferDst,
-          std::vector<u32>(sizeof(layered_values) / sizeof(u32), 0));
+          name, 16 * sizeof(float), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(16, 0));
       auto &layered_depth_native = texture_cache.GetImage(layered_depth_image);
       layered_depth_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
                                    vk::AccessFlagBits2::eTransferRead, {},
                                    command.Handle());
-      std::array<vk::BufferImageCopy, 2> layered_copies{};
+      std::array<vk::BufferImageCopy, 1> layered_copies{};
       layered_copies[0].bufferOffset = 0;
       layered_copies[0].imageSubresource.aspectMask =
           vk::ImageAspectFlagBits::eDepth;
       layered_copies[0].imageSubresource.mipLevel = 0;
-      layered_copies[0].imageSubresource.layerCount = 2;
+      layered_copies[0].imageSubresource.layerCount = 4;
       layered_copies[0].imageExtent = {2, 2, 1};
-      layered_copies[1].bufferOffset = 32;
-      layered_copies[1].imageSubresource.aspectMask =
-          vk::ImageAspectFlagBits::eDepth;
-      layered_copies[1].imageSubresource.mipLevel = 1;
-      layered_copies[1].imageSubresource.layerCount = 2;
-      layered_copies[1].imageExtent = {1, 1, 1};
       command.Handle().copyImageToBuffer(
           layered_depth_native.backing.image,
           vk::ImageLayout::eTransferSrcOptimal, layered_readback.buffer,
@@ -6934,20 +6990,17 @@ public:
               "GPU BGRA16 swap did not publish RGBA half-word order");
       scheduler.Finish();
       const auto layered_words =
-          ReadBuffer(name, layered_readback, layered_values.size());
-      const std::array<float, 10> layered_expected{
-          layered_values[0], layered_values[1], layered_values[2],
-          layered_values[3], layered_values[4], layered_values[5],
-          layered_values[6], layered_values[7], layered_values[8],
-          layered_values[9]};
+          ReadBuffer(name, layered_readback, 16);
       bool layered_content = layered_words.size() == layered_expected.size();
-      for (uint32_t index = 0;
-           layered_content && index < layered_expected.size(); index++) {
-        layered_content &=
-            layered_words[index] == std::bit_cast<u32>(layered_expected[index]);
+      for (uint32_t index = 0; index < layered_words.size() && index < layered_expected.size(); index++) {
+        if (layered_words[index] != std::bit_cast<u32>(layered_expected[index])) {
+          std::fprintf(stderr, "layered depth pixel %u: actual=%08x expected=%08x\n", index,
+                       layered_words[index], std::bit_cast<u32>(layered_expected[index]));
+          layered_content = false;
+        }
       }
       Require(name, "layered mipped depth content", layered_content,
-              "depth/color conversion changed a mip or array-layer value");
+              "depth/color conversion lost copied native layers or newly uploaded guest layers");
       const std::array<std::array<float, 4>, 2> expected_ms_depth{{
           {0x2000 / 65535.0f, 0xe000 / 65535.0f, 0.0f, 0.0f},
           {0.0f, 0x4000 / 65535.0f, 0x8000 / 65535.0f, 1.0f},
@@ -28437,7 +28490,12 @@ void CheckDepthTargetFootprints() {
   Require("DepthTargetFootprints", "lexicographic subresource comparison",
           ImageSubresources{2, 1} > ImageSubresources{1, 4} &&
               ImageSubresources{1, 4} < ImageSubresources{2, 1},
-          "subresource ordering diverged from required overlap semantics");
+          "subresource ordering diverged from lexicographic ordering");
+  Require("DepthTargetFootprints", "independent subresource capacity",
+          !ImageSubresources{2, 1}.Contains({1, 360}) &&
+              !ImageSubresources{1, 360}.Contains({2, 1}) &&
+              ImageSubresources{2, 360}.Contains({1, 360}),
+          "mip ordering hid insufficient array-layer capacity");
   struct TransferPlaneCase {
     const char *name;
     vk::Format attachment;
