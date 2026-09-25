@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "native-buffer-residency.h"
+#include "live-census.h"
+#include "live-counters.h"
 #include "native-resource-state.h"
 #include "gpu_tiler_shaders/lod_stats_pack_spv.h"
 
@@ -185,6 +187,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// Subsequent accesses to this window must retire this request before proceeding.
 	m_guest_readbacks[slot] = request;
 	m_active_guest_readbacks |= 1u << slot;
+	LiveCounters::Add(LiveCounters::AsyncReadbacks);
 	return request;
 }
 
@@ -222,7 +225,11 @@ void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_r
 void BufferCache::FinishGuestReadback(size_t slot) {
 	auto request = m_guest_readbacks[slot];
 	if (!request) return;
-	while (!request->copied.load(std::memory_order_acquire)) request->copied.wait(false);
+	if (!request->copied.load(std::memory_order_acquire)) {
+		LiveCensus::Scope census(LiveCensus::ReadbackWait, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+		                         reinterpret_cast<uint64_t>(__builtin_return_address(1)));
+		while (!request->copied.load(std::memory_order_acquire)) request->copied.wait(false);
+	}
 	for (const auto& part: request->parts) m_gpu_modified_ranges.Subtract(part.address, part.size);
 	// The renderer may have dirtied other pages in the widened window since handoff.
 	for (const auto& page: request->pages)
@@ -753,6 +760,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		    });
 	    });
 	if (!copies.empty()) {
+		LiveCounters::Add(LiveCounters::SyncDownloads);
 		DownloadBufferMemory(copies);
 		// The enumeration covered whole dirty pages and every exact interval on them.
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
@@ -931,6 +939,14 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                                      uint64_t total_size) {
 	if (copies.empty()) {
 		return nullptr;
+	}
+	LiveCounters::Add(LiveCounters::UploadCopies, copies.size());
+	LiveCounters::Add(LiveCounters::UploadBytes, total_size);
+	if (LiveCounters::g_granules_on.load(std::memory_order_relaxed)) {
+		for (const auto& copy: copies) {
+			LiveCounters::AddGranule(buffer.CpuAddress() + copy.dstOffset, LiveCounters::GUploadBytes, copy.size);
+			LiveCounters::AddGranule(buffer.CpuAddress() + copy.dstOffset, LiveCounters::GUploadCalls, 1);
+		}
 	}
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);

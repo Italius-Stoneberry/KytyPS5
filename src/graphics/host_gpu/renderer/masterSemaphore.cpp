@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "live-census.h"
 
 namespace Libs::Graphics {
 
@@ -44,6 +45,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		return;
 	}
 
+	LiveCensus::Scope census(LiveCensus::GpuWait, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+	                         reinterpret_cast<uint64_t>(__builtin_return_address(1)));
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;

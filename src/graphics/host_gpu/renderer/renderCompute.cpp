@@ -26,6 +26,7 @@
 #include "libs/errno.h"
 #include "native-preparation-state.h"
 #include "xpr-capture.h"
+#include "live-census.h"
 
 #include <algorithm>
 #include <array>
@@ -34,6 +35,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -295,6 +297,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
+	LiveCensus::Scope census(LiveCensus::Dispatch, sh_ctx.GetCs().cs_regs.data_addr, indirect_args != 0);
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
@@ -338,8 +341,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetNativeStageInput(input_info);
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	const auto census_shader = sh_ctx.GetCs().cs_regs.data_addr;
+	std::optional<LiveCensus::Scope> phase;
+	phase.emplace(LiveCensus::DispatchPhase, census_shader, 0);
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	phase.emplace(LiveCensus::DispatchPhase, census_shader, 1);
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -470,15 +477,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	phase.emplace(LiveCensus::DispatchPhase, census_shader, 2);
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
+	phase.emplace(LiveCensus::DispatchPhase, census_shader, 3);
 	NativePreparationScratch<PreparedBindings> binding_storage(
 	    kyty_local_binding_scratch_mode.load(std::memory_order_relaxed) != 0);
 	auto& bindings = binding_storage.Get();
 	PrepareBindingsInto(input_info.stage, bindings);
+	phase.emplace(LiveCensus::DispatchPhase, census_shader, 4);
 	FindBuffers(bindings);
+	phase.emplace(LiveCensus::DispatchPhase, census_shader, 5);
 	PrepareBdaBindings(bindings);
+	phase.emplace(LiveCensus::DispatchPhase, census_shader, 6);
 	// Materialize the persistent argument owner before final descriptor handles:
 	// a tiny CPU upload must not leave an indirect command using a stream slice
 	// that can be retired when preparation rotates the command buffer.
@@ -486,7 +498,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.GetBufferCache().EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
 	}
 	RebindBuffers(bindings);
+	phase.emplace(LiveCensus::DispatchPhase, census_shader, 7);
 	RebindImages(bindings);
+	phase.emplace(LiveCensus::DispatchPhase, census_shader, 8);
 	if (XprCapture::Enabled() && XprCapture::IsCullProgram(program.shader_hash)) {
 		for (size_t i = 0; i < program.info.buffers.size(); ++i) {
 			if (program.info.buffers[i].written) {
@@ -510,6 +524,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u}, chain);
+	phase.emplace(LiveCensus::DispatchPhase, census_shader, 9);
 	const bool continues_chain = chain && buffer.ComputeChainPending();
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
@@ -557,6 +572,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	ResetBindings();
 	m_context.GetCommandScheduler().CompleteDispatch();
+	phase.reset();
 }
 
 } // namespace Libs::Graphics

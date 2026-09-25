@@ -155,6 +155,12 @@ public:
 
 	[[nodiscard]] constexpr bool Any() const { return !None(); }
 
+	[[nodiscard]] constexpr size_t Count() const {
+		size_t count = 0;
+		for (const auto word: m_data) count += static_cast<size_t>(std::popcount(word));
+		return count;
+	}
+
 	// Test a half-open interval without constructing a full masked bit array.
 	[[nodiscard]] constexpr bool AnyInRange(size_t start, size_t end) const {
 		if (start >= end || end > N) return false;

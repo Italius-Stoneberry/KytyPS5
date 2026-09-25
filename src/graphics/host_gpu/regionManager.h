@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "live-counters.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -155,6 +156,13 @@ private:
 		m_writable = m_cpu_dirty;
 		if (mask.None()) {
 			return;
+		}
+		LiveCounters::Add(track ? LiveCounters::Reprotect : LiveCounters::Unprotect);
+		LiveCounters::Add(track ? LiveCounters::ReprotectPages : LiveCounters::UnprotectPages, mask.Count());
+		if (track && LiveCounters::g_granules_on.load(std::memory_order_relaxed)) {
+			for (const auto [start, end]: mask) {
+				LiveCounters::AddGranule(m_cpu_addr + start * TRACKER_PAGE_SIZE, LiveCounters::GReprotectPages, end - start);
+			}
 		}
 		m_page_manager.UpdatePageWatchersForRegion<track>(m_cpu_addr, mask);
 	}

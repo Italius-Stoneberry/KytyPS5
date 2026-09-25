@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
+#include "live-counters.h"
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -72,10 +73,15 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		if (TryInvalidateCpuWriteWindow(fault_vaddr)) return true;
+		if (TryInvalidateCpuWriteWindow(fault_vaddr)) {
+			LiveCounters::Add(LiveCounters::WindowFault);
+			return true;
+		}
+		LiveCounters::Add(LiveCounters::WriteFault);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		LiveCounters::Add(LiveCounters::ReadFault);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;

@@ -1,4 +1,6 @@
 #include "kernel/memory.h"
+#include "live-census.h"
+#include "live-counters.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"

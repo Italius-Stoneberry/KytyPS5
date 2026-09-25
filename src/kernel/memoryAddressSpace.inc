@@ -940,6 +940,8 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
+		LiveCounters::Add(LiveCounters::ProtectCalls);
+		if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::ProtectCallsRender);
 
 		std::lock_guard lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
