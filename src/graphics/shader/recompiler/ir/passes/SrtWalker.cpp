@@ -121,6 +121,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::IEqual32:
 		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::UGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
@@ -721,6 +722,7 @@ private:
 			return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
 		};
 		switch (inst.GetOpcode()) {
+			case ValueOpcode::Identity: return Arg(inst, 0, result);
 			case ValueOpcode::GetUserData: {
 				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
 				if (reg < m_program.user_data_base ||
@@ -1028,6 +1030,12 @@ private:
 			case ValueOpcode::UGreaterThan32:
 				if (binary()) {
 					result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
+					return true;
+				}
+				return false;
+			case ValueOpcode::UGreaterThanEqual32:
+				if (binary()) {
+					result = static_cast<uint32_t>(a) >= static_cast<uint32_t>(b);
 					return true;
 				}
 				return false;

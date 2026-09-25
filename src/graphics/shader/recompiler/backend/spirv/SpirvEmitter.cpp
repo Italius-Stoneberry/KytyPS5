@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -73,6 +74,12 @@ void ValidateNativeProgram(const IR::Program& program) {
 	}
 	if (uses_gds) {
 		Expect(Kind::Gds);
+	}
+	if (program.bindings.lod_stats_count != 0) {
+		if (program.stage != ShaderType::Pixel || program.bindings.lod_stats_count != program.info.images.size()) {
+			Fail(program, "LOD feedback metadata does not match pixel images");
+		}
+		Expect(Kind::LodStats);
 	}
 	if (program.info.uses_dma) {
 		Expect(Kind::BdaPagetable);
@@ -320,7 +327,10 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
-	state.stage = program.stage;
+	state.stage     = program.stage;
+	state.lod_stats_subgroup = program.bindings.lod_stats_count != 0 &&
+	    input_info.pixel != nullptr && input_info.pixel->lod_stats_subgroup;
+
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
