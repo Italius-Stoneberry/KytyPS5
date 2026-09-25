@@ -10,6 +10,8 @@
 #include <optional>
 
 extern "C" {
+// Dispatches recorded per submission (KYTY_DISPATCH_BATCH).
+volatile std::atomic_uint32_t kyty_local_dispatch_batch {32};
 // 0: refresh the master timeline before every drain attempt.
 // 1: prove the pending-operation queue empty before the timeline query and the
 //    operation lock. Draws and dispatches call this with nothing to retire.
@@ -109,8 +111,14 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 void CommandScheduler::CompleteDispatch() {
 	// Expose command-processor/GPU overlap without a host fence. Bound the
 	// recording batch; resource retirement still uses the submission timeline.
-	constexpr uint32_t DispatchesPerSubmission = 32;
-	if (++m_recorded_dispatches < DispatchesPerSubmission) return;
+	// The boundary costs one all-commands dependency, which lets no part of the
+	// next batch begin before this one drains, so its size trades that drain
+	// against how early the queue receives work. Dispatches inside a batch keep
+	// the same chain barriers at any size.
+	const auto batch = kyty_local_dispatch_batch.load(std::memory_order_relaxed);
+	if (++m_recorded_dispatches < std::clamp(batch, 1u, 65536u)) {
+		return;
+	}
 	CheckActive();
 	m_command.EndRendering();
 	VulkanMemoryBarrier dependency {};
@@ -121,6 +129,7 @@ void CommandScheduler::CompleteDispatch() {
 	                                   0, nullptr, 0, nullptr);
 	Flush();
 }
+
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
 }

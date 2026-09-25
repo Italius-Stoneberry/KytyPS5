@@ -2449,6 +2449,38 @@ public:
         std::ranges::find(blocked_handles, scheduler.Current().Handle()) !=
             blocked_handles.end(),
         "completed command buffers were not reused after timeline progress");
+
+    // Exercise resource versions across automatic compute-batch submissions.
+    // Each copy must retain its own value even though the producer is reused.
+    constexpr uint32_t version_count = 1027;
+    Libs::Graphics::Buffer producer(
+        m_runtime_context, scheduler, MemoryUsage::DeviceLocal, 0,
+        vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, 4);
+    Libs::Graphics::Buffer versions(
+        m_runtime_context, scheduler, MemoryUsage::Download, 0,
+        vk::BufferUsageFlagBits::eTransferDst, version_count * 4);
+    uint32_t retired = 0;
+    scheduler.DeferOperation([&retired] { ++retired; });
+    for (uint32_t i = 0; i < version_count; ++i) {
+      producer.Fill(0, 4, 0xc0de0000u + i);
+      versions.CopyFrom(scheduler.Current(), producer, 0, i * 4, 4,
+                        vk::AccessFlagBits::eMemoryWrite, {},
+                        vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+                        vk::AccessFlagBits::eHostRead);
+      scheduler.CompleteDispatch();
+    }
+    Require("SchedulerTimeline", "batch retirement boundary", retired == 0,
+            "automatic submission ran a resource callback inside an operation");
+    scheduler.Finish();
+    versions.Invalidate(0, versions.Size());
+    for (uint32_t i = 0; i < version_count; ++i) {
+      uint32_t value = 0;
+      std::memcpy(&value, versions.Mapped().data() + i * 4, 4);
+      Require("SchedulerTimeline", "batch resource versions", value == 0xc0de0000u + i,
+              "automatic submission lost a GPU dependency or resource version");
+    }
+    Require("SchedulerTimeline", "batch retirement completion", retired == 1,
+            "completed automatic submissions did not retire their resource");
     scheduler.Shutdown();
 
     CommandScheduler draining(Renderer(), m_runtime_context);

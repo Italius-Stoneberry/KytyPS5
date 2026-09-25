@@ -23,6 +23,7 @@ extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
 extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
 extern volatile std::atomic_uint32_t kyty_local_pending_drain_mode;
+extern volatile std::atomic_uint32_t kyty_local_dispatch_batch;
 extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 }
 
@@ -55,6 +56,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
+	    // Dispatches recorded per submission.
+	    Switch {"KYTY_DISPATCH_BATCH", &kyty_local_dispatch_batch, 1, 65536},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {
