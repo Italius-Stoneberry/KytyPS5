@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
+#include "native-preparation-scratch.h"
 
 #include <algorithm>
 #include <array>
@@ -35,6 +36,14 @@ struct IndirectImage {
 struct MaterializedSnapshot {
 	ResourceSnapshot           resources;
 	std::vector<IndirectImage> indirect_images;
+};
+
+struct MaterializeWorkspace {
+	MaterializedSnapshot materialized;
+	ResourceSpecialization specialization;
+	std::vector<DescriptorValue> values;
+	std::vector<uint32_t> flattened_srt;
+	std::vector<uint8_t> active_sources;
 };
 
 bool SpecializationFail(MaterializeReport* report, std::string_view message) {
@@ -559,7 +568,12 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 } // namespace
 
 static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& runtime,
-                                MaterializedSnapshot& snapshot, MaterializeReport* report) {
+                                MaterializeWorkspace& workspace, MaterializeReport* report) {
+	auto& snapshot = workspace.materialized;
+	// A previous failed transaction must not supply state to this invocation.
+	snapshot.indirect_images.clear();
+	snapshot.resources.uniform_fill = {};
+	snapshot.resources.images.clear();
 	const auto fail = [report](const char* why) {
 		if (report != nullptr) {
 			report->reason = why;
@@ -573,9 +587,9 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	if (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr) {
 		return fail("indirect image needs a specialization memory reader");
 	}
-	std::vector<DescriptorValue> values;
-	std::vector<uint32_t>        flattened_srt;
-	std::vector<uint8_t>         active_sources;
+	auto& values = workspace.values;
+	auto& flattened_srt = workspace.flattened_srt;
+	auto& active_sources = workspace.active_sources;
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
 	                            flattened_srt, program.clean_flat_slots, active_sources)) {
 		return fail("a descriptor source did not evaluate");
@@ -596,7 +610,7 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	auto cursor = values.begin();
 	next.buffers.assign(cursor, cursor + program.info.buffers.size());
 	cursor += program.info.buffers.size();
-	next.flattened_srt = std::move(flattened_srt);
+	next.flattened_srt.swap(flattened_srt);
 	next.images.resize(program.info.images.size());
 	for (uint32_t image_index = 0; image_index < program.info.images.size(); image_index++) {
 		const auto& image  = program.info.images[image_index];
@@ -695,12 +709,15 @@ struct ImageRemap {
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
 
-static bool BuildResourceSpecialization(const ResourcePlan& program, MaterializedSnapshot snapshot,
+static bool BuildResourceSpecialization(const ResourcePlan& program, MaterializeWorkspace& workspace,
                                         ResourceSnapshot&       specialized_snapshot,
                                         ResourceSpecialization& specialization,
                                         MaterializeReport*      report) {
-	auto                   next_snapshot = std::move(snapshot.resources);
-	ResourceSpecialization next_specialization;
+	auto& snapshot            = workspace.materialized;
+	auto& next_snapshot       = snapshot.resources;
+	auto& next_specialization = workspace.specialization;
+	next_specialization.buffers.clear();
+	next_specialization.images.clear();
 	next_specialization.buffers.reserve(program.info.buffers.size());
 	size_t image_count   = program.info.images.size();
 	size_t mapping_words = 0;
@@ -930,8 +947,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		}
 	}
 	ImageRemap(next_specialization).Apply(next_snapshot.images);
-	specialization       = std::move(next_specialization);
-	specialized_snapshot = std::move(next_snapshot);
+	// Publish only after all validation succeeds. Returning the old destination
+	// storage to the workspace retains capacity without caching mutable contents.
+	std::swap(specialization, next_specialization);
+	std::swap(specialized_snapshot, next_snapshot);
 	return true;
 }
 
@@ -1294,12 +1313,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (report != nullptr) {
 		*report = {};
 	}
-	MaterializedSnapshot materialized;
-	if (!MaterializeSnapshot(program, runtime, materialized, report)) {
+	NativePreparationScratch<MaterializeWorkspace> storage;
+	auto& workspace = storage.Get();
+	if (!MaterializeSnapshot(program, runtime, workspace, report)) {
 		return false;
 	}
-	return BuildResourceSpecialization(program, std::move(materialized), snapshot, specialization,
-	                                   report);
+	return BuildResourceSpecialization(program, workspace, snapshot, specialization, report);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

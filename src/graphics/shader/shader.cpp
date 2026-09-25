@@ -1,4 +1,5 @@
 #include "graphics/shader/shader.h"
+#include "native-preparation-state.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -532,7 +533,7 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 	                                   ShaderVertexInputInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 
-	info = {};
+	ResetNativeVertexInput(info);
 
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
@@ -588,7 +589,7 @@ static void ShaderGetStaticInputInfoPS(
 	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
-	ps_info = {};
+	ResetNativeStageInput(ps_info);
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 
 	// SPI_PS_IN_CONTROL.NUM_INTERP occupies bits 5:0. Keep the remaining control
@@ -640,7 +641,7 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
 	const auto host_subgroup_size         = info.host_subgroup_size;
-	info                                  = {};
+	ResetNativeStageInput(info);
 	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
 	info.host_subgroup_size               = host_subgroup_size;
 	info.threads_num[0]                   = regs.cs_regs.num_thread_x;
@@ -773,7 +774,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
 	// its user-data pointer in s0:s1.
 	params.user_data.insert(params.user_data.begin(), 8u, 0u);
-	info                     = {};
+	ResetNativeVertexInput(info);
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
 	mesh.input_primitive     = static_cast<uint32_t>(user_config.GetPrimType());

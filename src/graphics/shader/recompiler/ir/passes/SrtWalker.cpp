@@ -12,6 +12,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+extern "C" {
+volatile std::atomic<uint32_t> kyty_local_preparation_scratch_mode {0};
+}
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 

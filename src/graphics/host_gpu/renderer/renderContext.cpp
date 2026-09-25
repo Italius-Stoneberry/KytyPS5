@@ -11,7 +11,8 @@
 namespace Libs::Graphics {
 
 RenderContext::RenderContext(GraphicContext& graphics)
-    : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
+    : m_graphics(graphics), m_render_executor(*this), m_compute_render_executor(*this),
+      m_command_scheduler(*this, graphics),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_gpu_resources(graphics, m_command_scheduler) {

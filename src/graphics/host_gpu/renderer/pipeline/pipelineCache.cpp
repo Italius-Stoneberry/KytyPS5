@@ -18,6 +18,7 @@
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
+#include "native-preparation-scratch.h"
 
 #include <algorithm>
 #include <array>
@@ -337,8 +338,17 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
-		ShaderRecompiler::IR::ResourceSnapshot       resources;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderRecompiler::IR::ResourceSnapshot temporary_resources;
+		auto& resources = NativePreparationScratchEnabled() ? input_info.stage.resources
+		                                                    : temporary_resources;
+		NativePreparationScratch<ShaderRecompiler::IR::ResourceSpecialization> specialization_storage;
+		auto& specialization = specialization_storage.Get();
+		const auto publish_stage = [&](const auto& program) {
+			if (&resources != &input_info.stage.resources) {
+				input_info.stage.resources = std::move(resources);
+			}
+			input_info.stage.program = &program;
+		};
 		const ShaderRecompiler::IR::SrtRuntime input_runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
@@ -364,8 +374,7 @@ struct PipelineCache::ProgramCache {
 				               candidate.specialization == specialization;
 			        });
 			    permutation != entry->second.permutations.end()) {
-				input_info.stage = {.program   = &permutation->program,
-				                    .resources = std::move(resources)};
+				publish_stage(permutation->program);
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -411,7 +420,7 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();
-		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
+		publish_stage(permutation.program);
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> counts {};

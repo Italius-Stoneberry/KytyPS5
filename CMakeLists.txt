@@ -339,6 +339,7 @@ endif()
 
 set(inc_headers
 	${KYTY_SOURCE_DIR}
+	${KYTY_SOURCE_DIR}/local
 	${KYTY_THIRD_PARTY_DIR}/SDL2/include
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
@@ -716,6 +717,25 @@ if(APPLE)
 endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
+
+# Linux x86_64 only: the native resource preparation tests.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+	foreach(native_resource_target kyty_emulator shader_recompiler_compute_tests shader_cfg_tests
+			resource_tracking_tests resource_materialization_tests)
+		target_compile_definitions(${native_resource_target} PRIVATE KYTY_LOCAL_NATIVE_RESOURCES=1)
+		target_link_libraries(${native_resource_target} ${CMAKE_DL_LIBS})
+	endforeach()
+	if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_LINKER MATCHES "ld.lld$")
+		# Clang otherwise selected GNU ld/LLVMgold despite CMAKE_LINKER, which
+		# crashed linking these large ThinLTO test executables. LLVM 18's
+		# optimized ThinLTO backend also crashes selecting instructions for
+		# GetGraphicsPrograms in the GPU fixture: tests use the smaller pass set.
+		target_link_options(shader_recompiler_compute_tests PRIVATE "-fuse-ld=${CMAKE_LINKER}" "-Wl,--lto-O1")
+		target_link_options(shader_cfg_tests PRIVATE "-fuse-ld=${CMAKE_LINKER}")
+	endif()
+
+endif()
+
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
 endif()

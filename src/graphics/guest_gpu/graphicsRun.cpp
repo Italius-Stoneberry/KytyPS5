@@ -20,6 +20,8 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#include "performance-switches.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -470,6 +472,7 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	InitializePerformanceSwitches();
 
 	for (;;) {
 		Submission                   submission;
@@ -1208,9 +1211,9 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode,
-		                                              indirect_args);
+		m_renderer.GetComputeRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
+		                                                     thread_group_y, thread_group_z, mode,
+		                                                     indirect_args);
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;

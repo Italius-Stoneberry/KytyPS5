@@ -24,6 +24,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "native-preparation-state.h"
 
 #include <algorithm>
 #include <array>
@@ -331,7 +332,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& cs_regs = sh_ctx.GetCs();
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
-	ShaderComputeInputInfo input_info {};
+	NativePreparationScratch<ShaderComputeInputInfo> input_storage;
+	auto& input_info = input_storage.Get();
+	ResetNativeStageInput(input_info);
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	const auto compute_program =
@@ -475,8 +478,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// Materialize the persistent argument owner before final descriptor handles:
 	// a tiny CPU upload must not leave an indirect command using a stream slice
 	// that can be retired when preparation rotates the command buffer.
-	if (indirect_args != 0)
+	if (indirect_args != 0) {
 		m_context.GetBufferCache().EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
+	}
 	RebindBuffers(bindings);
 	RebindImages(bindings);
 

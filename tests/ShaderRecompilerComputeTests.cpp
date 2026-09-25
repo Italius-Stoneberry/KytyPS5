@@ -1,4 +1,8 @@
 #include "common/assert.h"
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+#include "native-resource-state.h"
+#include "native-preparation-scratch.h"
+#endif
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"

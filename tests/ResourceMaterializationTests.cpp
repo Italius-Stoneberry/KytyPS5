@@ -1,5 +1,8 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+#include "native-resource-state.h"
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -378,6 +381,73 @@ void TestBdaReadPlanTransactions() {
         "last valid tracker dword was rejected");
 }
 
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+void TestPreparationStorageTransactions() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto mixed = MixedSamplerPlan();
+  auto buffer = UserDataBufferPlan();
+  auto read = SrtPlan(0x1000);
+  const auto saved_mode = kyty_local_preparation_scratch_mode.load();
+  const auto equal = [](const ResourceSnapshot& a, const ResourceSnapshot& b) {
+    return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
+           a.flattened_srt == b.flattened_srt && a.user_data == b.user_data &&
+           a.uniform_fill == b.uniform_fill;
+  };
+  ResourceSnapshot expected, actual;
+  ResourceSpecialization expected_spec, actual_spec;
+  for (uint32_t iteration = 0; iteration < 64; ++iteration) {
+    const uint32_t user_data = 0x10000000u + iteration * 0x100;
+    const auto& plan = iteration % 3 == 0 ? mixed : buffer;
+    SrtRuntime runtime{.user_data = std::span(&user_data, 1)};
+    kyty_local_preparation_scratch_mode.store(0);
+    Check(MaterializeResources(plan, runtime, expected, expected_spec), "reference transaction");
+    kyty_local_preparation_scratch_mode.store(1);
+    Check(MaterializeResources(plan, runtime, actual, actual_spec) &&
+              equal(expected, actual) && expected_spec == actual_spec,
+          "storage reuse retained resources from a different material shape");
+    const auto before = actual;
+    const auto before_spec = actual_spec;
+    Check(!MaterializeResources(buffer, {}, actual, actual_spec) &&
+              equal(before, actual) && before_spec == actual_spec,
+          "failed reused transaction changed previously published resources");
+  }
+  struct Nested {
+    const ResourcePlan* plan;
+    uint32_t calls = 0;
+    bool fail = false;
+    static bool Read(void* opaque, uint64_t address, uint32_t* word) {
+      auto& self = *static_cast<Nested*>(opaque);
+      ++self.calls;
+      Check(address == 0x1000, "nested transaction changed source address");
+      ResourceSnapshot nested;
+      ResourceSpecialization nested_spec;
+      const SrtRuntime runtime{.read_memory = [](void*, uint64_t a, uint32_t* out) {
+        *out = 73; return a == 0x1000;
+      }};
+      Check(MaterializeResources(*self.plan, runtime, nested, nested_spec) &&
+                nested.flattened_srt == std::vector<uint32_t>{73},
+            "nested transaction lost its private output storage");
+      *word = 91;
+      return !self.fail;
+    }
+  };
+  Nested nested{&read};
+  const SrtRuntime runtime{.userdata = &nested, .read_memory = Nested::Read};
+  for (bool fail : {false, true, false, true, false}) {
+    nested.fail = fail;
+    const auto before = actual;
+    const auto before_spec = actual_spec;
+    const bool ok = MaterializeResources(read, runtime, actual, actual_spec);
+    Check(ok != fail, "reentrant transaction masked a reader failure");
+    Check(ok ? actual.flattened_srt == std::vector<uint32_t>{91}
+             : equal(before, actual) && before_spec == actual_spec,
+          "reentrant transaction reused live outer storage or published partial output");
+  }
+  Check(nested.calls == 5, "reused transaction duplicated a live source read");
+  kyty_local_preparation_scratch_mode.store(saved_mode);
+}
+#endif
+
 } // namespace
 
 namespace Common {
@@ -395,6 +465,9 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  TestPreparationStorageTransactions();
+#endif
   TestBdaReadPlanIntervals();
   TestBdaReadPlanTransactions();
   TestMappedSrtUsesDirectReaderByDefault();

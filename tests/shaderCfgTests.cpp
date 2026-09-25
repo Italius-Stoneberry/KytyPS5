@@ -1,4 +1,7 @@
 #include "common/emulatorConfig.h"
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+#include "native-resource-state.h"
+#endif
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/subsystems.h"
@@ -9346,6 +9349,82 @@ void TestMergedShaderUserDataSnapshot() {
   }
 }
 
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+void TestPreparationVertexInputReuse() {
+  const auto saved_mode = kyty_local_preparation_scratch_mode.load();
+  const uint32_t code[] = {EncodeSopp(0x01)};
+  std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets;
+  offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+  ShaderUserData user_data{};
+  user_data.direct_resource_offset = offsets.data();
+  user_data.direct_resource_count = static_cast<uint16_t>(offsets.size());
+  std::array<ShaderSemantic, 32> semantics{};
+  std::array<uint32_t, 32> attributes{};
+  std::array<uint32_t, 128> buffers{};
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code);
+  regs.gs_regs.rsrc2.user_sgpr = 4;
+  const uint64_t tables[] = {reinterpret_cast<uint64_t>(buffers.data()),
+                           reinterpret_cast<uint64_t>(attributes.data())};
+  std::memcpy(regs.gs_user_sgpr.value, tables, sizeof(tables));
+  ShaderMappedData mapped{};
+  mapped.user_data = &user_data;
+  mapped.input_semantics = semantics.data();
+  mapped.code_size_bytes = sizeof(code);
+  ShaderVertexInputInfo actual{};
+  for (uint32_t count : {32u, 1u, 0u, 17u, 2u, 31u, 0u, 32u, 3u}) {
+    for (uint32_t i = 0; i < 32; ++i) {
+      semantics[i].semantic = 31u - i;
+      semantics[i].hardware_mapping = 9u + i;
+      semantics[i].size_in_elements = 4;
+      attributes[i] = i | (static_cast<uint32_t>(Prospero::VertexAttribFormat::k32_32Float) << 5u) |
+                      ((i % 4u) * 8u << 14u) | ((i % 3u == 0u) ? 1u << 26u : 0u);
+      buffers[4*i] = 0x10000000u + (i / 4u) * 0x1000u + count * 0x10000u;
+      buffers[4*i+1] = 64u << 16u;
+      buffers[4*i+2] = 128;
+      buffers[4*i+3] = (static_cast<uint32_t>(Prospero::BufferFormat::k32_32Float) << 12u) |
+                        DstSel(4, 5, 6, 7);
+    }
+    mapped.num_input_semantics = count;
+    mapped.scratch_size_dwords = count;
+    offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] =
+        count == 0 ? AGC_ILLEGAL_DIRECT_OFFSET : 2;
+    ShaderMapUserData(regs.es_regs.data_addr, mapped);
+    ShaderVertexInputInfo expected{};
+    kyty_local_preparation_scratch_mode.store(0);
+    PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, expected);
+    // Simulate returning from a mesh/clip-transformed draw before a different
+    // vertex format. Only storage capacity is permitted to survive this reset.
+    actual.mesh.threads_num[0] = 64;
+    actual.clip_space.enabled = true;
+    actual.fetch_external = true;
+    kyty_local_preparation_scratch_mode.store(1);
+    PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, actual);
+    Check(MakeStageStaticKey(actual) == MakeStageStaticKey(expected) &&
+              actual.resources_num == expected.resources_num &&
+              actual.buffers_num == expected.buffers_num &&
+              !actual.clip_space.enabled && !actual.stage,
+          "reused vertex preparation kept previous mesh or format state");
+    for (int i = 0; i < actual.resources_num; ++i) {
+      Check(std::memcmp(&actual.resources[i], &expected.resources[i], sizeof(actual.resources[i])) == 0 &&
+                std::memcmp(&actual.resources_dst[i], &expected.resources_dst[i], sizeof(actual.resources_dst[i])) == 0,
+            "reused vertex preparation changed an active resource or destination");
+    }
+    for (int i = 0; i < actual.buffers_num; ++i) {
+      const auto& a = actual.buffers[i]; const auto& b = expected.buffers[i];
+      Check(a.addr == b.addr && a.stride == b.stride && a.num_records == b.num_records &&
+                a.fetch_index == b.fetch_index && a.attr_num == b.attr_num &&
+                std::equal(a.attr_indices, a.attr_indices + a.attr_num, b.attr_indices) &&
+                std::equal(a.attr_offsets, a.attr_offsets + a.attr_num, b.attr_offsets),
+            "reused vertex grouping retained inactive attributes");
+    }
+  }
+  kyty_local_preparation_scratch_mode.store(saved_mode);
+}
+#endif
+
 void TestEmbeddedVertexFormatSwizzle() {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
@@ -12861,6 +12940,9 @@ int main() {
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  TestPreparationVertexInputReuse();
+#endif
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();

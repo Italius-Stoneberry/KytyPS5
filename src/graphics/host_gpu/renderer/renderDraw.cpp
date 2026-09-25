@@ -29,6 +29,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "native-preparation-state.h"
 
 #include <algorithm>
 #include <array>
@@ -46,6 +47,26 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Draw state in reusable preparation storage when that switch is on.
+class NativeDrawState {
+	const bool                                enabled = NativePreparationScratchEnabled();
+	NativePreparationScratch<DrawRenderState> storage {enabled};
+
+public:
+	NativeDrawState() {
+		if (!enabled) {
+			return;
+		}
+		auto& state      = storage.Get();
+		state.depth_info = {};
+		std::fill(std::begin(state.color_info), std::end(state.color_info), RenderColorInfo {});
+		state.color_count = 0;
+		state.ps_active   = true;
+		state.programs    = {};
+	}
+	DrawRenderState& Get() { return storage.Get(); }
+};
 
 int32_t ResolveVertexOffset(uint32_t index_offset, const ShaderVertexInputInfo& vs_input_info) {
 	if (index_offset != 0 || !vs_input_info.fetch_embedded) {
@@ -969,7 +990,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 	const auto& shader_regs        = ctx.GetShaderRegisters();
 
 	state.programs      = {};
-	state.ps_input_info = {};
+	ResetNativeStageInput(state.ps_input_info);
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
 	    target_export_mapping {};
 	for (uint32_t i = 0; i < state.color_count; i++) {
@@ -1336,7 +1357,8 @@ bool RenderExecutor::TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer,
 	if (!alias_epoch) return false;
 	const DrawCallInfo draw {"DrawIndexRun", CommandBufferDebugOp::DrawIndex, draws[0].index_count,
 	                         draws[0].instance_count, draws[0].first_instance};
-	DrawRenderState    state {};
+	NativeDrawState state_storage;
+	auto& state = state_storage.Get();
 	if (!PrepareDrawRenderState(buffer, draw, 0, false, state)) {
 		ResetBindings();
 		return false;
@@ -1540,7 +1562,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {"DrawIndex", CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
-	DrawRenderState state {};
+	NativeDrawState state_storage;
+	auto& state = state_storage.Get();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, true,
 	                            state)) {
 		ResetBindings();
@@ -1617,7 +1640,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	const DrawCallInfo draw {"DrawIndexAuto", CommandBufferDebugOp::DrawIndexAuto,
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
-	DrawRenderState state {};
+	NativeDrawState state_storage;
+	auto& state = state_storage.Get();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, false,
 	                            state)) {
 		ResetBindings();

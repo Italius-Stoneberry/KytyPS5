@@ -46,6 +46,9 @@ public:
 	BufferCache&        GetBufferCache() { return m_gpu_resources.GetBufferCache(); }
 	TextureCache&       GetTextureCache() { return m_gpu_resources.GetTextureCache(); }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
+	// Dispatches use their own executor, so draws do not displace their
+	// per-operation scratch and texture resolutions.
+	RenderExecutor&     GetComputeRenderExecutor() { return m_compute_render_executor; }
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -60,6 +63,7 @@ private:
 	GraphicContext&           m_graphics;
 	Common::Mutex             m_mutex;
 	RenderExecutor            m_render_executor;
+	RenderExecutor            m_compute_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
 	PipelineCache             m_pipeline_cache;
