@@ -60,7 +60,12 @@ public:
 		}
 		auto& state      = storage.Get();
 		state.depth_info = {};
-		std::fill(std::begin(state.color_info), std::end(state.color_info), RenderColorInfo {});
+		// ResolveRenderColorTarget resets each active slot before every path,
+		// including slot zero for depth-only draws. Remaining array slots are
+		// never read beyond color_count.
+		if (!kyty_local_preparation_trim_mode.load(std::memory_order_relaxed)) {
+			std::fill(std::begin(state.color_info), std::end(state.color_info), RenderColorInfo {});
+		}
 		state.color_count = 0;
 		state.ps_active   = true;
 		state.programs    = {};

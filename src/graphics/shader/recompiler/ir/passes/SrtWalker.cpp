@@ -19,6 +19,7 @@ volatile std::atomic<uint32_t> kyty_local_srt_native_mode {0};
 volatile std::atomic<uint32_t> kyty_local_srt_predicate_mode {0};
 volatile std::atomic<uint32_t> kyty_local_preparation_scratch_mode {0};
 volatile std::atomic<uint32_t> kyty_local_preparation_lookup_mode {0};
+volatile std::atomic<uint32_t> kyty_local_preparation_trim_mode {0};
 }
 
 namespace Libs::Graphics::ShaderRecompiler::IR {

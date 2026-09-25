@@ -14,4 +14,6 @@ extern volatile std::atomic<uint32_t> kyty_local_srt_predicate_mode;
 extern volatile std::atomic<uint32_t> kyty_local_preparation_scratch_mode;
 // 1: bounded lookup shortcuts (the first image page, single-mapping backing copies).
 extern volatile std::atomic<uint32_t> kyty_local_preparation_lookup_mode;
+// 1: remove redundant attachment clearing and the temporary snapshot remap index.
+extern volatile std::atomic<uint32_t> kyty_local_preparation_trim_mode;
 }

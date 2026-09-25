@@ -946,7 +946,23 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			next_snapshot.samplers.push_back(next_snapshot.samplers[index]);
 		}
 	}
-	ImageRemap(next_specialization).Apply(next_snapshot.images);
+	if (kyty_local_preparation_trim_mode.load(std::memory_order_relaxed)) {
+		// Runtime snapshots only need stable compaction. The compiler still
+		// builds the full index remap when rewriting IR resource references.
+		EXIT_IF(next_snapshot.images.size() != next_specialization.images.size());
+		uint32_t output = 0;
+		for (uint32_t index = 0; index < next_specialization.images.size(); ++index) {
+			if (!next_specialization.images[index].fmask) {
+				if (output != index) {
+					next_snapshot.images[output] = std::move(next_snapshot.images[index]);
+				}
+				++output;
+			}
+		}
+		next_snapshot.images.resize(output);
+	} else {
+		ImageRemap(next_specialization).Apply(next_snapshot.images);
+	}
 	// Publish only after all validation succeeds. Returning the old destination
 	// storage to the workspace retains capacity without caching mutable contents.
 	std::swap(specialization, next_specialization);
