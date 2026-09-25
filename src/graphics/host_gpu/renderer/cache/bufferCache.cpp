@@ -554,9 +554,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
+	const char* prt_failure = "not-attempted";
 	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size, &prt_failure))) {
+		EXIT("BufferCache: failed to read mapped guest image backing: "
+		     "address=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " staging=%p staging_capacity=0x%016" PRIx64 " prt_failure=%s\n",
+		     vaddr, size, static_cast<void*>(staging), m_staging_buffer.Size(), prt_failure);
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};
