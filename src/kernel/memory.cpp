@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "native-resource-state.h"
 
 #include <algorithm>
 #include <array>

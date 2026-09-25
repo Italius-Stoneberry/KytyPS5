@@ -12,4 +12,6 @@ extern volatile std::atomic<uint32_t> kyty_local_srt_native_mode;
 extern volatile std::atomic<uint32_t> kyty_local_srt_predicate_mode;
 // 1: reusable preparation storage; contents are always fresh.
 extern volatile std::atomic<uint32_t> kyty_local_preparation_scratch_mode;
+// 1: bounded lookup shortcuts (the first image page, single-mapping backing copies).
+extern volatile std::atomic<uint32_t> kyty_local_preparation_lookup_mode;
 }

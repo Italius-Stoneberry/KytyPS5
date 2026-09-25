@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
+#include "native-resource-state.h"
 
 #include <algorithm>
 #include <array>
@@ -1350,13 +1351,30 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
-
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
+		ImageIds candidates;
+		if (kyty_local_preparation_lookup_mode.load(std::memory_order_relaxed) != 0) {
+			// Every exact match starts on the requested first page. Traversing
+			// that page preserves the original order (including the last match)
+			// without visiting and deduplicating the same owners on later pages.
+			ImagePageTable::PageRange pages {};
+			if (ImagePageTable::TryGetPageRange(desc.info.data.address, desc.info.data.size, pages)) {
+				if (const auto* owners = m_image_page_table.Find(pages.first)) {
+					owners->ForEach([&](ImageId id) {
+						const auto* image = m_slot_images.try_get(id);
+						if (image != nullptr && SameBacking(image->info, desc.info, exact_format)) {
+							result = id;
+						}
+					});
+				}
+			}
+		}
+		if (!result) {
+			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+			for (const auto id: candidates) {
+				const auto& image = m_slot_images[id];
+				if (SameBacking(image.info, desc.info, exact_format)) {
+					result = id;
+				}
 			}
 		}
 

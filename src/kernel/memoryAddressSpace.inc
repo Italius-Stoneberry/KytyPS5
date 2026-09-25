@@ -549,6 +549,17 @@ private:
 
 		std::lock_guard lock(m_mutex);
 		const auto      end     = vaddr + size;
+		if (kyty_local_preparation_lookup_mode.load(std::memory_order_relaxed)) {
+			MapEntry entry{};
+			if (FindContainingUnlocked(vaddr, size, &entry)) {
+				const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+				if (!RangeOk(offset, size)) return false;
+				// The lock keeps this whole mapping valid through the transfer.
+				// Spanning requests retain the original validate-all-then-copy path.
+				transfer(m_backing_base + offset, 0, static_cast<size_t>(size));
+				return true;
+			}
+		}
 		auto            current = vaddr;
 		while (current < end) {
 			MapEntry entry {};
