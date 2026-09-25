@@ -2,6 +2,7 @@
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
 #include "native-resource-state.h"
 #include "native-preparation-scratch.h"
+extern "C" volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 extern "C" volatile std::atomic_uint32_t kyty_local_backing_read_mode;
 #include <barrier>
 extern "C" volatile std::atomic_uint32_t kyty_local_stream_upload_mode;
@@ -164,6 +165,15 @@ struct BufferCacheTestAccess {
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
   static uint64_t CpuEpoch(const BufferCache& cache, uint64_t address, uint64_t size) {
     return cache.m_memory_tracker.CpuModificationEpoch(address, size);
+  }
+  static auto BeginGuestReadback(BufferCache& cache, uint64_t address, uint64_t size) {
+    return cache.BeginGuestReadback(address, size);
+  }
+  static void CopyGuestReadback(BufferCache& cache, const auto& request) {
+    cache.CopyGuestReadback(request);
+  }
+  static bool HasGuestReadback(const BufferCache& cache) {
+    return cache.m_active_guest_readbacks != 0;
   }
   static void DownloadLodReport(BufferCache& cache, uint64_t address) {
     cache.ReadMemoryOnGpu(address, 0x840, false);
@@ -3443,6 +3453,65 @@ public:
                 ordered_finished.load(),
             "submit done did not drain prior PM4 work");
 
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+    // A later frame may be generated while either prior PM4 queue is blocked.
+    // Its work cannot run, and the frame number cannot advance, until all
+    // earlier queues have reached the frame boundary. Keep the borrowed packet
+    // storage alive until the final synchronous drain.
+    for (const bool compute_first : {false, true}) {
+      gpu.SendCommandSync([&] { label = prefix = suffix = 0; });
+      const auto initial_frame = gpu.GetFrameNum();
+      const auto previous_mode = kyty_local_frame_pipeline_mode.exchange(1);
+      if (compute_first) gpu.SubmitCompute(0x20, commands);
+      else gpu.Submit(commands, {});
+
+      std::binary_semaphore first_boundary_returned{0};
+      std::jthread first_boundary([&] {
+        gpu.Done();
+        first_boundary_returned.release();
+      });
+      const bool returned_early = first_boundary_returned.try_acquire_for(
+          std::chrono::seconds(2));
+      if (!returned_early) gpu.SendCommandSync([&] { label = 1; });
+      first_boundary.join();
+      Require("GpuCommandLane", "asynchronous frame return", returned_early,
+              "frame boundary blocked CPU preparation on the current frame");
+
+      uint32_t next_graphics = 0, next_compute = 0;
+      std::array<uint32_t, 5> next_graphics_commands{}, next_compute_commands{};
+      write_packet(next_graphics_commands.data(), &next_graphics, 33);
+      write_packet(next_compute_commands.data(), &next_compute, 44);
+      gpu.Submit(next_graphics_commands, {});
+      gpu.SubmitCompute(0x20, next_compute_commands);
+
+      std::binary_semaphore second_boundary_returned{0};
+      std::jthread second_boundary([&] {
+        gpu.Done();
+        second_boundary_returned.release();
+      });
+      const bool unbounded = second_boundary_returned.try_acquire_for(
+          std::chrono::milliseconds(100));
+      bool correct_boundary = false;
+      gpu.SendCommandSync([&] {
+        correct_boundary = !unbounded && prefix == 11 && suffix == 0 &&
+            next_graphics == 0 && next_compute == 0 &&
+            gpu.GetFrameNum() == initial_frame;
+        label = 1;
+      });
+      second_boundary.join();
+      // Switching off drains already-queued boundaries before applying the
+      // normal synchronous Done; it cannot discard a queued frame or reset.
+      kyty_local_frame_pipeline_mode.store(0);
+      gpu.Done();
+      Require("GpuCommandLane", "bounded cross-queue frames",
+              correct_boundary && suffix == 22 && next_graphics == 33 &&
+                  next_compute == 44 && gpu.GetFrameNum() == initial_frame + 3,
+              "frame boundary overtook a blocked queue, lost work, advanced "
+              "the frame early, or failed to bound CPU lead");
+      kyty_local_frame_pipeline_mode.store(previous_mode);
+    }
+#endif
+
     auto &resources = context.GetGpuResources();
     constexpr uint64_t empty_unmap_base = 0x0000000200400000ull;
     constexpr uint64_t empty_unmap_size = 0x4000;
@@ -4077,6 +4146,151 @@ public:
   }
 
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  void CheckGuestReadback() {
+    constexpr const char* name = "GuestReadback";
+    constexpr uintptr_t base = 0x0000000200700000ull;
+    constexpr uint64_t bytes = 0x800000, alignment = 0x10000;
+    EnsureRuntimeContext();
+    auto& context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto& gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+        0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), bytes,
+        alignment, 0, &direct_offset) == 0, "allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, bytes, 0x3, 0x10, direct_offset, alignment) == 0 &&
+        mapped == reinterpret_cast<void*>(base), "mapping failed");
+    std::memset(mapped, 0x5a, bytes);
+    const auto old_frame_mode = kyty_local_frame_pipeline_mode.exchange(1);
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      resources.MapMemory(base, bytes);
+      auto& cache = resources.GetBufferCache();
+      gpu.SendCommandSync([&] { (void)cache.FindBuffer(base, bytes); });
+      const auto backing = [&](uint64_t address) {
+        uint32_t value = 0;
+        Require(name, "backing", Libs::LibKernel::Memory::TryReadBacking(
+            address, &value, 4), "backing unavailable");
+        return value;
+      };
+      const auto fill = [&](uint64_t address, uint32_t value) {
+        auto [buffer, offset] = cache.ObtainBuffer(address, 4, true);
+        buffer->Fill(offset, 4, value);
+      };
+      vk::SemaphoreTypeCreateInfo type{};
+      type.semaphoreType = vk::SemaphoreType::eTimeline;
+      vk::SemaphoreCreateInfo info{};
+      info.pNext = &type;
+      vk::Semaphore gate{};
+      Require(name, "gate", m_runtime_context.device.createSemaphore(&info, nullptr, &gate) ==
+          vk::Result::eSuccess, "timeline creation failed");
+      for (uint32_t iteration = 1; iteration <= 4; ++iteration) {
+        const auto address = base + 0x100000 * iteration + 0x104;
+        const uint32_t value = 0x12340000 | iteration;
+        auto request = BufferCacheTestAccess::BeginGuestReadback(cache, base, 4);
+        Require(name, "clean fallback", !request, "clean bytes created a readback");
+        gpu.SendCommandSync([&] {
+          fill(address, value);
+          SubmitInfo submit{};
+          submit.num_wait_semaphores = 1;
+          submit.wait_semaphores[0] = gate;
+          submit.wait_ticks[0] = iteration;
+          submit.wait_stages[0] = vk::PipelineStageFlagBits::eAllCommands;
+          scheduler.Flush(submit);
+          request = BufferCacheTestAccess::BeginGuestReadback(cache, address, 1);
+        });
+        Require(name, "accepted", bool(request), "mapped dirty window was rejected");
+        std::atomic<bool> copied{false};
+        std::jthread reader([&] {
+          BufferCacheTestAccess::CopyGuestReadback(cache, request);
+          copied.store(true, std::memory_order_release);
+        });
+        auto second = request;
+        const auto second_address = address + 0x80000;
+        gpu.SendCommandSync([&] {
+          fill(second_address, value ^ 0x55555555);
+          second = BufferCacheTestAccess::BeginGuestReadback(cache, second_address, 1);
+          auto shared = BufferCacheTestAccess::BeginGuestReadback(cache, address, 1);
+          Require(name, "independent and shared requests", second && second != request &&
+              shared == request, "independent requests serialized or same-page readers did not coalesce");
+        });
+        std::jthread second_reader([&] { BufferCacheTestAccess::CopyGuestReadback(cache, second); });
+        std::jthread follower([&] { BufferCacheTestAccess::CopyGuestReadback(cache, request); });
+        gpu.SendCommandSync([&] {
+          auto [read_buffer, read_offset] = cache.ObtainBuffer(address, 4, false);
+          (void)read_buffer;
+          (void)read_offset;
+          cache.SynchronizeBuffersInRange(address, TRACKER_PAGE_SIZE);
+          cache.RunGarbageCollector(); // Below budget: it must not wait for a host reader.
+          cache.ProcessFaultBuffer();  // Uses separate host/GPU storage.
+          fill(address + TRACKER_PAGE_SIZE, 0x99887766);
+          fill(base + 0x700000, iteration);
+          Require(name, "independent recording", BufferCacheTestAccess::HasGuestReadback(cache) &&
+              !copied.load(std::memory_order_acquire), "recording waited on the gated copy");
+        });
+        Require(name, "no early bytes", backing(address) == 0x5a5a5a5a,
+                "incomplete copy was published");
+        vk::SemaphoreSignalInfo signal{};
+        signal.semaphore = gate;
+        signal.value = iteration;
+        Require(name, "signal", m_runtime_context.device.signalSemaphore(&signal) ==
+            vk::Result::eSuccess, "timeline signal failed");
+        reader.join();
+        second_reader.join();
+        follower.join();
+        Require(name, "independent slot bytes", backing(second_address) == (value ^ 0x55555555),
+                "one in-flight download slot overwrote another");
+        gpu.SendCommandSync([&] {
+          cache.DrainGuestReadback(second_address, 1);
+          Require(name, "protection until retirement", cache.IsRegionGpuModified(address, 1) &&
+              cache.HasGpuDirtyBytes(address, 1), "caller changed GPU-owned metadata");
+          if (iteration == 1) cache.DrainGuestReadback();
+          if (iteration == 2) fill(address, 0xabcdef01); // Overlap retires before new GPU ownership.
+          if (iteration == 3) resources.UnmapMemory(address & ~(alignment - 1), alignment);
+          if (iteration == 4) {
+            BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, UINT64_MAX);
+            cache.RunGarbageCollector();
+          }
+          Require(name, "retired", !BufferCacheTestAccess::HasGuestReadback(cache),
+                  "overlap, unmap, or collection retained an active ticket");
+          if (iteration != 3)
+            Require(name, "new dirty page preserved", cache.HasGpuDirtyBytes(address + TRACKER_PAGE_SIZE, 4) &&
+                cache.IsRegionGpuModified(address + TRACKER_PAGE_SIZE, 4),
+                "retirement cleared a page dirtied after handoff");
+        });
+        Require(name, "exact bytes", backing(address) == value &&
+            backing(address - 4) == 0x5a5a5a5a && backing(address + 4) == 0x5a5a5a5a,
+            "copy changed neighbouring clean bytes or lost GPU output");
+        if (iteration == 2) {
+          cache.ReadMemory(address, 1);
+          Require(name, "newer writer", backing(address) == 0xabcdef01,
+                  "retirement dropped a newer GPU write");
+        }
+      }
+      gpu.SendCommandSync([&] {
+        scheduler.Finish();
+        resources.UnmapMemory(base, bytes);
+      });
+      m_runtime_context.device.destroySemaphore(gate, nullptr);
+    }
+    context.GetGpu().Shutdown();
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, bytes) == 0,
+            "guest unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+        direct_offset, bytes) == 0, "direct release failed");
+    scheduler.Shutdown();
+    kyty_local_frame_pipeline_mode.store(old_frame_mode);
+    std::printf("PASS %s\n", name);
+  }
+
   void CheckCompletedCopyFeedback() {
     constexpr const char *name = "CompletedCopyFeedback";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -31713,6 +31927,10 @@ int main(int argc, char **argv) {
     kyty_local_backing_read_mode.store(1, std::memory_order_relaxed);
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckCpuWriteWindow();
+    // This fixture normally exits with its GPU lane owned by the harness.
+    // Join it before the next fixture initializes a new lane in this context.
+    vulkan.RuntimeRenderer().ShutdownGpu();
+    vulkan.CheckGuestReadback();
     kyty_local_backing_read_mode.store(0, std::memory_order_relaxed);
     return 0;
   }
@@ -31757,6 +31975,11 @@ int main(int argc, char **argv) {
     return 0;
   }
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  if (argc == 2 && std::strcmp(argv[1], "--guest-readback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGuestReadback();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--copy-feedback-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckCompletedCopyFeedback();

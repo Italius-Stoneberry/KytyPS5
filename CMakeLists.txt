@@ -761,6 +761,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
 		add_test(NAME binding_scratch COMMAND shader_recompiler_compute_tests --binding-scratch-only)
 		add_test(NAME shader_upload_ring COMMAND shader_recompiler_compute_tests --shader-upload-ring-only)
 		add_test(NAME host_backing_read COMMAND shader_recompiler_compute_tests --host-backing-read-only)
+		add_test(NAME buffer_cache_guest_readback
+			COMMAND shader_recompiler_compute_tests --guest-readback-only)
 		add_test(NAME copy_feedback COMMAND shader_recompiler_compute_tests --copy-feedback-only)
 	endif()
 endif()

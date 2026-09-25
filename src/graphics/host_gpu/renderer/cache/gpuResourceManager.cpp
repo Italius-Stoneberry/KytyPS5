@@ -99,6 +99,7 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 }
 
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
+	if (m_gpu) m_gpu->SendCommandSync([this] { m_buffer_cache.DrainGuestReadback(); });
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
@@ -113,6 +114,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		m_buffer_cache.DrainGuestReadback();
 		if (m_scheduler.Active()) {
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Finish();
@@ -165,6 +167,8 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 }
 
 void GpuResourceManager::PrepareBda() {
+	// Unknown shader addresses cannot prove disjointness from an in-flight readback.
+	m_buffer_cache.DrainGuestReadback();
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	RefreshBdaRanges();
 	for (auto& request : m_bda_region_requests) m_buffer_cache.SynchronizeRegionRequest(request);

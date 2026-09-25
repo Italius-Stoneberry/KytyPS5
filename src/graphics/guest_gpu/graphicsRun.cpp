@@ -36,6 +36,13 @@
 
 namespace Libs::Graphics {
 
+extern "C" {
+// 0: synchronous frame boundary. 1: the guest may prepare the following frame
+// while the renderer consumes the previous one; guest reads of GPU-written
+// memory are then served by asynchronous readbacks (BufferCache).
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode {0};
+}
+
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
@@ -202,6 +209,23 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::Done() {
 	GpuMutexLock lock(m_submission_mutex);
 	if (!IsGpuThread()) {
+		if (kyty_local_frame_pipeline_mode.load(std::memory_order_relaxed) != 0) {
+			// Permit CPU preparation of one following frame. Before publishing
+			// another boundary, the preceding frame must have been consumed on
+			// every PM4 queue. Host commands remain serviceable during this wait.
+			{
+				Common::LockGuard queue_lock(m_queue_mutex);
+				while (m_submitted_frame != m_consumed_frame) {
+					m_idle.Wait(&m_queue_mutex);
+				}
+			}
+			Submission boundary;
+			boundary.type = SubmissionType::FrameBoundary;
+			Enqueue(std::move(boundary));
+			++m_submitted_frame;
+			m_graphics_done = true;
+			return;
+		}
 		WaitForIdle();
 	}
 	m_graphics_done = true;
@@ -454,6 +478,7 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	submission.frame_epoch = m_submitted_frame;
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -464,6 +489,19 @@ void GuestGpu::WaitForIdle() {
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
 		m_idle.Wait(&m_queue_mutex);
 	}
+}
+
+bool GuestGpu::CanProcessSubmission(const Submission& submission) const {
+	// Caller holds m_queue_mutex. Later-frame compute work must not overtake
+	// the graphics boundary, nor may that boundary pass earlier compute work.
+	if (submission.frame_epoch != m_consumed_frame) return false;
+	if (submission.type == SubmissionType::FrameBoundary) {
+		for (uint32_t id = 1; id < QueueCount; ++id) {
+			if (!m_queues[id].empty() &&
+			    m_queues[id].front().frame_epoch == submission.frame_epoch) return false;
+		}
+	}
+	return true;
 }
 
 void GuestGpu::ThreadRun(void* data) {
@@ -499,7 +537,8 @@ void GuestGpu::ThreadRun(void* data) {
 				int selected_queue = -1;
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
 					const auto id = (gpu->m_next_queue + offset) % QueueCount;
-					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked) {
+					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked &&
+					    gpu->CanProcessSubmission(gpu->m_queues[id].front())) {
 						selected_queue = static_cast<int>(id);
 						break;
 					}
@@ -565,6 +604,15 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	if (submission.type == SubmissionType::FrameBoundary) {
+		EXIT_IF(submission.started || submission.queue_id != 0);
+		Common::LockGuard lock(m_queue_mutex);
+		EXIT_IF(submission.frame_epoch != m_consumed_frame);
+		++m_done_num;
+		++m_consumed_frame;
+		m_idle.SignalAll();
+		return true;
+	}
 	const bool first_slice = !submission.started;
 	auto& cp = GetProcessor(submission.queue_id);
 
@@ -647,6 +695,7 @@ bool GuestGpu::Process(Submission& submission) {
 			m_renderer.GetGpuResources().RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
+		case SubmissionType::FrameBoundary: EXIT("frame boundary already handled\n");
 	}
 
 	return complete;

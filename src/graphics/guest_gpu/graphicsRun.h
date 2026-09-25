@@ -48,7 +48,7 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Graphics, Compute, FlipPreparation };
+	enum class SubmissionType { Graphics, Compute, FlipPreparation, FrameBoundary };
 
 	struct Submission {
 		SubmissionType            type     = SubmissionType::Graphics;
@@ -63,10 +63,12 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		uint64_t                  frame_epoch       = 0;
 	};
 
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
+	bool              CanProcessSubmission(const Submission& submission) const;
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -83,6 +85,9 @@ private:
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
+	// Producer epoch is owned by m_submission_mutex; consumed epoch by m_queue_mutex.
+	uint64_t                                       m_submitted_frame   = 0;
+	uint64_t                                       m_consumed_frame    = 0;
 	bool                                           m_processing        = false;
 	bool                                           m_graphics_done     = true;
 	bool                                           m_accepting         = true;

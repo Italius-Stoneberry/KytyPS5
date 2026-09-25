@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <map>
 #include <span>
 #include <utility>
@@ -72,6 +73,10 @@ public:
 	                bool src_gds);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
+	// GPU thread: retire a pending guest read before touching overlapping backing.
+	// With no range, drain before mapping changes, unknown BDA access, or shutdown.
+	void DrainGuestReadback(uint64_t address = 0, uint64_t size = UINT64_MAX,
+	                        bool gpu_read_only = false);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -125,6 +130,15 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
+	struct GuestReadback;
+	std::shared_ptr<GuestReadback> BeginGuestReadback(uint64_t address, uint64_t size,
+	                                                  bool* completed = nullptr);
+	void CopyGuestReadback(const std::shared_ptr<GuestReadback>& request);
+	void FinishGuestReadback(size_t slot);
+	static constexpr size_t GuestReadbackSlots = 8;
+	std::array<std::shared_ptr<GuestReadback>, GuestReadbackSlots> m_guest_readbacks {};
+	std::array<std::unique_ptr<Buffer>, GuestReadbackSlots> m_guest_downloads {};
+	uint32_t m_active_guest_readbacks = 0;
 	struct CopyFeedback;
 	void InvalidateCopyFeedback(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size);

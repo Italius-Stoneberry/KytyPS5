@@ -11,6 +11,7 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // 1: shader constants stream through a host-visible upload ring.
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_stream_upload_mode {0};
+extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 }
 
 #include "common/assert.h"
@@ -71,6 +72,164 @@ struct BufferCache::DownloadCopy {
 	uint64_t address       = 0;
 	uint64_t size          = 0;
 };
+
+struct BufferCache::GuestReadback {
+	struct Part { uint64_t address, size, offset; };
+	std::vector<Part> parts;
+	std::vector<GuestRange> pages;
+	uint64_t begin = 0, size = 0, tick = 0, packed_size = 0;
+	size_t slot = 0;
+	Buffer* download = nullptr;
+	std::atomic<bool> copying {false};
+	std::atomic<bool> copied {false};
+};
+
+// With the frame pipeline, guest reads of GPU-written memory are copied out
+// asynchronously; read-only GPU bindings may overlap the copy.
+static bool GuestReadbacksEnabled() {
+	return kyty_local_frame_pipeline_mode.load(std::memory_order_relaxed) != 0;
+}
+
+std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
+    uint64_t address, uint64_t size, bool* completed) {
+	if (completed) *completed = false;
+	constexpr uint64_t WindowSize = 512 * 1024;
+	constexpr uint64_t Capacity = 2 * WindowSize;
+	if (!m_resources || !GuestRange {address, size}.Valid() || size > WindowSize) return {};
+	if (!GuestReadbacksEnabled()) return {};
+	for (size_t slot = 0; slot < GuestReadbackSlots; ++slot) {
+		const auto& pending = m_guest_readbacks[slot];
+		if (!pending) continue;
+		if (pending->copied.load(std::memory_order_acquire)) {
+			FinishGuestReadback(slot);
+			continue;
+		}
+		if (std::ranges::any_of(pending->pages, [&](const GuestRange& page) {
+			return address >= page.address && address < page.End() && size <= page.End() - address;
+		})) {
+			return pending;
+		}
+	}
+	// A request spanning several pending page spans cannot share just one ticket.
+	DrainGuestReadback(address, size);
+	auto& buffer = m_slot_buffers[FindBuffer(address, size)];
+	const auto begin = std::max(address & ~(WindowSize - 1), buffer.CpuAddress());
+	const auto end = std::min(std::max(begin + WindowSize, address + size),
+	                          buffer.CpuAddress() + buffer.Size());
+	if (!m_resources->IsMapped(begin, end - begin) ||
+	    !LibKernel::Memory::IsUniqueGuestBackingRange(begin, end - begin) ||
+	    m_texture_cache.HasTrackedDataOverlap(begin, end - begin)) return {};
+	RangeSet available_pages;
+	m_memory_tracker.ForEachDownloadRange<false>(begin, end - begin,
+	    [&](uint64_t a, uint64_t bytes) noexcept {
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, a, bytes, "guest readback");
+	    },
+	    [&](uint64_t a, uint64_t bytes) noexcept {
+		    available_pages.Add(a, bytes);
+	    });
+	// Widening is speculative: pages another ticket already covers must not cause
+	// this unrelated request to wait or download the same bytes a second time.
+	for (const auto& pending: m_guest_readbacks) {
+		if (pending) for (const auto& page: pending->pages)
+			available_pages.Subtract(page.address, page.size);
+	}
+	std::vector<DownloadCopy> copies;
+	std::vector<GuestRange> pages;
+	available_pages.ForEach([&](uint64_t a, uint64_t end) {
+		pages.push_back({a, end - a});
+		m_gpu_modified_ranges.ForEachIntersection(a, end - a, [&](RangeSet::Range range) {
+			copies.push_back({&buffer, buffer.Offset(range.address), range.address, range.size});
+		});
+	});
+	if (copies.empty()) {
+		if (completed) *completed = true;
+		return {};
+	}
+	uint64_t packed_size = 0;
+	for (const auto& copy: copies) {
+		packed_size += AlignDownload(DownloadEnvelope(copy).second);
+		if (packed_size > Capacity) return {};
+	}
+	size_t slot = 0;
+	while (slot < GuestReadbackSlots && m_guest_readbacks[slot]) ++slot;
+	if (slot == GuestReadbackSlots) {
+		slot = 0;
+		for (size_t i = 1; i < GuestReadbackSlots; ++i)
+			if (m_guest_readbacks[i]->tick < m_guest_readbacks[slot]->tick) slot = i;
+		FinishGuestReadback(slot);
+	}
+	auto& download = m_guest_downloads[slot];
+	if (!download)
+		download = std::make_unique<Buffer>(m_graphics, m_scheduler,
+		    MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, Capacity);
+	auto request = std::make_shared<GuestReadback>();
+	request->begin = begin;
+	request->size = end - begin;
+	request->pages = std::move(pages);
+	request->slot = slot;
+	request->download = download.get();
+	request->packed_size = packed_size;
+	uint64_t cursor = 0;
+	for (const auto& copy: copies) {
+		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+		download->CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, cursor,
+		    envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+		    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		    vk::AccessFlagBits::eHostRead);
+		request->parts.push_back({copy.address, copy.size, cursor + copy.source_offset - source_begin});
+		cursor += AlignDownload(envelope_size);
+	}
+	request->tick = m_scheduler.CurrentTick();
+	m_scheduler.Flush();
+	// Keep GPU ownership and page protection until the caller has copied every byte.
+	// Subsequent accesses to this window must retire this request before proceeding.
+	m_guest_readbacks[slot] = request;
+	m_active_guest_readbacks |= 1u << slot;
+	return request;
+}
+
+void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& request) {
+	if (request->copying.exchange(true, std::memory_order_acq_rel)) {
+		while (!request->copied.load(std::memory_order_acquire)) request->copied.wait(false);
+		return;
+	}
+	m_scheduler.GetMasterSemaphore().Wait(request->tick);
+	m_scheduler.WaitPriorityOperations(request->tick);
+	request->download->Invalidate(0, request->packed_size);
+	for (const auto& part: request->parts)
+		LibKernel::Memory::WriteBacking(part.address,
+		    request->download->Mapped().data() + part.offset, part.size);
+	request->copied.store(true, std::memory_order_release);
+	request->copied.notify_all();
+}
+
+void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_read_only) {
+	// Read-only bindings use device bytes. Pending copies retain GPU ownership
+	// and CPU-clean pages, so synchronization cannot upload over those bytes.
+	if (!m_active_guest_readbacks || gpu_read_only) return;
+	for (size_t slot = 0; slot < GuestReadbackSlots; ++slot) {
+		const auto& request = m_guest_readbacks[slot];
+		if (!request) continue;
+		if (address != 0 && (address >= request->begin + request->size ||
+		                    (address < request->begin && size <= request->begin - address))) continue;
+		if (address != 0 && std::ranges::none_of(request->pages, [&](const GuestRange& page) {
+			return address < page.End() && (address >= page.address || size > page.address - address);
+		})) continue;
+		FinishGuestReadback(slot);
+	}
+}
+
+void BufferCache::FinishGuestReadback(size_t slot) {
+	auto request = m_guest_readbacks[slot];
+	if (!request) return;
+	while (!request->copied.load(std::memory_order_acquire)) request->copied.wait(false);
+	for (const auto& part: request->parts) m_gpu_modified_ranges.Subtract(part.address, part.size);
+	// The renderer may have dirtied other pages in the widened window since handoff.
+	for (const auto& page: request->pages)
+		m_memory_tracker.UnmarkRegionAsGpuModified(page.address, page.size);
+	m_guest_readbacks[slot].reset();
+	m_active_guest_readbacks &= ~(1u << slot);
+}
 
 // All metadata and mapped reads belong to the GPU thread. A slot is reused only
 // after its copy tick completes; speculative copies never publish CPU ownership.
@@ -232,6 +391,7 @@ void BufferCache::Unregister(BufferId id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
+	DrainGuestReadback(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size());
 	m_sync_buffers_valid = false;
 	++m_registration_epoch;
 	auto& buffer = m_slot_buffers[id];
@@ -509,6 +669,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	DrainGuestReadback();
     m_graphics.device.destroyPipeline(m_lod_pack_pipeline, nullptr);
     m_graphics.device.destroyPipelineLayout(m_lod_pack_layout, nullptr);
     m_graphics.device.destroyDescriptorSetLayout(m_lod_pack_descriptors, nullptr);
@@ -539,11 +700,29 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	if (!is_write && !GuestGpu::IsGpuThread() && GuestReadbacksEnabled()) {
+		std::shared_ptr<GuestReadback> request;
+		auto& gpu = m_scheduler.Context().GetGpu();
+		gpu.SendCommandSync([&] {
+			bool completed = false;
+			request = BeginGuestReadback(vaddr, size, &completed);
+			if (!request && !completed) ReadMemoryOnGpu(vaddr, size, false);
+		});
+		if (request) {
+			CopyGuestReadback(request);
+			gpu.SendCommandSync([this, request] {
+				// An overlapping access may already have retired this request.
+				if (m_guest_readbacks[request->slot] == request) FinishGuestReadback(request->slot);
+			});
+		}
+		return;
+	}
 	m_scheduler.Context().GetGpu().SendCommandSync(
 	    [this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
+	DrainGuestReadback();
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
 	}
@@ -584,6 +763,8 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+	// Registration changes still drain separately before retiring an owner.
+	DrainGuestReadback(vaddr, size, true);
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
 	}
@@ -791,6 +972,7 @@ StreamBuffer& BufferCache::GetShaderUploadBuffer() noexcept {
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	DrainGuestReadback(vaddr, size, !is_written && !is_texel_buffer);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -824,6 +1006,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+	DrainGuestReadback(vaddr, size);
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
@@ -954,6 +1137,9 @@ void BufferCache::RunGarbageCollector() {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	// Most collection checks do no work. Only a real collection can enumerate
+	// pending dirty bytes or retire their owner, so only that path needs a drain.
+	DrainGuestReadback();
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
@@ -1012,6 +1198,8 @@ void BufferCache::RunGarbageCollector() {
 }
 
 void BufferCache::ProcessFaultBuffer() {
+	// This records into FaultManager's own buffer. Its later registration callbacks
+	// pass through ChangeRegister, which drains before changing a guest owner.
 	m_fault_manager.ProcessFaultBuffer();
 }
 
@@ -1028,6 +1216,7 @@ void BufferCache::CollectMappedRegisteredRanges(const RangeSet& mapped,
 }
 
 void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
+	DrainGuestReadback(request.address, request.size, true);
 	const auto epoch = m_memory_tracker.CpuModificationEpoch(request.address, request.size);
 	const auto registered = m_registration_epoch;
 	if (epoch != 0 && request.cpu_epoch == epoch && request.registration_epoch == registered)
@@ -1042,6 +1231,7 @@ void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	DrainGuestReadback(vaddr, size, true);
 	if (!m_sync_buffers_valid) {
 		m_sync_buffers.clear();
 		m_sync_buffers.reserve(m_buffers.size());
