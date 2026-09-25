@@ -697,8 +697,27 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
 		     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 	}
-	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
-	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
+	if (size.size == 0 || size.align == 0 ||
+	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+		// A sampled view whose guest address misses the alignment the tile table
+		// asks for cannot be described. Storage views carry compute results back,
+		// so they still have to be exact and keep aborting; a sampled view can
+		// degrade the same way an unrepresentable one already does, which keeps
+		// the emulator running instead of killing the session.
+		if (storage) {
+			EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
+			                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
+		}
+		if (m_unrepresentable_textures.insert(address).second) {
+			LOGF("TextureCache: misaligned sampled view addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " align=0x%016" PRIx64 ", bound as null\n",
+			     address, static_cast<uint64_t>(size.size),
+			     static_cast<uint64_t>(size.align));
+		}
+		auto       desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
