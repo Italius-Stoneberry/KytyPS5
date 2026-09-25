@@ -21,4 +21,6 @@ extern volatile std::atomic<uint32_t> kyty_local_preparation_trim_mode;
 extern volatile std::atomic<uint32_t> kyty_local_specialization_guard_mode;
 // 1: graphics pipelines through a block-hashed index of the full key.
 extern volatile std::atomic<uint32_t> kyty_local_pipeline_index_mode;
+// 1: exact copy readbacks served from completed GPU mirrors.
+extern volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode;
 }

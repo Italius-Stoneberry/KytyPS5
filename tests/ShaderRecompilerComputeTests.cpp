@@ -3928,6 +3928,226 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  void CheckCompletedCopyFeedback() {
+    constexpr const char *name = "CompletedCopyFeedback";
+    constexpr uintptr_t base = 0x0000000200700000ull;
+    constexpr uint64_t allocation_size = 0x800000, alignment = 0x10000;
+    constexpr uint64_t source = base + 0x600000;
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "allocation", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+        0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+        alignment, 0, &direct_offset) == 0, "direct allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "mapping", Libs::LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, allocation_size, 0x3, 0x10, direct_offset, alignment) == 0 &&
+        mapped == reinterpret_cast<void *>(base), "direct mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+    const auto old_mode = kyty_local_copy_feedback_mode.exchange(1);
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      resources.MapMemory(base, allocation_size);
+      auto &cache = resources.GetBufferCache();
+      (void)cache.FindBuffer(base, allocation_size);
+      const auto backing = [&](uint64_t address) {
+        uint32_t value = 0;
+        Require(name, "backing read", Libs::LibKernel::Memory::TryReadBacking(
+            address, &value, sizeof(value)), "backing unavailable");
+        return value;
+      };
+      const auto fill = [&](uint64_t address, uint64_t bytes, uint32_t value) {
+        auto [buffer, offset] = cache.ObtainBuffer(address, bytes, true, false);
+        buffer->Fill(offset, bytes, value);
+      };
+      const auto produce = [&](uint64_t destination, uint64_t bytes, uint32_t value) {
+        fill(source, bytes, value);
+        cache.CopyBuffer(destination, source, bytes, false, false);
+        const auto tick = scheduler.CurrentTick();
+        cache.ScheduleCopyFeedback(destination, bytes);
+        Require(name, "no speculative submit", scheduler.CurrentTick() == tick,
+                "copy mirroring submitted GPU work");
+      };
+
+      produce(base + 0x100, 64, 0x12345678);
+      Require(name, "no early publication", backing(base + 0x100) == 0x5a5a5a5a,
+              "speculative copy published backing before consumption");
+      auto before = scheduler.CurrentTick();
+      cache.ReadMemory(base + 0x100, 4);
+      Require(name, "unsubmitted fallback", scheduler.CurrentTick() > before &&
+              backing(base + 0x100) == 0x12345678, "unsubmitted copy bypassed the original readback");
+
+      produce(base + 0x20100, 64, 0x10203040);
+      produce(base + 0x20200, 64, 0xa1b2c3d4);
+      scheduler.Finish();
+      fill(base + 0x25000, 4, 0x77777777);
+      before = scheduler.CurrentTick();
+      cache.ReadMemory(base + 0x20100, 4);
+      Require(name, "completed scattered coverage",
+              scheduler.CurrentTick() == before && backing(base + 0x20100) == 0x10203040 &&
+              backing(base + 0x20200) == 0xa1b2c3d4 && backing(base + 0x20180) == 0x5a5a5a5a &&
+              backing(base + 0x25000) == 0x5a5a5a5a && cache.HasGpuDirtyBytes(base + 0x25000, 4) &&
+              !cache.IsRegionGpuModified(base + 0x20100, 4),
+              "mirror missed complete page coverage or drained unrelated new work");
+
+      produce(base + 0x30100, 64, 0x33333333);
+      scheduler.Finish();
+      fill(base + 0x30200, 4, 0x88888888);
+      before = scheduler.CurrentTick();
+      cache.ReadMemory(base + 0x30100, 4);
+      Require(name, "incomplete page fallback", scheduler.CurrentTick() > before &&
+              backing(base + 0x30100) == 0x33333333 && backing(base + 0x30200) == 0x88888888 &&
+              backing(base + 0x25000) == 0x77777777,
+              "a partial snapshot dropped protection on uncovered dirty bytes");
+
+      produce(base + 0x40100, 64, 0x44444444);
+      scheduler.Finish();
+      cache.FillBuffer(base + 0x40104, 4, 0x99999999, false);
+      before = scheduler.CurrentTick();
+      cache.ReadMemory(base + 0x40100, 4);
+      Require(name, "GPU rewrite fallback", scheduler.CurrentTick() > before &&
+              backing(base + 0x40100) == 0x44444444 &&
+              backing(base + 0x40104) == 0x99999999, "GPU rewrite reused a stale snapshot");
+
+      produce(base + 0x50100, 64, 0x55555555);
+      scheduler.Finish();
+      cache.InvalidateMemory(base + 0x50104, 4);
+      const uint32_t cpu_value = 0xabcdef01;
+      Libs::LibKernel::Memory::WriteBacking(base + 0x50104, &cpu_value, 4);
+      fill(base + 0x50108, 4, 0x66666666);
+      cache.ScheduleCopyFeedback(base + 0x50108, 4);
+      scheduler.Finish();
+      before = scheduler.CurrentTick();
+      cache.ReadMemory(base + 0x50108, 4);
+      Require(name, "CPU rewrite and fresh upload", scheduler.CurrentTick() == before &&
+              backing(base + 0x50100) == 0x55555555 && backing(base + 0x50104) == cpu_value &&
+              backing(base + 0x50108) == 0x66666666,
+              "snapshot publication overwrote CPU-clean bytes or missed a fresh GPU upload");
+
+      produce(base + 0x70100, 64, 0x70707070);
+      scheduler.Finish();
+      resources.MapMemory(base + 0x700000, alignment);
+      before = scheduler.CurrentTick();
+      cache.ReadMemory(base + 0x70100, 4);
+      Require(name, "mapping epoch fallback", scheduler.CurrentTick() > before &&
+              backing(base + 0x70100) == 0x70707070,
+              "mapping change reused an old snapshot");
+
+      constexpr uintptr_t alias_base = 0x0000000201700000ull;
+      void *alias = reinterpret_cast<void *>(alias_base);
+      Require(name, "physical alias mapping", Libs::LibKernel::Memory::KernelMapDirectMemory(
+          &alias, alignment, 0x3, 0x10, direct_offset + 0x80000, alignment) == 0,
+          "physical alias mapping failed");
+      resources.MapMemory(alias_base, alignment);
+      produce(base + 0x80100, 64, 0x80808080);
+      Require(name, "physical alias excluded",
+              !Libs::LibKernel::Memory::IsUniqueGuestBackingRange(base + 0x80100, 64),
+              "aliased storage entered the mirror cache");
+      cache.ReadMemory(base + 0x80100, 4);
+      resources.UnmapMemory(alias_base, alignment);
+      Require(name, "physical alias unmap", Libs::LibKernel::Memory::KernelMunmap(alias_base, alignment) == 0,
+              "physical alias unmap failed");
+
+      for (uint32_t i = 0; i < 129; ++i) produce(base + 0x100000 + i * 0x1000, 4, 0x11000000 + i);
+      scheduler.Finish();
+      before = scheduler.CurrentTick();
+      cache.ReadMemory(base + 0x100000, 4);
+      Require(name, "live slot survived pool exhaustion", scheduler.CurrentTick() == before &&
+              backing(base + 0x100000) == 0x11000000, "pool exhaustion overwrote an in-flight slot");
+      cache.ReadMemory(base + 0x180000, 4);
+      Require(name, "pool fallback contents", backing(base + 0x180000) == 0x11000080,
+              "uncached producer lost its original GPU result");
+
+      for (uint32_t iteration = 0; iteration < 24; ++iteration) {
+        const auto bytes = 4 * (1 + (iteration * 97) % 5000);
+        const uint32_t value = 0x91371100u ^ iteration;
+        produce(base + 0x200000, bytes, value);
+        scheduler.Finish();
+        cache.ReadMemory(base + 0x200000, bytes);
+        Require(name, "changing GPU results", backing(base + 0x200000) == value &&
+                backing(base + 0x200000 + bytes - 4) == value,
+                "fresh GPU values disagreed with the completed mirror");
+      }
+
+      produce(base + 0x300000, 4, 0x1234abcd);
+      scheduler.Finish();
+      TextureCache::ImageDesc image{};
+      image.type = TextureCache::BindingType::Texture;
+      image.info.data = {base + 0x300000, 4};
+      image.info.pixel_format = vk::Format::eR8G8B8A8Uint;
+      image.info.guest_format = Prospero::BufferFormat::k8_8_8_8UInt;
+      image.info.type = Prospero::ImageType::kColor2D;
+      image.info.extent = {1, 1, 1};
+      image.info.resources = {1, 1};
+      image.info.pitch = 1;
+      image.info.bytes_per_block = 4;
+      image.info.samples = 1;
+      image.info.tile_mode = Prospero::TileMode::kLinear;
+      image.info.mip_layout[0] = {0, 4, 1, 1};
+      image.view_info.format = image.info.pixel_format;
+      image.view_info.type = vk::ImageViewType::e2D;
+      image.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      image.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      (void)resources.GetTextureCache().FindImage(image);
+      cache.ScheduleCopyFeedback(base + 0x300000, 4);
+      before = scheduler.CurrentTick();
+      cache.ReadMemory(base + 0x300000, 4);
+      Require(name, "image alias excludes queue and consume", scheduler.CurrentTick() > before &&
+              backing(base + 0x300000) == 0x1234abcd, "image alias reused a buffer mirror");
+
+      produce(base + 0x310100, 64, 0x13572468);
+      scheduler.Finish();
+      resources.UnmapMemory(base + 0x310000, alignment);
+      Require(name, "live snapshot unmap", Libs::LibKernel::Memory::KernelMunmap(base + 0x310000, alignment) == 0,
+              "snapshot mapping unmap failed");
+      void *remapped = reinterpret_cast<void *>(base + 0x310000);
+      Require(name, "same-address remap", Libs::LibKernel::Memory::KernelMapDirectMemory(
+          &remapped, alignment, 0x3, 0x10, direct_offset + 0x310000, alignment) == 0,
+          "snapshot same-address remap failed");
+      resources.MapMemory(base + 0x310000, alignment);
+      const uint32_t remap_value = 0xfedcba98;
+      Libs::LibKernel::Memory::WriteBacking(base + 0x310100, &remap_value, 4);
+      auto [remap_buffer, remap_offset] = cache.ObtainBuffer(base + 0x310100, 4, true, false);
+      cache.ReadMemory(base + 0x310100, 4);
+      Require(name, "remap fresh bytes", backing(base + 0x310100) == remap_value,
+              "same-address remap exposed an old mirror");
+      (void)remap_buffer; (void)remap_offset;
+
+      produce(base + 0x330100, 64, 0x97532468);
+      scheduler.Finish();
+      const auto old_owner = cache.GetBuffer(cache.FindBuffer(base + 0x330100, 4)).Handle();
+      // Discovery may merge a live owner into a larger Vulkan allocation without
+      // changing guest addresses. The completed mirror must still be invalidated.
+      const auto merged_id = cache.FindBuffer(base - alignment, allocation_size + alignment);
+      before = scheduler.CurrentTick();
+      cache.ReadMemory(base + 0x330100, 4);
+      Require(name, "owner replacement fallback", cache.GetBuffer(merged_id).Handle() != old_owner &&
+              scheduler.CurrentTick() > before && backing(base + 0x330100) == 0x97532468,
+              "owner merge reused a retired mirror or lost the original GPU result");
+
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    scheduler.Shutdown();
+    context.ShutdownGpu();
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "direct allocation release failed");
+    std::printf("%-32s ok\n", name);
+    kyty_local_copy_feedback_mode.store(old_mode);
+  }
+#endif
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -31218,6 +31438,13 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  if (argc == 2 && std::strcmp(argv[1], "--copy-feedback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckCompletedCopyFeedback();
+    return 0;
+  }
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();

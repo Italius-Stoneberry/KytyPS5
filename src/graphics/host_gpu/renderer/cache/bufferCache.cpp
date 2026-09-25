@@ -1,9 +1,11 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "native-buffer-residency.h"
+#include "native-resource-state.h"
 
 extern "C" {
 volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
+volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 }
 
 #include "common/assert.h"
@@ -19,6 +21,7 @@ volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -64,6 +67,156 @@ struct BufferCache::DownloadCopy {
 	uint64_t size          = 0;
 };
 
+// All metadata and mapped reads belong to the GPU thread. A slot is reused only
+// after its copy tick completes; speculative copies never publish CPU ownership.
+struct BufferCache::CopyFeedback {
+	static constexpr uint64_t SlotSize = 64 * 1024;
+	static constexpr size_t SlotCount = 512;
+	struct Slot {
+		uint64_t address = 0, size = 0, tick = 0, mapping_epoch = 0;
+		vk::Buffer owner = nullptr;
+	};
+	Buffer download;
+	std::array<Slot, SlotCount> slots {};
+	std::map<uint64_t, size_t> index;
+	size_t cursor = 0;
+	CopyFeedback(GraphicContext& graphics, CommandScheduler& scheduler)
+	    : download(graphics, scheduler, MemoryUsage::Download, 0,
+	               vk::BufferUsageFlagBits::eTransferDst, SlotCount * SlotSize) {
+		// Each slot has a separate non-coherent atom, even when adjacent slots are in flight.
+		const auto atom = graphics.physical_device_properties.limits.nonCoherentAtomSize;
+		EXIT_IF(atom == 0 || SlotSize % atom != 0);
+	}
+};
+
+void BufferCache::InvalidateCopyFeedback(uint64_t vaddr, uint64_t size) {
+	if (!m_copy_feedback || m_copy_feedback->index.empty()) return;
+	auto& feedback = *m_copy_feedback;
+	auto it = feedback.index.lower_bound(vaddr);
+	if (it != feedback.index.begin()) {
+		const auto prior = std::prev(it);
+		const auto& slot = feedback.slots[prior->second];
+		if (slot.address + slot.size > vaddr) it = prior;
+	}
+	while (it != feedback.index.end() && it->first < vaddr + size) {
+		feedback.slots[it->second].address = 0;
+		it = feedback.index.erase(it);
+	}
+}
+
+void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
+	if (kyty_local_copy_feedback_mode.load(std::memory_order_relaxed) == 0) return;
+	const auto mapping_epoch = m_resources ? m_resources->MappingEpoch() : 0;
+	if (!m_resources || !GuestRange {vaddr, size}.Valid() ||
+	    ((vaddr | size) & 3u) != 0 || size > CopyFeedback::SlotSize ||
+	    !m_gpu_modified_ranges.Contains(vaddr, size) ||
+	    m_texture_cache.HasTrackedDataOverlap(vaddr, size) ||
+	    !m_resources->IsMapped(vaddr, size) ||
+	    !LibKernel::Memory::IsUniqueGuestBackingRange(vaddr, size)) {
+		return;
+	}
+	const auto* owner_id = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	auto* owner = owner_id && *owner_id ? m_slot_buffers.try_get(*owner_id) : nullptr;
+	if (!owner || owner->is_deleted || !owner->IsInBounds(vaddr, size)) {
+		return;
+	}
+	if (!m_copy_feedback) m_copy_feedback = std::make_unique<CopyFeedback>(m_graphics, m_scheduler);
+	auto& feedback = *m_copy_feedback;
+	auto& master = m_scheduler.GetMasterSemaphore();
+	size_t selected = CopyFeedback::SlotCount;
+	for (unsigned refresh = 0; refresh < 2 && selected == CopyFeedback::SlotCount; ++refresh) {
+		if (refresh) master.Refresh();
+		const auto completed = master.KnownGpuTick();
+		// Prefer an invalidated slot, then evict an old completed snapshot if necessary.
+		for (unsigned evict = 0; evict < 2 && selected == CopyFeedback::SlotCount; ++evict) {
+			for (size_t n = 0; n < CopyFeedback::SlotCount; ++n) {
+				const auto i = (feedback.cursor + n) % CopyFeedback::SlotCount;
+				const auto& slot = feedback.slots[i];
+				if (slot.tick <= completed && (evict || slot.address == 0)) {
+					selected = i;
+					break;
+				}
+			}
+		}
+	}
+	if (selected == CopyFeedback::SlotCount) {
+		return; // Never submit or wait merely to obtain speculative storage.
+	}
+	if (m_resources->MappingEpoch() != mapping_epoch) return;
+	auto& slot = feedback.slots[selected];
+	if (slot.address) {
+		feedback.index.erase(slot.address);
+	}
+	InvalidateCopyFeedback(vaddr, size);
+	feedback.download.CopyFrom(m_scheduler.Current(), *owner, owner->Offset(vaddr),
+	    selected * CopyFeedback::SlotSize, size, vk::AccessFlagBits::eMemoryWrite,
+	    vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostRead,
+	    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	    vk::AccessFlagBits::eHostRead);
+	slot = {vaddr, size, m_scheduler.CurrentTick(), mapping_epoch, owner->Handle()};
+	feedback.index.emplace(vaddr, selected);
+	feedback.cursor = (selected + 1) % CopyFeedback::SlotCount;
+}
+
+bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	if (kyty_local_copy_feedback_mode.load(std::memory_order_relaxed) == 0 || !m_copy_feedback || !m_resources)
+		return false;
+	const auto begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto end = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	if (!buffer.IsInBounds(begin, end - begin) || end - begin > CopyFeedback::SlotSize ||
+	    m_texture_cache.HasTrackedDataOverlap(begin, end - begin)) {
+		return false;
+	}
+	std::vector<DownloadCopy> copies;
+	m_memory_tracker.ForEachDownloadRange<false>(begin, end - begin,
+	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+		                                           "copy feedback");
+	    },
+	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_gpu_modified_ranges.ForEachIntersection(address, bytes, [&](RangeSet::Range range) {
+			    copies.push_back({&buffer, buffer.Offset(range.address), range.address, range.size});
+		    });
+	    });
+	if (copies.empty()) return false;
+	struct Part { uint64_t address, size, offset; };
+	std::vector<Part> parts;
+	auto& feedback = *m_copy_feedback;
+	const auto mapping_epoch = m_resources->MappingEpoch();
+	uint64_t latest_tick = 0;
+	for (const auto& copy: copies) {
+		auto cursor = copy.address;
+		while (cursor < copy.address + copy.size) {
+			auto it = feedback.index.upper_bound(cursor);
+			if (it == feedback.index.begin()) return false;
+			--it;
+			const auto& slot = feedback.slots[it->second];
+			if (cursor >= slot.address + slot.size) return false;
+			if (slot.owner != buffer.Handle() || slot.mapping_epoch != mapping_epoch ||
+			    !m_resources->IsMapped(slot.address, slot.size) ||
+			    !LibKernel::Memory::IsUniqueGuestBackingRange(slot.address, slot.size)) {
+				return false;
+			}
+			const auto bytes = std::min(copy.address + copy.size, slot.address + slot.size) - cursor;
+			parts.push_back({cursor, bytes, it->second * CopyFeedback::SlotSize + cursor - slot.address});
+			latest_tick = std::max(latest_tick, slot.tick);
+			cursor += bytes;
+		}
+	}
+	if (!m_scheduler.IsFree(latest_tick)) return false;
+	m_scheduler.WaitPriorityOperations(latest_tick);
+	if (m_resources->MappingEpoch() != mapping_epoch) return false;
+	for (const auto& part: parts) feedback.download.Invalidate(part.offset, part.size);
+	for (const auto& part: parts) {
+		LibKernel::Memory::WriteBacking(part.address, feedback.download.Mapped().data() + part.offset, part.size);
+	}
+	for (const auto& copy: copies) m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+	// Only complete dirty-page coverage allows dropping protection. CPU-clean bytes
+	// are never published from the snapshot. Any later upload/GPU write invalidates it.
+	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
+	return true;
+}
+
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
 }
@@ -77,6 +230,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 	m_sync_buffers_valid = false;
 	++m_registration_epoch;
 	auto& buffer = m_slot_buffers[id];
+	if constexpr (!insert) InvalidateCopyFeedback(buffer.CpuAddress(), buffer.Size());
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
@@ -241,7 +395,8 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
-                         PageManager& page_manager, TextureCache& texture_cache)
+                         PageManager& page_manager, TextureCache& texture_cache,
+                         GpuResourceManager* resources)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_lod_stats_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, 256 * 16),
@@ -252,7 +407,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
-      m_texture_cache(texture_cache) {
+      m_texture_cache(texture_cache), m_resources(resources) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	std::memset(m_lod_stats_buffer.Mapped().data(), 0, 256 * 16);
@@ -317,6 +472,10 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		return;
 	}
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	if (TryReadCopyFeedback(buffer, vaddr, size)) {
+		if (is_write) m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		return;
+	}
 
 	// Widen nearby CPU reads so they share one GPU drain.
 	constexpr uint64_t WindowSize   = 512 * 1024;
@@ -478,6 +637,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
+		for (const auto& copy: copies)
+			InvalidateCopyFeedback(buffer.CpuAddress() + copy.dstOffset, copy.size);
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -574,6 +735,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(*buffer);
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		InvalidateCopyFeedback(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return {buffer, buffer->Offset(vaddr)};
@@ -602,8 +764,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size, &prt_failure))) {
 		EXIT("BufferCache: failed to read mapped guest image backing: "
 		     "address=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " staging=%p staging_capacity=0x%016" PRIx64 " prt_failure=%s\n",
-		     vaddr, size, static_cast<void*>(staging), m_staging_buffer.Size(), prt_failure);
+		     " staging=%p staging_capacity=0x%016" PRIx64 " mapped=%u prt_failure=%s\n",
+		     vaddr, size, static_cast<void*>(staging), m_staging_buffer.Size(),
+		     m_resources != nullptr && m_resources->IsMapped(vaddr, size), prt_failure);
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};

@@ -21,6 +21,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 class CommandScheduler;
 class TextureCache;
+class GpuResourceManager;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
@@ -34,7 +35,7 @@ public:
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
-	            TextureCache& texture_cache);
+	            TextureCache& texture_cache, GpuResourceManager* resources = nullptr);
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
@@ -66,6 +67,8 @@ public:
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
+	// Called after an identified small GPU copy; it never submits or publishes guest data.
+	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -119,6 +122,10 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
+	struct CopyFeedback;
+	void InvalidateCopyFeedback(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	std::unique_ptr<CopyFeedback> m_copy_feedback;
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -149,6 +156,7 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
+	GpuResourceManager*                               m_resources = nullptr;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;

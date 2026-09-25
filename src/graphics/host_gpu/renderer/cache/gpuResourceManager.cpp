@@ -8,7 +8,7 @@
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
-    : m_scheduler(scheduler), m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache),
+    : m_scheduler(scheduler), m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache, this),
       m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache) {}
 
 GpuResourceManager::~GpuResourceManager() = default;

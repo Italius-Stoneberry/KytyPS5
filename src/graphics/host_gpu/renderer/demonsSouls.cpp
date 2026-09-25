@@ -67,6 +67,7 @@ bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint
 	    !LibKernel::Memory::IsUniqueGuestBackingRange(parameters.Base48(), 16))
 		return false;
 	cache.CopyBuffer(dst, src, bytes, false, false);
+	cache.ScheduleCopyFeedback(dst, bytes);
 	return true;
 }
 } // namespace Libs::Graphics::DemonsSouls

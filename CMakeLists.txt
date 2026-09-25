@@ -742,6 +742,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
 			COMMAND shader_recompiler_compute_tests --native-pipeline-index-only)
 		add_test(NAME draw_run_ranges COMMAND shader_recompiler_compute_tests --draw-run-ranges-only)
 		add_test(NAME binding_scratch COMMAND shader_recompiler_compute_tests --binding-scratch-only)
+		add_test(NAME copy_feedback COMMAND shader_recompiler_compute_tests --copy-feedback-only)
 	endif()
 endif()
 

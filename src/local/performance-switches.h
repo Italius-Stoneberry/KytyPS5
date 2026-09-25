@@ -39,6 +39,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_DRAW_RUN_RANGES", &kyty_local_draw_run_ranges_mode},
 	    // Buffers and guest memory.
 	    Switch {"KYTY_BUFFER_RESIDENCY", &kyty_local_buffer_residency_mode},
+	    Switch {"KYTY_COPY_FEEDBACK", &kyty_local_copy_feedback_mode},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {
