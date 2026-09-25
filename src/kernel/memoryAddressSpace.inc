@@ -171,6 +171,8 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
+		std::lock_guard lock(m_mutex);
+		BackingWriteFence fence(*this);
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -181,7 +183,7 @@ public:
 			return false;
 		}
 		const auto* source = static_cast<const uint8_t*>(data);
-		return TryTransferBacking(vaddr, size,
+		return TryTransferBacking<true>(vaddr, size,
 		                          [source](uint8_t* backing, uint64_t data_offset, size_t bytes) {
 			                          std::memcpy(backing, source + data_offset, bytes);
 		                          });
@@ -192,10 +194,35 @@ public:
 			return false;
 		}
 		auto* destination = static_cast<uint8_t*>(data);
-		return TryTransferBacking(
+		return TryTransferBacking<false>(
 		    vaddr, size, [destination](uint8_t* backing, uint64_t data_offset, size_t bytes) {
 			    std::memcpy(destination + data_offset, backing, bytes);
 		    });
+	}
+
+	bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+		if (kyty_local_backing_read_mode.load(std::memory_order_relaxed) != 0 && IsAvailable() &&
+		    data && size && size <= 0x10000 && UINT64_MAX - vaddr >= size) {
+			BackingReadTransaction read(*this);
+			if (read.Acquired()) {
+				auto& cached = m_host_read_translations[(vaddr >> 22) % m_host_read_translations.size()];
+				MapEntry entry {};
+				if (cached.epoch == m_mapping_epoch &&
+				    GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
+					entry = cached.entry;
+				} else if (FindContainingUnlocked(vaddr, size, &entry)) {
+					cached = {entry, m_mapping_epoch};
+				}
+				if (entry.size && RangeOk(entry.backing_offset + vaddr - entry.vaddr, size)) {
+					const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+					std::memcpy(data, m_backing_base + offset, size);
+					return true;
+				}
+			}
+			// The transaction is released here, before a spanning transfer or a
+			// writer-held mutex can wait.
+		}
+		return TryReadBacking(vaddr, data, size);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -257,7 +284,8 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
-			m_alias_ranges_valid = false;
+			BackingWriteFence fence(*this);
+			InvalidateMappingLookup();
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -269,7 +297,8 @@ public:
 		}
 		{
 			std::lock_guard lock(m_mutex);
-			m_alias_ranges_valid = false;
+			BackingWriteFence fence(*this);
+			InvalidateMappingLookup();
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -360,7 +389,8 @@ public:
 				auto entry = std::prev(next);
 				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
 					old = entry->second;
-					m_alias_ranges_valid = false;
+					BackingWriteFence fence(*this);
+					InvalidateMappingLookup();
 					m_maps.erase(entry);
 				}
 			}
@@ -376,7 +406,8 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
-				m_alias_ranges_valid = false;
+				BackingWriteFence fence(*this);
+				InvalidateMappingLookup();
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -431,13 +462,15 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		m_alias_ranges_valid = false;
+		BackingWriteFence fence(*this);
+		InvalidateMappingLookup();
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
 		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			std::lock_guard lock(m_mutex);
-			m_alias_ranges_valid = false;
+			BackingWriteFence fence(*this);
+			InvalidateMappingLookup();
 			m_maps.emplace(old.vaddr, old);
 			return false;
 		}
@@ -541,13 +574,68 @@ private:
 	}
 
 private:
-	template <typename Transfer>
+	// The original mutex still serializes all writers and mapping mutations.
+	// A writer announces itself before inspecting the one reader slot. Sequential
+	// consistency makes it impossible for both entrants to miss the other: either
+	// the reader falls back, or the writer waits for its bounded host copy to end.
+	// No GPU work, guest faults, or other locks occur inside that copy transaction.
+	class BackingWriteFence {
+	public:
+		KYTY_CLASS_NO_COPY(BackingWriteFence);
+		explicit BackingWriteFence(GuestBackingStore& store): m_store(store) {
+			m_store.m_host_write_pending.store(true, std::memory_order_seq_cst);
+			unsigned spins = 0;
+			while (m_store.m_host_read_active.test(std::memory_order_seq_cst)) {
+				_mm_pause();
+				if (++spins == 256) { std::this_thread::yield(); spins = 0; }
+			}
+		}
+		~BackingWriteFence() {
+			m_store.m_host_write_pending.store(false, std::memory_order_release);
+		}
+	private:
+		GuestBackingStore& m_store;
+	};
+
+	class BackingReadTransaction {
+	public:
+		KYTY_CLASS_NO_COPY(BackingReadTransaction);
+		explicit BackingReadTransaction(GuestBackingStore& store): m_store(store) {
+			if (m_store.m_host_write_pending.load(std::memory_order_relaxed) ||
+			    m_store.m_host_read_active.test_and_set(std::memory_order_seq_cst)) return;
+			m_acquired = true;
+			if (m_store.m_host_write_pending.load(std::memory_order_seq_cst)) Release();
+		}
+		~BackingReadTransaction() { Release(); }
+		bool Acquired() const { return m_acquired; }
+	private:
+		void Release() {
+			if (m_acquired) {
+				m_store.m_host_read_active.clear(std::memory_order_release);
+				m_acquired = false;
+			}
+		}
+		GuestBackingStore& m_store;
+		bool m_acquired = false;
+	};
+
+	template <bool Write, typename Transfer>
 	bool TryTransferBacking(uint64_t vaddr, uint64_t size, Transfer transfer) {
 		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
 		std::lock_guard lock(m_mutex);
+		if constexpr (Write) {
+			BackingWriteFence fence(*this);
+			return TransferBackingUnlocked(vaddr, size, transfer);
+		} else {
+			return TransferBackingUnlocked(vaddr, size, transfer);
+		}
+	}
+
+	template <typename Transfer>
+	bool TransferBackingUnlocked(uint64_t vaddr, uint64_t size, Transfer transfer) {
 		const auto      end     = vaddr + size;
 		if (kyty_local_preparation_lookup_mode.load(std::memory_order_relaxed)) {
 			MapEntry entry{};
@@ -591,6 +679,14 @@ private:
 		uint64_t            backing_offset = 0;
 		VirtualMemory::Mode mode           = VirtualMemory::Mode::NoAccess;
 	};
+
+	void InvalidateMappingLookup() {
+		m_alias_ranges_valid = false;
+		if (++m_mapping_epoch == 0) {
+			m_mapping_epoch = 1;
+			m_host_read_translations = {};
+		}
+	}
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
 		EXIT_IF(out == nullptr);
@@ -722,6 +818,11 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_aliased_physical_ranges;
 	bool m_alias_ranges_valid = false;
 	std::map<uint64_t, MapEntry> m_maps;
+	alignas(64) std::atomic_bool m_host_write_pending {false};
+	alignas(64) std::atomic_flag m_host_read_active = ATOMIC_FLAG_INIT;
+	struct HostReadTranslation { MapEntry entry; uint64_t epoch = 0; };
+	std::array<HostReadTranslation, 64> m_host_read_translations {};
+	uint64_t m_mapping_epoch = 1;
 };
 
 class GuestAddressSpace {
@@ -813,6 +914,9 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+	bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+		return m_backing->TryReadBackingToHost(vaddr, data, size);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {

@@ -2,6 +2,8 @@
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
 #include "native-resource-state.h"
 #include "native-preparation-scratch.h"
+extern "C" volatile std::atomic_uint32_t kyty_local_backing_read_mode;
+#include <barrier>
 extern "C" volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode;
 #endif
 #include "common/emulatorConfig.h"
@@ -5287,6 +5289,107 @@ public:
             "slice growth direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
+
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  void CheckHostBackingReadTransactions() {
+    constexpr const char* name = "HostBackingReadTransactions";
+    namespace Memory = Libs::LibKernel::Memory;
+    constexpr uint64_t base = 0x201200000ull, page = 0x4000, alias = base + 4 * page;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", Memory::KernelAllocateDirectMemory(
+        0, Memory::KernelGetDirectMemorySize(), 8 * page, page, 0, &physical) == 0,
+        "backing allocation failed");
+    const auto map = [&](uint64_t address, uint64_t offset) {
+      void* target = reinterpret_cast<void*>(address);
+      Require(name, "map", Memory::KernelMapDirectMemory(
+          &target, page, 0x3, 0x10, physical + offset, page) == 0 &&
+          reinterpret_cast<uint64_t>(target) == address, "backing mapping failed");
+    };
+    map(base, 0); map(base + page, page); map(alias, 0);
+    std::vector<uint8_t> first(page, 0x11), second(page, 0x22), third(page, 0x33);
+    Require(name, "initialize", Memory::TryWriteBacking(base, first.data(), page) &&
+        Memory::TryWriteBacking(base + page, second.data(), page), "initial write failed");
+    kyty_local_backing_read_mode.store(1, std::memory_order_relaxed);
+    std::vector<uint8_t> output(page, 0x55);
+    Require(name, "alias read", Memory::TryReadBackingToHost(alias, output.data(), page) &&
+        output == first, "physical alias was not resolved");
+    std::array<uint8_t, 32> crossing {};
+    Require(name, "adjacent mappings", Memory::TryReadBackingToHost(base + page - 16,
+        crossing.data(), crossing.size()) &&
+        std::all_of(crossing.begin(), crossing.begin() + 16, [](auto v) { return v == 0x11; }) &&
+        std::all_of(crossing.begin() + 16, crossing.end(), [](auto v) { return v == 0x22; }),
+        "spanning fallback did not preserve each physical mapping");
+    crossing.fill(0x55);
+    Require(name, "transactional failure", !Memory::TryReadBackingToHost(
+        base + 2 * page - 16, crossing.data(), crossing.size()) &&
+        std::all_of(crossing.begin(), crossing.end(), [](auto v) { return v == 0x55; }),
+        "a request crossing an unmapped hole partially changed its destination");
+    Require(name, "invalid requests", !Memory::TryReadBackingToHost(base, nullptr, page) &&
+        !Memory::TryReadBackingToHost(base, output.data(), 0) &&
+        !Memory::TryReadBackingToHost(UINT64_MAX - 4, output.data(), 16),
+        "invalid host copy accepted");
+
+    std::atomic_bool valid {true};
+    std::barrier gate(3);
+    auto reader = [&] {
+      std::vector<uint8_t> bytes(page);
+      gate.arrive_and_wait();
+      for (unsigned i = 0; i < 2000; ++i) {
+        const bool ok = i % 2 == 1 ? Memory::TryReadBackingToHost(alias, bytes.data(), page)
+                                   : Memory::TryReadBacking(alias, bytes.data(), page);
+        if (!ok || (bytes.front() != 0x11 && bytes.front() != 0x33) ||
+            !std::all_of(bytes.begin(), bytes.end(), [&](auto v) { return v == bytes.front(); }))
+          valid.store(false, std::memory_order_relaxed);
+      }
+    };
+    std::thread reader_a(reader), reader_b(reader);
+    gate.arrive_and_wait();
+    for (unsigned i = 0; i < 2000; ++i) {
+      // Flip while copies are in flight: both modes share the writer exclusion.
+      kyty_local_backing_read_mode.store(i & 1u, std::memory_order_relaxed);
+      const auto& bytes = i & 1u ? first : third;
+      if (!Memory::TryWriteBacking(base, bytes.data(), page)) valid.store(false);
+    }
+    reader_a.join(); reader_b.join();
+    Require(name, "concurrent alias writes", valid.load(),
+            "host copy observed a torn write or failed during an unchanged mapping");
+    kyty_local_backing_read_mode.store(1, std::memory_order_relaxed);
+    Require(name, "reset", Memory::TryWriteBacking(base, first.data(), page), "reset failed");
+
+    std::barrier remap_gate(3);
+    auto remap_reader = [&] {
+      std::vector<uint8_t> bytes(page);
+      remap_gate.arrive_and_wait();
+      for (unsigned i = 0; i < 4000; ++i) {
+        std::fill(bytes.begin(), bytes.end(), 0x55);
+        const bool ok = i % 2 == 1 ? Memory::TryReadBackingToHost(alias, bytes.data(), page)
+                                   : Memory::TryReadBacking(alias, bytes.data(), page);
+        const auto expected = ok ? bytes.front() : uint8_t{0x55};
+        if ((ok && expected != 0x11 && expected != 0x22) ||
+            !std::all_of(bytes.begin(), bytes.end(), [&](auto v) { return v == expected; }))
+          valid.store(false, std::memory_order_relaxed);
+      }
+    };
+    std::thread remap_a(remap_reader), remap_b(remap_reader);
+    remap_gate.arrive_and_wait();
+    for (unsigned i = 0; i < 100; ++i) {
+      Require(name, "unmap", Memory::KernelMunmap(alias, page) == 0, "alias unmap failed");
+      map(alias, (i & 1u) * page);
+      const auto& expected = i & 1u ? second : first;
+      Require(name, "mapping epoch", Memory::TryReadBackingToHost(alias, output.data(), page) &&
+          output == expected, "cached translation survived replacement with another physical page");
+    }
+    remap_a.join(); remap_b.join();
+    Require(name, "concurrent remapping", valid.load(), "remapping exposed torn or partial data");
+    for (const auto address : {base, base + page, alias})
+      Require(name, "cleanup mapping", Memory::KernelMunmap(address, page) == 0, "unmap failed");
+    Require(name, "release", Memory::KernelReleaseDirectMemory(physical, 8 * page) == 0,
+            "release failed");
+    kyty_local_backing_read_mode.store(0, std::memory_order_relaxed);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+#endif
 
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
@@ -31453,6 +31556,15 @@ int main(int argc, char **argv) {
     vulkan.CheckPreparedBindingScratch();
     vulkan.CheckUnifiedTextureCacheFlow();
     kyty_local_binding_scratch_mode.store(0, std::memory_order_relaxed);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--host-backing-read-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckHostBackingReadTransactions();
+    kyty_local_backing_read_mode.store(1, std::memory_order_relaxed);
+    vulkan.CheckUnifiedTextureCacheFlow();
+    vulkan.CheckCpuWriteWindow();
+    kyty_local_backing_read_mode.store(0, std::memory_order_relaxed);
     return 0;
   }
 #endif

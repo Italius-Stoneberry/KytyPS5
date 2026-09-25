@@ -21,7 +21,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
+
+#include <immintrin.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -49,6 +52,12 @@
 #endif
 
 namespace Libs::LibKernel::Memory {
+
+extern "C" {
+// 1: small host-copy reads of guest backing take a lock-free read transaction
+// with a cached translation instead of the backing mutex.
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_backing_read_mode {0};
+}
 
 namespace VirtualMemory = Common::VirtualMemory;
 
@@ -906,7 +915,12 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
-bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryReadBackingToHost(vaddr, data, size);
+}
+
+static bool TryReadGpuCleanBackingImpl(uint64_t vaddr, void* data, uint64_t size, bool host) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||
 		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
@@ -914,19 +928,28 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 			return false;
 		}
 	}
-	return TryReadBacking(vaddr, data, size);
+	return host ? TryReadBackingToHost(vaddr, data, size) : TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	return TryReadGpuCleanBackingImpl(vaddr, data, size, false);
+}
+
+bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+	return TryReadGpuCleanBackingImpl(vaddr, data, size, true);
+}
+
+bool IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr && g_guest_address_space->IsUniqueBackingRange(vaddr, size);
 }
-}
 
+bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size) {
 	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
 	       IsGpuAddressRange(vaddr, size) && g_gpu_resources->HasReadWatchers(vaddr, size) &&
 	       TryReadGpuCleanBacking(vaddr, data, size);
 }
-}
 
+bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean) {
 	if (!data || size < 8 || size > 64 || !g_gpu_resources || !Graphics::GuestGpu::IsGpuThread() ||
 	    !IsGpuAddressRange(vaddr, size))
 		return false;
@@ -935,7 +958,6 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return true;
 	}
 	return TryReadGpuCleanBackingToHost(vaddr, data, size);
-	return TryReadGpuCleanBacking(vaddr, data, size);
 }
 
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {

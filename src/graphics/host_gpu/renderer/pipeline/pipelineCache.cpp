@@ -108,7 +108,7 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return value != nullptr &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+	       Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(address, value, sizeof(*value));
 }
 
 bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
