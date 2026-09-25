@@ -59,6 +59,7 @@ void BufferCache::Unregister(BufferId id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
+	m_sync_buffers_valid = false;
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
@@ -728,19 +729,41 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	const auto end = vaddr + size;
-	auto       it  = m_buffers.upper_bound(vaddr);
-	if (it != m_buffers.begin()) {
-		--it;
+	if (!m_sync_buffers_valid) {
+		m_sync_buffers.clear();
+		m_sync_buffers.reserve(m_buffers.size());
+		for (const auto& [address, id]: m_buffers) {
+			auto& buffer = m_slot_buffers[id];
+			m_sync_buffers.push_back({address, address + buffer.Size(), &buffer});
+		}
+		m_sync_stamps.assign(m_sync_buffers.size(), {});
+		m_sync_buffers_valid = true;
 	}
-	for (; it != m_buffers.end() && it->first < end; ++it) {
-		auto&      buffer = m_slot_buffers[it->second];
-		const auto start  = std::max(buffer.CpuAddress(), vaddr);
-		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+	const auto end = vaddr + size;
+
+	auto it = std::lower_bound(m_sync_buffers.begin(), m_sync_buffers.end(), vaddr,
+	                           [](const SyncBuffer& buffer, uint64_t address) {
+		                           return buffer.end <= address;
+	                           });
+	for (; it != m_sync_buffers.end() && it->start < end; ++it) {
+		const auto start  = std::max(it->start, vaddr);
+		const auto finish = std::min(it->end, end);
 		if (start < finish) {
-			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+			SyncStamp* stamp = nullptr;
+			uint64_t epoch = 0;
+			{
+				stamp = &m_sync_stamps[static_cast<size_t>(it - m_sync_buffers.begin())];
+				epoch = m_memory_tracker.CpuModificationEpoch(start, finish - start);
+				if (epoch != 0 && stamp->epoch == epoch && start >= stamp->begin && finish <= stamp->end) continue;
+			}
+			(void)SynchronizeBuffer(*it->buffer, start, finish - start, false, false);
+			if (stamp != nullptr && epoch != 0 && m_sync_buffers_valid &&
+			    m_memory_tracker.CpuModificationEpoch(start, finish - start) == epoch) {
+				*stamp = {start, finish, epoch};
+			}
 		}
 	}
+
 }
 
 } // namespace Libs::Graphics
