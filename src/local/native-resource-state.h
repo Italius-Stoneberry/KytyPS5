@@ -29,4 +29,7 @@ extern volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode;
 // 1: a GPU write over a guest readback whose copy has not started detaches it
 // instead of waiting for the reader (the reader faults again for newer bytes).
 extern volatile std::atomic<uint32_t> kyty_local_readback_detach_mode;
+// 1: a guest write to GPU-owned memory takes the asynchronous readback (the writer
+// waits for the copy) instead of a GPU-thread download that drains the GPU.
+extern volatile std::atomic<uint32_t> kyty_local_async_write_readback_mode;
 }

@@ -10,6 +10,7 @@ extern "C" {
 volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
 volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_detach_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_write_readback_mode {0};
 // 1: pack the LOD report on the GPU instead of a CPU wait and copy.
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // 1: shader constants stream through a host-visible upload ring.
@@ -727,25 +728,42 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	if (!is_write && !GuestGpu::IsGpuThread() && GuestReadbacksEnabled()) {
+	// A write takes the same asynchronous copy (KYTY_ASYNC_WRITE_READBACK): the
+	// GPU thread records the download instead of draining the GPU; the writer
+	// waits and copies, then the written range becomes CPU-owned.
+	const bool async_write = is_write && kyty_local_async_write_readback_mode.load(std::memory_order_relaxed) != 0;
+	if ((!is_write || async_write) && !GuestGpu::IsGpuThread() && GuestReadbacksEnabled()) {
 		std::shared_ptr<GuestReadback> request;
 		auto& gpu = m_scheduler.Context().GetGpu();
 		gpu.SendCommandSync([&] {
 			bool completed = false;
 			request = BeginGuestReadback(vaddr, size, &completed);
-			if (!request && !completed) ReadMemoryOnGpu(vaddr, size, false);
+			if (!request && (is_write || !completed)) ReadMemoryOnGpu(vaddr, size, is_write);
 		});
 		if (request) {
 			CopyGuestReadback(request);
-			gpu.SendCommandSync([this, request] {
+			gpu.SendCommandSync([this, request, vaddr, size, is_write] {
 				// An overlapping access may already have retired this request.
 				if (m_guest_readbacks[request->slot] == request) FinishGuestReadback(request->slot);
+				if (is_write) FinishWriteReadback(vaddr, size);
 			});
 		}
 		return;
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync(
 	    [this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
+}
+
+// GPU thread, after an asynchronous readback for a guest write: the tail of
+// ReadMemoryOnGpu(is_write). A range the readback left GPU-owned (detached, or
+// outside its window) is downloaded as before.
+void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size) {
+	if (!IsRegionRegistered(vaddr, size)) return;
+	if (m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		ReadMemoryOnGpu(vaddr, size, true);
+		return;
+	}
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {

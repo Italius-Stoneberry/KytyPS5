@@ -170,6 +170,7 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
+	void FinishWriteReadback(uint64_t vaddr, uint64_t size);
 	struct GuestReadback;
 	std::shared_ptr<GuestReadback> BeginGuestReadback(uint64_t address, uint64_t size,
 	                                                  bool* completed = nullptr);

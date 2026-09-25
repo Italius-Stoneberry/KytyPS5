@@ -4329,6 +4329,103 @@ public:
     std::printf("PASS %s\n", name);
   }
 
+  // A guest write to GPU-owned memory with KYTY_ASYNC_WRITE_READBACK: the GPU
+  // thread only records the download; the writer waits for it, the bytes land in
+  // the backing and the written range ends CPU-owned.
+  void CheckAsyncWriteReadback() {
+    constexpr const char* name = "AsyncWriteReadback";
+    constexpr uintptr_t base = 0x0000000200700000ull;
+    constexpr uint64_t bytes = 0x200000, alignment = 0x10000;
+    EnsureRuntimeContext();
+    auto& context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto& gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+        0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), bytes,
+        alignment, 0, &direct_offset) == 0, "allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, bytes, 0x3, 0x10, direct_offset, alignment) == 0 &&
+        mapped == reinterpret_cast<void*>(base), "mapping failed");
+    std::memset(mapped, 0x5a, bytes);
+    const auto old_frame_mode = kyty_local_frame_pipeline_mode.exchange(1);
+    const auto old_write_mode = kyty_local_async_write_readback_mode.exchange(1);
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      resources.MapMemory(base, bytes);
+      auto& cache = resources.GetBufferCache();
+      gpu.SendCommandSync([&] { (void)cache.FindBuffer(base, bytes); });
+      const auto backing = [&](uint64_t address) {
+        uint32_t value = 0;
+        Require(name, "backing", Libs::LibKernel::Memory::TryReadBacking(address, &value, 4),
+                "backing unavailable");
+        return value;
+      };
+      vk::SemaphoreTypeCreateInfo type{};
+      type.semaphoreType = vk::SemaphoreType::eTimeline;
+      vk::SemaphoreCreateInfo info{};
+      info.pNext = &type;
+      vk::Semaphore gate{};
+      Require(name, "gate", m_runtime_context.device.createSemaphore(&info, nullptr, &gate) ==
+          vk::Result::eSuccess, "timeline creation failed");
+      const auto address = base + 0x40104;
+      gpu.SendCommandSync([&] {
+        auto [buffer, offset] = cache.ObtainBuffer(address, 4, true);
+        buffer->Fill(offset, 4, 0x13572468u);
+        SubmitInfo submit{};
+        submit.num_wait_semaphores = 1;
+        submit.wait_semaphores[0]  = gate;
+        submit.wait_ticks[0]       = 1;
+        submit.wait_stages[0]      = vk::PipelineStageFlagBits::eAllCommands;
+        scheduler.Flush(submit);
+      });
+      std::atomic<bool> written{false};
+      std::jthread writer([&] {
+        cache.ReadMemory(address, 4, true);
+        written.store(true, std::memory_order_release);
+      });
+      // The GPU thread stays responsive while the gated download is pending.
+      for (int i = 0; i < 100 && !BufferCacheTestAccess::HasGuestReadback(cache); ++i)
+        gpu.SendCommandSync([] {});
+      gpu.SendCommandSync([&] {
+        Require(name, "pending", BufferCacheTestAccess::HasGuestReadback(cache) &&
+            !written.load(std::memory_order_acquire), "the write did not wait for the download");
+      });
+      Require(name, "no early bytes", backing(address) == 0x5a5a5a5au, "incomplete copy was published");
+      vk::SemaphoreSignalInfo signal{};
+      signal.semaphore = gate;
+      signal.value     = 1;
+      Require(name, "signal", m_runtime_context.device.signalSemaphore(&signal) == vk::Result::eSuccess,
+              "timeline signal failed");
+      writer.join();
+      Require(name, "bytes", backing(address) == 0x13572468u && backing(address - 4) == 0x5a5a5a5au &&
+          backing(address + 4) == 0x5a5a5a5au, "the download lost GPU output or changed clean bytes");
+      gpu.SendCommandSync([&] {
+        Require(name, "ownership", !cache.IsRegionGpuModified(address, 4) &&
+            !cache.HasGpuDirtyBytes(address, 4) && !BufferCacheTestAccess::HasGuestReadback(cache),
+            "the written range stayed GPU-owned");
+        scheduler.Finish();
+        resources.UnmapMemory(base, bytes);
+      });
+      m_runtime_context.device.destroySemaphore(gate, nullptr);
+    }
+    context.GetGpu().Shutdown();
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, bytes) == 0, "guest unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, bytes) == 0,
+            "direct release failed");
+    scheduler.Shutdown();
+    kyty_local_async_write_readback_mode.store(old_write_mode);
+    kyty_local_frame_pipeline_mode.store(old_frame_mode);
+    std::printf("PASS %s\n", name);
+  }
+
   void CheckCompletedCopyFeedback() {
     constexpr const char *name = "CompletedCopyFeedback";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -32081,6 +32178,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--copy-feedback-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckCompletedCopyFeedback();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--async-write-readback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckAsyncWriteReadback();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--write-window-handoff-only") == 0) {
