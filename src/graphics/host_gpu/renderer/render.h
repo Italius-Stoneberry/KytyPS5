@@ -113,6 +113,12 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	// Raw internal graphics operations must invalidate the values recorded by
+	// the ordinary draw path. Compute and transfer commands do not alter them.
+	void InvalidateGraphicsState() const noexcept;
+	// Advances with every InvalidateGraphicsState: a path that binds graphics
+	// state itself can tell whether anything else bound state since.
+	[[nodiscard]] uint64_t GraphicsGeneration() const noexcept { return m_graphics_generation; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	// Only the dispatch path can bypass a pending dependency, after preparing
@@ -141,7 +147,8 @@ private:
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
-	mutable bool       m_compute_access_pending = false;
+	mutable bool        m_compute_access_pending = false;
+	mutable uint64_t    m_graphics_generation    = 0;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
@@ -244,6 +251,74 @@ private:
 	void CaptureXprDraw(CommandBuffer& buffer, const DrawRenderState& state, const DrawIndexArgs& args);
 	void CaptureXprTargets(const DrawRenderState& state, const GraphicsBindings& bindings);
 
+	// Native XPR draws (src/local/native-xpr.inc).
+	struct NativeXprDrawState;
+	struct NativeXprRecord;
+	struct NativeXprCache;
+	struct NativeXprDrawArgs {
+		uint64_t      index_address = 0, index_bytes = 0;
+		vk::IndexType index_type    = vk::IndexType::eUint16;
+		uint64_t      args_address  = 0; // GPU-side DrawIndexedIndirectCommand
+		bool          keep_clears   = false;
+	};
+	std::shared_ptr<NativeXprCache> m_native_xpr;
+	bool                            m_native_xpr_store = false; // next prepared draw stores
+	struct NativeXprVerifyRequest {
+		const NativeXprRecord*    record = nullptr;
+		const NativeXprDrawState* state  = nullptr;
+	} m_native_xpr_verify; // mode 2: the next prepared draw is compared with this record
+	void NativeXprVerify(CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering,
+	                     std::span<PreparedBindings* const> stages);
+	NativeXprCache& NativeXprState();
+	void NativeXprRequestStore();
+	void NativeXprKey(CommandBuffer& buffer, std::vector<uint32_t>& key) const;
+	[[nodiscard]] uint64_t NativeXprStateKey(CommandBuffer& buffer) const;
+	[[nodiscard]] vk::DescriptorSet NativeXprAllocateSet(vk::DescriptorSetLayout layout,
+	                                                     vk::DescriptorPool& pool);
+	void NativeXprRetire(std::unique_ptr<NativeXprRecord> record, bool keep_for_learning);
+	void NativeXprRetireSet(vk::DescriptorPool pool, vk::DescriptorSet set);
+	[[nodiscard]] const char* NativeXprBindResources(NativeXprRecord& record,
+	                                                 std::span<PreparedBindings* const> stages,
+	                                                 vk::DescriptorSetLayout layout, bool runtime);
+	[[nodiscard]] bool NativeXprRebind(NativeXprRecord& record,
+	                                   std::array<ShaderRecompiler::IR::ResourceSnapshot, 2>& fresh);
+	[[nodiscard]] bool NativeXprTexelRangesClear(const NativeXprRecord& record);
+	[[nodiscard]] bool NativeXprSwitchVariant(NativeXprRecord& record, uint64_t signature);
+	void               NativeXprDropVariants(NativeXprRecord& record);
+	[[nodiscard]] bool NativeXprRebindSlots(NativeXprRecord& record,
+	                                        std::span<const std::pair<uint32_t, uint32_t>> images,
+	                                        std::span<const std::pair<uint32_t, uint32_t>> buffers);
+	void NativeXprCollect();
+	void NativeXprLearn(const NativeXprRecord& stale, NativeXprRecord& fresh);
+	void NativeXprStore(CommandBuffer& buffer, const DrawRenderState& state,
+	                    vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                    const RenderState& rendering, std::span<PreparedBindings* const> stages);
+	[[nodiscard]] bool NativeXprValidate(NativeXprRecord& record, uint64_t frame);
+	[[nodiscard]] bool NativeXprReevaluate(NativeXprRecord& record);
+	[[nodiscard]] bool NativeXprValidateResources(NativeXprRecord& record, uint64_t frame, bool mapping_moved);
+	void NativeXprRetrace(NativeXprRecord& record);
+	[[nodiscard]] bool NativeXprGather(NativeXprRecord& record);
+	enum class NativeXprPatch { Done, Evaluate, Invalid };
+	[[nodiscard]] NativeXprPatch NativeXprPatchDescriptors(NativeXprRecord& record);
+	[[nodiscard]] bool NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& record,
+	                                 const NativeXprDrawState& draw_state,
+	                                 const PipelineCache::Pipeline& pipeline,
+	                                 std::span<const uint64_t> commands, uint64_t index_base,
+	                                 uint64_t index_bytes, vk::IndexType index_type, bool keep_clears);
+	[[nodiscard]] bool NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArgs& args);
+
+public:
+	// Runtime entry points for the command processor (kyty_local_native_xpr_mode).
+	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, bool clean, std::span<const uint64_t> commands,
+	                                uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type);
+	// After a refused NativeXprTry: the normal path stores. Returns the log the
+	// caller's ShaderReadObserver fills with the SRT evaluation's reads.
+	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>>* NativeXprReadLog();
+	void NativeXprEndPacket();
+	// Graphics registers may have changed without the observer seeing it.
+	void NativeXprForgetState();
+
+private:
 	RenderContext&                        m_context;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;

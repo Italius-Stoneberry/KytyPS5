@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "shader-warmup-cache.h"
@@ -36,6 +37,7 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <bit>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -49,6 +51,10 @@
 using namespace Libs::Graphics;
 namespace IR = ShaderRecompiler::IR;
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+extern "C" volatile std::atomic<uint32_t> kyty_local_native_xpr_debug;
+#endif
+
 namespace Libs::Graphics {
 // Friend of RenderExecutor (render.h): the replay drives the real draw entry.
 struct RenderExecutorTestAccess {
@@ -56,6 +62,19 @@ struct RenderExecutorTestAccess {
 	                      const DrawIndexArgs& args) {
 		executor.DrawIndex(submit_id, buffer, args);
 	}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	static void RequestNativeStore(RenderExecutor& executor) { executor.NativeXprRequestStore(); }
+	static bool NativeDraw(RenderExecutor& executor, CommandBuffer& buffer, uint64_t index_address,
+	                       uint64_t index_bytes, bool index32, uint64_t args_address) {
+		RenderExecutor::NativeXprDrawArgs args;
+		args.index_address = index_address;
+		args.index_bytes   = index_bytes;
+		args.index_type    = index32 ? vk::IndexType::eUint32 : vk::IndexType::eUint16;
+		args.args_address  = args_address;
+		args.keep_clears   = true;
+		return executor.NativeXprDraw(buffer, args);
+	}
+#endif
 };
 } // namespace Libs::Graphics
 
@@ -262,6 +281,8 @@ std::string Describe(const IR::ResourceSnapshot& a, const IR::ResourceSnapshot& 
 	return out;
 }
 
+size_t g_traced_stages = 0, g_untraced_stages = 0, g_traced_data = 0, g_traced_structural = 0, g_traced_feeds = 0;
+
 std::string ReplayStage(Stage& stage, Memory& memory) {
 	auto options    = LocalShaderWarmup::Options(stage.record, stage.user_data);
 	options.dump_ir = false;
@@ -287,6 +308,43 @@ std::string ReplayStage(Stage& stage, Memory& memory) {
 		return buffer;
 	}
 	if (const auto diff = Describe(resources, stage.resources); !diff.empty()) return "snapshot differs:" + diff;
+	// The read trace native records rely on: every data read is a plain copy of
+	// its address into its flat position, every structural read has the memory value.
+	{
+		IR::SrtReadTrace trace;
+		if (IR::TraceLinearSrtReads(plan, runtime, trace)) {
+			++g_traced_stages;
+			g_traced_data += trace.data.size();
+			g_traced_structural += trace.structural.size();
+			if (trace.flat_words != resources.flattened_srt.size()) return "trace: flat size";
+			for (const auto& [flat, address]: trace.data) {
+				uint32_t value = 0;
+				if (!memory.Read(address, &value) || value != resources.flattened_srt[flat]) return "trace: data read";
+			}
+			for (const auto& read: trace.structural) {
+				uint32_t value = 0;
+				if (!memory.Read(read.address, &value) || value != read.value) return "trace: structural read";
+			}
+			g_traced_feeds += trace.feeds.size();
+			for (const auto& [read, flat]: trace.flat_feeds)
+				if (flat >= resources.flattened_srt.size() || resources.flattened_srt[flat] != trace.structural[read].value)
+					return "trace: flat feed";
+			for (const auto& feed: trace.feeds) {
+				const auto& values = feed.kind == IR::SrtReadTrace::Kind::Buffer  ? resources.buffers
+				                     : feed.kind == IR::SrtReadTrace::Kind::Image ? resources.images
+				                                                                  : resources.samplers;
+				if (feed.index >= values.size() || feed.dword >= values[feed.index].dword_count)
+					return "trace: feed target";
+				// An image the evaluation found invalid is zeroed; its feeds do not apply.
+				if (values[feed.index].dwords[feed.dword] != trace.structural[feed.read].value &&
+				    !(feed.kind == IR::SrtReadTrace::Kind::Image &&
+				      std::ranges::all_of(values[feed.index].dwords, [](uint32_t w) { return w == 0; })))
+					return "trace: feed value";
+			}
+		} else {
+			++g_untraced_stages;
+		}
+	}
 	auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization,
 	                                                 stage.push_start);
 	return compiled.spirv.empty() ? "empty SPIR-V" : "";
@@ -324,8 +382,13 @@ public:
 	bool m_force_depth_pass = true;
 
 	// Replays one draw; returns false with a reason when it cannot be set up.
-	bool Run(const Draw& draw, std::vector<TargetResult>& out, std::string& why) {
+	// With `native`, the normal draw also stores a native record; the targets are
+	// then reset to their fill values and the same draw goes through the native
+	// path (GPU-side indirect arguments), with its targets in `native`.
+	bool Run(const Draw& draw, std::vector<TargetResult>& out, std::string& why,
+	         std::vector<TargetResult>* native = nullptr) {
 		out.clear();
+		if (native != nullptr) native->clear();
 		std::vector<std::pair<uint64_t, uint64_t>> ranges;
 		const auto add = [&](uint64_t address, uint64_t size) {
 			if (address != 0 && size != 0) ranges.emplace_back(address, size);
@@ -347,6 +410,9 @@ public:
 		    std::min<uint32_t>(draw.args[0], index_type == 0 ? 0xfffeu : 30000u);
 		const uint64_t index_base = (highest + 0x1000000 + RegionAlign - 1) & ~(RegionAlign - 1);
 		add(index_base, uint64_t(index_count) * index_bytes);
+		// Indirect arguments for the native path, as the culling shader writes them.
+		const uint64_t args_address = (index_base + uint64_t(index_count) * index_bytes + 0xff) & ~uint64_t {0xff};
+		add(args_address, sizeof(vk::DrawIndexedIndirectCommand));
 		auto regions = Merge(ranges);
 		if (!MapRegions(regions, why)) return false;
 
@@ -362,6 +428,9 @@ public:
 			if (index_bytes == 2) reinterpret_cast<uint16_t*>(index_base)[i] = static_cast<uint16_t>(i);
 			else reinterpret_cast<uint32_t*>(index_base)[i] = i;
 		}
+		const vk::DrawIndexedIndirectCommand indirect {index_count, std::max(draw.args[1], 1u), 0,
+		                                               static_cast<int32_t>(draw.args[2]), draw.args[3]};
+		std::memcpy(reinterpret_cast<void*>(args_address), &indirect, sizeof(indirect));
 		auto& resources = m_context->GetGpuResources();
 		for (const auto& region: regions) resources.MapMemory(region.address, region.size);
 
@@ -399,9 +468,29 @@ public:
 		                          .base_vertex         = static_cast<int32_t>(draw.args[2]),
 		                          .first_instance      = draw.args[3],
 		                          .offset_source       = DrawOffsetSource::IndirectArgs};
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		if (native != nullptr) RenderExecutorTestAccess::RequestNativeStore(m_context->GetRenderExecutor());
+#endif
 		RenderExecutorTestAccess::DrawIndex(m_context->GetRenderExecutor(), ++m_submit_id,
 		                                    scheduler.Current(), args);
 		for (const auto& target: draw.targets) out.push_back(ReadTarget(target));
+		if (native != nullptr) {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+			for (const auto& target: draw.targets) ResetTarget(target);
+			if (!RenderExecutorTestAccess::NativeDraw(m_context->GetRenderExecutor(), scheduler.Current(),
+			                                          index_base, uint64_t(index_count) * index_bytes,
+			                                          index_bytes == 4, args_address)) {
+				why = "native draw refused (no record)";
+				UnmapRegions(regions);
+				return false;
+			}
+			for (const auto& target: draw.targets) native->push_back(ReadTarget(target));
+#else
+			why = "native path needs KYTY_LOCAL_VULKAN_RECORDING";
+			UnmapRegions(regions);
+			return false;
+#endif
+		}
 		UnmapRegions(regions);
 		return true;
 	}
@@ -495,6 +584,38 @@ private:
 		}
 	}
 
+	// Back to the fill value the texture cache uploaded before the first draw.
+	void ResetTarget(const Fill& target) {
+		auto&      cache = m_context->GetTextureCache();
+		const auto id    = cache.FindImageFromRange(target.address, target.size, false);
+		if (!id) return;
+		auto& scheduler = m_context->GetCommandScheduler();
+		auto& image     = cache.GetImage(id);
+		scheduler.Current().EndRendering();
+		const auto command = scheduler.Current().Handle();
+		image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+		if (image.info.IsDepth()) {
+			const bool  d16   = image.info.pixel_format == vk::Format::eD16Unorm ||
+			                  image.info.pixel_format == vk::Format::eD16UnormS8Uint;
+			const float depth = target.kind != FillKind::DepthTarget ? 0.0f
+			                    : d16 ? static_cast<float>(target.value & 0xffffu) / 65535.0f
+			                          : std::bit_cast<float>(target.value);
+			auto aspects = vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth};
+			if (image.info.HasStencil()) aspects |= vk::ImageAspectFlagBits::eStencil;
+			const vk::ClearDepthStencilValue value {depth, 0};
+			const vk::ImageSubresourceRange  range {aspects, 0, VK_REMAINING_MIP_LEVELS, 0,
+			                                        VK_REMAINING_ARRAY_LAYERS};
+			command.clearDepthStencilImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+			                               &value, 1, &range);
+		} else {
+			const vk::ClearColorValue       value {};
+			const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, VK_REMAINING_MIP_LEVELS,
+			                                       0, VK_REMAINING_ARRAY_LAYERS};
+			command.clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal, &value, 1,
+			                        &range);
+		}
+	}
+
 	TargetResult ReadTarget(const Fill& target) {
 		TargetResult result;
 		auto&      cache = m_context->GetTextureCache();
@@ -576,18 +697,19 @@ private:
 
 int main(int argc, char** argv) {
 	if (argc < 2) {
-		std::fprintf(stderr, "usage: %s <capture-dir> [--limit N] [--gpu] [--once] [--keep-depth-test] [--only NAME]\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <capture-dir> [--limit N] [--gpu] [--once] [--native] [--keep-depth-test] [--only NAME]\n", argv[0]);
 		return 2;
 	}
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
 	Initialize();
 	size_t      limit = SIZE_MAX;
-	bool        gpu   = false, once = false, keep_depth_test = false;
+	bool        gpu   = false, once = false, keep_depth_test = false, native = false;
 	std::string only;
 	for (int i = 2; i < argc; ++i) {
 		if (std::strcmp(argv[i], "--limit") == 0 && i + 1 < argc) limit = std::strtoull(argv[++i], nullptr, 10);
 		else if (std::strcmp(argv[i], "--gpu") == 0) gpu = true;
 		else if (std::strcmp(argv[i], "--once") == 0) once = true;
+		else if (std::strcmp(argv[i], "--native") == 0) gpu = native = true;
 		else if (std::strcmp(argv[i], "--keep-depth-test") == 0) keep_depth_test = true;
 		else if (std::strcmp(argv[i], "--only") == 0 && i + 1 < argc) only = argv[++i];
 	}
@@ -599,6 +721,11 @@ int main(int argc, char** argv) {
 	std::ranges::sort(files);
 	if (files.size() > limit) files.resize(limit);
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	// Negative controls (see native-xpr.inc): 1 corrupts constants, 2 skips the draw.
+	if (const auto* control = std::getenv("KYTY_NATIVE_XPR_DEBUG"))
+		kyty_local_native_xpr_debug.store(static_cast<uint32_t>(std::strtoul(control, nullptr, 10)));
+#endif
 	std::unique_ptr<GpuReplay> replay;
 	if (gpu) {
 		ShaderInit();
@@ -609,6 +736,7 @@ int main(int argc, char** argv) {
 
 	size_t draws = 0, stages = 0, passed = 0, unreadable = 0;
 	size_t gpu_ok = 0, gpu_failed = 0, gpu_unstable = 0, gpu_empty = 0;
+	size_t native_equal = 0, native_differ = 0;
 	std::map<std::string, size_t> failures;
 	for (const auto& path: files) {
 		const auto name = path.filename().string();
@@ -634,9 +762,10 @@ int main(int argc, char** argv) {
 			            stage == &draw.vertex ? "vs" : "ps", stage->record.hash, why.c_str());
 		}
 		if (!replay) continue;
-		std::vector<TargetResult> first, second;
+		std::vector<TargetResult> first, second, native_targets;
 		std::string               why;
-		if (!replay->Run(draw, first, why) || (!once && !replay->Run(draw, second, why))) {
+		if (!replay->Run(draw, first, why, native ? &native_targets : nullptr) ||
+		    (!once && !replay->Run(draw, second, why))) {
 			++gpu_failed;
 			++failures["gpu: " + why];
 			std::printf("GPU_FAIL %s %s\n", name.c_str(), why.c_str());
@@ -654,15 +783,33 @@ int main(int argc, char** argv) {
 		if (!stable) ++gpu_unstable;
 		else if (changed == 0) ++gpu_empty;
 		else ++gpu_ok;
-		std::printf("GPU %s vs=%016" PRIx64 " ps=%016" PRIx64 " stable=%d targets:%s\n", name.c_str(),
+		std::string native_note;
+		if (native) {
+			const bool equal = native_targets == first;
+			++(equal ? native_equal : native_differ);
+			native_note = equal ? " native=equal" : " native=DIFF";
+			if (!equal)
+				for (const auto& target: native_targets) {
+					char buffer[64];
+					std::snprintf(buffer, sizeof(buffer), " %016" PRIx64 "/%" PRIu64, target.hash, target.changed);
+					native_note += target.found ? buffer : " missing";
+				}
+		}
+		std::printf("GPU %s vs=%016" PRIx64 " ps=%016" PRIx64 " stable=%d targets:%s%s\n", name.c_str(),
 		            draw.vertex.record.hash, draw.has_pixel ? draw.pixel.record.hash : 0, stable ? 1 : 0,
-		            hashes.c_str());
+		            hashes.c_str(), native_note.c_str());
 	}
 	std::printf("XPR_REPLAY draws=%zu stages=%zu passed=%zu unreadable=%zu\n", draws, stages, passed,
 	            unreadable);
+	std::printf("SRT_TRACE traced=%zu untraced=%zu data_reads=%zu structural_reads=%zu feeds=%zu\n", g_traced_stages,
+	            g_untraced_stages, g_traced_data, g_traced_structural, g_traced_feeds);
 	if (replay)
 		std::printf("GPU_REPLAY ok=%zu empty=%zu unstable=%zu failed=%zu\n", gpu_ok, gpu_empty,
 		            gpu_unstable, gpu_failed);
+	if (native) std::printf("NATIVE_REPLAY equal=%zu differ=%zu\n", native_equal, native_differ);
 	for (const auto& [why, count]: failures) std::printf("  %zu x %s\n", count, why.c_str());
-	return passed == stages && unreadable == 0 && gpu_failed == 0 && gpu_unstable == 0 ? 0 : 1;
+	return passed == stages && unreadable == 0 && gpu_failed == 0 && gpu_unstable == 0 &&
+	               native_differ == 0
+	           ? 0
+	           : 1;
 }

@@ -44,11 +44,23 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// Addresses that gained their first registered image, in registration
+	// order: a caller that proved "no image starts here" at StartEpoch() E only
+	// needs the addresses logged after E.
+	[[nodiscard]] uint64_t StartEpoch() const { return m_start_epoch.load(std::memory_order_acquire); }
+	[[nodiscard]] bool     HasImageStartingAt(uint64_t address);
+	// Appends the (epoch, address) entries logged after `epoch`; false when the
+	// log no longer reaches back that far.
+	[[nodiscard]] bool NewImageStartsSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_t>>& out);
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
 	// Only reuses discovery. FindTexture still refreshes contents and selects the current view.
 	[[nodiscard]] bool TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t epoch);
+	// TryReuseSampledImage without the resolution-epoch proof, for caches that must
+	// survive image registrations elsewhere (native XPR records): the owner is
+	// still registered, not being rebound, and has the same backing and resources.
+	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -72,6 +84,12 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
+	// Bumped on every insertion, erasure or type change of a surface-metadata
+	// record, so a cached negative IsMeta/ClearMeta answer for an address stays
+	// valid while this value is unchanged.
+	[[nodiscard]] uint64_t MetaEpoch() const {
+		return m_meta_epoch.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
 	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
@@ -176,11 +194,17 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	// Start address -> number of registered images starting there, and the
+	// log of addresses that gained their first one.
+	std::unordered_map<uint64_t, uint32_t>            m_image_starts;
+	std::atomic<uint64_t>                             m_start_epoch {1};
+	std::vector<std::pair<uint64_t, uint64_t>>        m_start_log; // (epoch, address)
 	std::atomic<uint64_t>                             m_resolution_epoch {1};
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	std::atomic<uint64_t>                             m_meta_epoch {1};
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

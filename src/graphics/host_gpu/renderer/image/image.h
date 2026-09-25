@@ -172,6 +172,8 @@ public:
 	size_t           lru_id             = 0;
 	// Transit group that last set the whole-image state; see BeginTransitGroup.
 	uint64_t         transit_group      = 0;
+	// Unique per image object: a deleted image's slot id goes to later images.
+	uint64_t         serial             = 0;
 
 private:
 	friend struct ImageTestAccess;

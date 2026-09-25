@@ -29,6 +29,8 @@ namespace {
 uint64_t g_transit_group      = 0;
 uint64_t g_transit_group_next = 1;
 
+std::atomic<uint64_t> g_image_serial_next {1};
+
 [[nodiscard]] inline bool DedupeTransitGroups() {
 	return kyty_local_image_barrier_dedupe.load(std::memory_order_relaxed) != 0;
 }
@@ -678,7 +680,8 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 } // namespace ImageOps
 
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
-    : info(image_info), m_graphics(graphics), m_scheduler(scheduler) {
+    : info(image_info), serial(g_image_serial_next.fetch_add(1, std::memory_order_relaxed)),
+      m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
 	m_cpu_dirty =

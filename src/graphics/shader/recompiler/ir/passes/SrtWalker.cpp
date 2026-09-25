@@ -1390,6 +1390,153 @@ static bool EvaluateLinearSrt(const LinearSrtPlan& plan,const SrtRuntime& runtim
     return EvaluateLinearSrtOriginal(plan, runtime, results, flat, active_sources);
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+static bool TraceLinearPlan(const ResourcePlan& program, const LinearSrtPlan& plan, const SrtRuntime& runtime,
+                            SrtReadTrace& trace) {
+	if (plan.function == nullptr) return false;
+	std::vector<uint64_t> values(plan.nodes.size());
+	if (!plan.function(&runtime, values.data())) return false;
+	using Kind = LinearSrtPlan::Kind;
+	// A node is structural when another node or a descriptor dword consumes it.
+	std::vector<uint8_t> structural(plan.nodes.size(), 0);
+	for (const auto& node: plan.nodes) {
+		uint32_t used = 0;
+		uint8_t  use  = SrtReadTrace::Computed;
+		switch (node.kind) {
+			case Kind::Read:
+				used = node.op == ValueOpcode::ReadConstBuffer ? 5u : 3u;
+				use  = SrtReadTrace::Address;
+				break;
+			case Kind::Unary: used = 1; break;
+			case Kind::Binary: used = 2; break;
+			case Kind::Select: used = 3; break;
+			default: break;
+		}
+		for (uint32_t i = 0; i < used; ++i) structural[node.args[i]] |= use;
+	}
+	for (const auto node: plan.descriptor_words)
+		if (node != UINT32_MAX) structural[node] |= SrtReadTrace::Descriptor;
+	trace.flat_words = plan.flat_words.size();
+	std::vector<uint8_t> data(plan.nodes.size(), 0);
+	for (uint32_t i = 0; i < plan.flat_words.size(); ++i) {
+		const auto index = plan.flat_words[i];
+		if (index == UINT32_MAX) continue;
+		const auto& node = plan.nodes[index];
+		// Anything else in the flattened SRT is an immediate, user data or computed
+		// from structural reads: its value stays, its inputs are compared.
+		if (node.kind != Kind::Read || structural[index] || node.clean) continue;
+		uint64_t address = 0;
+		if (!LinearSrtPlan::ReadAddress(&node, values.data(), address)) return false;
+		trace.data.emplace_back(i, address);
+		data[index] = 1;
+	}
+	std::vector<uint32_t> read_index(plan.nodes.size(), UINT32_MAX);
+	for (uint32_t index = 0; index < plan.nodes.size(); ++index) {
+		const auto& node = plan.nodes[index];
+		if (node.kind != Kind::Read || data[index]) continue;
+		uint64_t address = 0;
+		if (!LinearSrtPlan::ReadAddress(&node, values.data(), address)) return false;
+		read_index[index] = static_cast<uint32_t>(trace.structural.size());
+		trace.structural.push_back({address, static_cast<uint32_t>(values[index]), node.clean, structural[index]});
+	}
+	for (uint32_t i = 0; i < plan.flat_words.size(); ++i) {
+		const auto node = plan.flat_words[i];
+		if (node != UINT32_MAX && read_index[node] != UINT32_MAX) trace.flat_feeds.emplace_back(read_index[node], i);
+	}
+	// Descriptor sources in evaluation order are the buffers, the direct images
+	// and the samplers of the snapshot (MaterializeSnapshot). Without that exact
+	// correspondence no feed is reported.
+	std::vector<std::pair<SrtReadTrace::Kind, uint32_t>> kinds;
+	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) kinds.emplace_back(SrtReadTrace::Kind::Buffer, i);
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto* source = Source(program, program.info.images[i].source);
+		if (source != nullptr && source->indirect_image.has_value()) return true;
+		kinds.emplace_back(SrtReadTrace::Kind::Image, i);
+	}
+	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) kinds.emplace_back(SrtReadTrace::Kind::Sampler, i);
+	if (kinds.size() != plan.descriptor_sizes.size()) return true;
+	size_t word = 0;
+	for (size_t source = 0; source < plan.descriptor_sizes.size(); ++source)
+		for (uint32_t dword = 0; dword < plan.descriptor_sizes[source]; ++dword, ++word) {
+			const auto node = plan.descriptor_words[word];
+			if (node == UINT32_MAX || read_index[node] == UINT32_MAX) continue;
+			trace.feeds.push_back({read_index[node], kinds[source].first, kinds[source].second, dword});
+		}
+	return true;
+}
+
+// Forwards to the caller's readers and logs every value read (control-flow
+// predicates decide the plan, so their inputs are structural).
+struct TraceReadLog {
+	const SrtRuntime*                   inner = nullptr;
+	std::vector<SrtReadTrace::Read>*    out   = nullptr;
+	static bool Raw(void* self, uint64_t address, uint32_t* value) {
+		auto& log = *static_cast<TraceReadLog*>(self);
+		if (!log.inner->read_memory(log.inner->userdata, address, value)) return false;
+		log.out->push_back({address, *value, false, SrtReadTrace::Predicate});
+		return true;
+	}
+	static bool Clean(void* self, uint64_t address, uint32_t* value) {
+		auto& log = *static_cast<TraceReadLog*>(self);
+		if (!log.inner->read_specialization_memory(log.inner->userdata, address, value)) return false;
+		log.out->push_back({address, *value, true, SrtReadTrace::Predicate});
+		return true;
+	}
+	static bool Span(void* self, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
+		auto& log = *static_cast<TraceReadLog*>(self);
+		if (!log.inner->try_read_memory_span(log.inner->userdata, address, values, count, clean)) return false;
+		for (uint32_t i = 0; i < count; ++i)
+			log.out->push_back({address + 4ull * i, values[i], clean, SrtReadTrace::Predicate});
+		return true;
+	}
+	static bool Sync(void* self, uint64_t address, uint64_t size) {
+		auto& log = *static_cast<TraceReadLog*>(self);
+		return log.inner->sync_memory(log.inner->userdata, address, size);
+	}
+};
+#endif
+
+bool TraceLinearSrtReads(const ResourcePlan& program, const SrtRuntime& runtime, SrtReadTrace& trace) {
+#if defined(__x86_64__) || defined(_M_X64)
+	const auto* plan = program.linear_srt.get();
+	trace.data.clear();
+	trace.structural.clear();
+	trace.feeds.clear();
+	trace.flat_feeds.clear();
+	if (plan == nullptr || !program.srt_plan_complete ||
+	    !std::ranges::equal(program.materialization_sources, plan->sources) ||
+	    !LinearMaskMatches(program.clean_flat_slots, plan->clean_slots))
+		return false;
+	if (plan->control_variants.empty()) return TraceLinearPlan(program, *plan, runtime, trace);
+	// The leaf EvaluateRuntimeSources would select, from logged predicate reads.
+	if (runtime.read_memory == nullptr || runtime.read_specialization_memory == nullptr ||
+	    runtime.try_read_memory_span == nullptr || runtime.sync_memory == nullptr)
+		return false;
+	std::vector<SrtReadTrace::Read> predicate_reads;
+	TraceReadLog log {&runtime, &predicate_reads};
+	SrtRuntime logged = runtime;
+	logged.userdata                   = &log;
+	logged.read_memory                = TraceReadLog::Raw;
+	logged.read_specialization_memory = TraceReadLog::Clean;
+	logged.try_read_memory_span       = TraceReadLog::Span;
+	logged.sync_memory                = TraceReadLog::Sync;
+	auto clean        = logged;
+	clean.read_memory = logged.read_specialization_memory;
+	Evaluator            predicate_evaluator(program, clean);
+	std::vector<uint8_t> active;
+	EvaluateSourceActivity(program, logged, predicate_evaluator, active);
+	const auto leaf = std::ranges::find_if(plan->control_variants,
+	                                       [&](const auto& candidate) { return candidate->active_sources == active; });
+	if (leaf == plan->control_variants.end() || !TraceLinearPlan(program, **leaf, runtime, trace)) return false;
+	trace.structural.insert(trace.structural.end(), predicate_reads.begin(), predicate_reads.end());
+	return true;
+#else
+	(void)program;
+	(void)runtime;
+	(void)trace;
+	return false;
+#endif
+}
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,
                           std::string* reason) {

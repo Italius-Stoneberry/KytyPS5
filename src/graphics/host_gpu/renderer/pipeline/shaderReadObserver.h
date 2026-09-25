@@ -19,8 +19,10 @@ public:
 	~ShaderReadObserver() { s_current = m_previous; }
 	ShaderReadObserver(const ShaderReadObserver&)            = delete;
 	ShaderReadObserver& operator=(const ShaderReadObserver&) = delete;
+	// Nested observers all see the read, innermost first.
 	static void         ObserveRead(uint64_t address, uint64_t size) {
-        if (s_current) s_current->m_callback(s_current->m_userdata, address, size);
+        for (auto* observer = s_current; observer != nullptr; observer = observer->m_previous)
+            observer->m_callback(observer->m_userdata, address, size);
 	}
 
 	class Runtime {
@@ -41,7 +43,8 @@ public:
 
 	private:
 		void Observe(uint64_t address, uint64_t size) const {
-			m_observer->m_callback(m_observer->m_userdata, address, size);
+			for (auto* observer = m_observer; observer != nullptr; observer = observer->m_previous)
+				observer->m_callback(observer->m_userdata, address, size);
 		}
 		static bool Read(void* userdata, uint64_t address, uint32_t* value, bool clean) {
 			auto& self = *static_cast<Runtime*>(userdata);

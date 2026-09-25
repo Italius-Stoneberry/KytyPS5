@@ -271,6 +271,12 @@ void TextureCache::RegisterImage(ImageId id) {
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		m_image_page_table[page].push_back(id);
 	}
+	if (m_image_starts[image.info.data.address]++ == 0) {
+		const auto epoch = m_start_epoch.load(std::memory_order_relaxed) + 1;
+		if (m_start_log.size() >= 8192) m_start_log.erase(m_start_log.begin(), m_start_log.begin() + 4096);
+		m_start_log.emplace_back(epoch, image.info.data.address);
+		m_start_epoch.store(epoch, std::memory_order_release);
+	}
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -292,6 +298,12 @@ void TextureCache::UnregisterImage(ImageId id) {
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
+	}
+	if (const auto start = m_image_starts.find(image.info.data.address);
+	    start == m_image_starts.end() || start->second == 0) {
+		EXIT("TextureCache: image missing from start index\n");
+	} else if (--start->second == 0) {
+		m_image_starts.erase(start);
 	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -335,6 +347,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		      metadata->second.type == MetaDataInfo::Type::HTile))) {
 			// A later binding may have reused this address for another metadata type.
 			m_surface_metas.erase(metadata);
+			m_meta_epoch.fetch_add(1, std::memory_order_release);
 		}
 	}
 	UnregisterImage(id);
@@ -1235,6 +1248,7 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	image.info.metadata    = desc.info.metadata;
 	auto [entry, inserted] = m_surface_metas.try_emplace(
 	    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::Dcc});
+	m_meta_epoch.fetch_add(1, std::memory_order_release);
 	auto& metadata = entry->second;
 	if (!inserted && metadata.type == MetaDataInfo::Type::PendingDcc) {
 		metadata.type = MetaDataInfo::Type::Dcc;
@@ -1455,6 +1469,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	return result;
 }
 
+bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
+	std::scoped_lock lock {m_lock};
+	if (m_scheduler.Current().IsInvalid() || desc.type != BindingType::Texture ||
+	    desc.info.data.Empty() || desc.info.IsDepth() || desc.info.HasMetadata() ||
+	    desc.info.HasStencil() || desc.info.tile_mode == Prospero::TileMode::kDepth) {
+		return false;
+	}
+	auto* image = m_slot_images.try_get(id);
+	if (image == nullptr || !image->registered || image->depth_id ||
+	    image->binding.needs_rebind || image->info.IsDepth() || image->info.HasMetadata() ||
+	    image->info.HasStencil() || !SameBacking(image->info, desc.info, true) ||
+	    !(image->info.resources == desc.info.resources)) {
+		return false;
+	}
+	image->tick_accessed_last = m_scheduler.CurrentTick();
+	TouchImage(*image);
+	return true;
+}
+
 bool TextureCache::TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t epoch) {
 	std::scoped_lock lock {m_lock};
 	if (m_scheduler.Current().IsInvalid() || epoch == 0 ||
@@ -1486,13 +1519,34 @@ void TextureCache::UpdateImage(ImageId id) {
 	RefreshImage(id);
 }
 
+bool TextureCache::HasImageStartingAt(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	return m_image_starts.contains(address);
+}
+
+bool TextureCache::NewImageStartsSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_t>>& out) {
+	std::scoped_lock lock {m_lock};
+	// Entries carry consecutive epochs; the log covers (front - 1, current].
+	if (!m_start_log.empty() && epoch + 1 < m_start_log.front().first) return false;
+	const auto first = std::ranges::upper_bound(m_start_log, epoch, {}, &std::pair<uint64_t, uint64_t>::first);
+	out.insert(out.end(), first, m_start_log.end());
+	return true;
+}
+
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
 	if (!GuestRange {address, size}.Valid()) {
 		return {};
 	}
 	std::scoped_lock lock {m_lock};
-	ImageIds         matches;
-	for (const auto id: FindImagesInRegion(address, size, false)) {
+	// Only registered images starting at `address` qualify.
+	if (!m_image_starts.contains(address)) {
+		return {};
+	}
+	ImageIds matches;
+	// Each qualifying image covers that byte: the images over it are the same
+	// candidates, in the same order, as the images over the whole range (which
+	// can span many image pages).
+	for (const auto id: FindImagesInRegion(address, 1, false)) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr || owner->info.data.address != address) {
 			continue;
@@ -1595,17 +1649,23 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.usage.depth_target = true;
 	RefreshImage(id);
 	if (desc.info.HasMetadata()) {
+		// The epoch moves only when metadata state changes: every depth target
+		// acquisition passes here.
+		bool changed        = !(image.info.metadata == desc.info.metadata);
 		image.info.metadata = desc.info.metadata;
 		auto [metadata, inserted] =
 		    m_surface_metas.try_emplace(desc.info.metadata.range.address,
 		                                MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
 		                                              .clear_mask = image.info.htile_clear_mask});
+		changed |= inserted;
 		if (!inserted && metadata->second.type != MetaDataInfo::Type::HTile) {
 			// PS5 allocations can reuse DCC storage as HTile while the old color image is cached.
 			// The depth binding defines the new type; incompatible fill state cannot carry over.
 			metadata->second = {.type       = MetaDataInfo::Type::HTile,
 			                    .clear_mask = image.info.htile_clear_mask};
+			changed          = true;
 		}
+		if (changed) m_meta_epoch.fetch_add(1, std::memory_order_release);
 	}
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
@@ -2152,6 +2212,7 @@ void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_v
 	// The guest dispatch still writes metadata. An unknown address remains PendingDcc until an
 	// image descriptor confirms its role; never reinterpret CMask/FMask/HTile as DCC.
 	const auto found = m_surface_metas.try_emplace(address).first;
+	m_meta_epoch.fetch_add(1, std::memory_order_release);
 	if (found->second.type == MetaDataInfo::Type::PendingDcc ||
 	    found->second.type == MetaDataInfo::Type::Dcc) {
 		found->second.clear_mask = dcc_clear_mask;
@@ -2186,6 +2247,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	     metadata != m_surface_metas.end() && metadata->first < end;) {
 		metadata = m_surface_metas.erase(metadata);
 	}
+	m_meta_epoch.fetch_add(1, std::memory_order_release);
 	auto images = FindImagesInRegion(address, size, false);
 	for (const auto id: images) {
 		auto owner = m_slot_images.try_get(id);

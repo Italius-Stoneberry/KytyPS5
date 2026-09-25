@@ -28,6 +28,7 @@ extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 extern volatile std::atomic_uint32_t kyty_local_vulkan_recording_mode;
 extern volatile std::atomic_uint32_t kyty_local_deferred_submit_mode;
+extern volatile std::atomic_uint32_t kyty_local_native_xpr_mode;
 #endif
 }
 
@@ -65,6 +66,8 @@ inline void InitializePerformanceSwitches() {
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	    Switch {"KYTY_VULKAN_RECORDING", &kyty_local_vulkan_recording_mode},
 	    Switch {"KYTY_DEFERRED_SUBMIT", &kyty_local_deferred_submit_mode},
+	    // 1: native XPR draws; 2: verification (the normal path draws and is compared).
+	    Switch {"KYTY_NATIVE_XPR", &kyty_local_native_xpr_mode, 0, 2},
 #endif
 	};
 	std::string enabled;

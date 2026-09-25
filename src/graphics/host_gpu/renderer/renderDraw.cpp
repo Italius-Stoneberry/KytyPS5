@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -51,6 +52,7 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -1374,6 +1376,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!record_draw) {
 		CommitGraphicsState(buffer, state.vs_input_info, state.color_info, state.color_count,
 		                    state.depth_info, pipeline.pipeline, feedback_aspects);
+	} else {
+		buffer.InvalidateGraphicsState();
 	}
 
 	LogDrawPhase(draw.name, "BeginRendering");
@@ -1435,8 +1439,24 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 	}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	// After the draw is recorded: storing may clean buffer owners (copies) and so
+	// may end rendering or restart the scheduler.
+	if (m_native_xpr_verify.record != nullptr)
+		NativeXprVerify(buffer, state, rendering, std::span {descriptor_stages.data(), descriptor_stage_count});
+	if (m_native_xpr_store) {
+		m_native_xpr_store = false;
+		if (!mesh_active && emit.indexed && vertex_bindings.count == 0)
+			NativeXprStore(buffer, state, topology, primitive_restart_enable, rendering,
+			               std::span {descriptor_stages.data(), descriptor_stage_count});
+	}
+#endif
 	return true;
 }
+
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "native-xpr.inc"
+#endif
 
 bool BuildDrawIndexRun(std::span<const DrawIndexArgs> draws, DrawIndexRun& run) {
 	if (draws.size() < 2 || draws.size() > DrawIndexRun::MaxDraws) return false;

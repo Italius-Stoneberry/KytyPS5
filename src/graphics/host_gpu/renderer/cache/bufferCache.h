@@ -44,6 +44,10 @@ public:
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
+	[[nodiscard]] Buffer* GetBufferIfLive(BufferId id) {
+		auto* buffer = m_slot_buffers.try_get(id);
+		return buffer != nullptr && !buffer->is_deleted ? buffer : nullptr;
+	}
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -89,6 +93,40 @@ public:
 	};
 	void SynchronizeRegionRequest(SyncRegionRequest& request);
 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
+	// Proofs that an earlier resolution still holds. Pure queries; TouchLiveBuffer
+	// only refreshes the LRU slot exactly as ObtainBuffer's TouchBuffer would.
+	// Zero means "cannot prove anything" (see MemoryTracker::CpuModificationEpoch).
+	// A range spanning several 4 MiB tracker regions returns the sum of their
+	// epochs: region managers are never destroyed and each epoch only grows, so
+	// an unchanged sum proves that no region saw a new CPU-dirty mark.
+	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const {
+		if (!GuestRange {vaddr, size}.Valid()) return 0;
+		constexpr uint64_t MaxRegions = 64;
+		const uint64_t     first      = vaddr / TRACKER_REGION_SIZE;
+		const uint64_t     last       = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		if (last - first >= MaxRegions) return 0;
+		uint64_t sum = 0;
+		for (uint64_t region = first; region <= last; ++region) {
+			const uint64_t begin = std::max(vaddr, region * TRACKER_REGION_SIZE);
+			const uint64_t end   = std::min(vaddr + size, (region + 1) * TRACKER_REGION_SIZE);
+			const uint64_t epoch = m_memory_tracker.CpuModificationEpoch(begin, end - begin);
+			if (epoch == 0) return 0;
+			sum += epoch;
+		}
+		return sum;
+	}
+	// True when `id` names a live (registered, not deleted) game buffer that
+	// covers the range and whose Vulkan handle is `handle`; refreshes its LRU slot.
+	[[nodiscard]] bool TouchLiveBuffer(BufferId id, vk::Buffer handle, uint64_t vaddr,
+	                                   uint64_t size) {
+		auto* buffer = m_slot_buffers.try_get(id);
+		if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size) ||
+		    buffer->Handle() != handle) {
+			return false;
+		}
+		TouchBuffer(*buffer);
+		return true;
+	}
 	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
 
 	void               RunGarbageCollector();

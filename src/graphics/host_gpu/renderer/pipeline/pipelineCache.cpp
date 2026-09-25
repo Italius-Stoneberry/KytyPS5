@@ -372,6 +372,7 @@ struct PipelineCache::ProgramCache {
 				for (const auto& p : entry->second.permutations) {
 					device.destroyShaderModule(p.handle.module, nullptr);
 				}
+				std::erase_if(by_program, [&](const auto& item) { return item.second.first == &entry->second; });
 				programs.erase(entry);
 				entry = programs.end();
 			} else {
@@ -603,6 +604,10 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	// Native XPR re-evaluation: compiled program -> its source and permutation.
+	std::unordered_map<const ShaderRecompiler::IR::CompiledShaderInfo*,
+	                   std::pair<SourceEntry*, const Permutation*>>
+	    by_program;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
@@ -864,6 +869,68 @@ bool PipelineCache::Save() {
 	return inputs_saved;
 }
 
+namespace {
+template <typename Cache>
+auto FindProgramSource(Cache& cache, const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	auto found = cache.by_program.find(&program);
+	if (found == cache.by_program.end()) {
+		// Sources are node-stable and permutations live in deques, so a found pair
+		// stays valid until the source is erased (warm-code mismatch, first use).
+		for (auto& [key, source]: cache.programs)
+			for (const auto& permutation: source.permutations)
+				if (&permutation.program == &program)
+					found = cache.by_program.emplace(&program, std::pair {&source, &permutation}).first;
+	}
+	return found;
+}
+} // namespace
+
+bool PipelineCache::TraceStage(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                               std::span<const uint32_t> user_data, uint64_t shader_base,
+                               ShaderRecompiler::IR::SrtReadTrace& trace) {
+	Common::LockGuard lock(m_mutex);
+	auto&             cache = *m_program_cache;
+	const auto        found = FindProgramSource(cache, program);
+	if (found == cache.by_program.end()) return false;
+	const ShaderRecompiler::IR::SrtRuntime runtime {
+	    .user_data                  = user_data,
+	    .shader_base                = shader_base,
+	    .read_memory                = ReadShaderRawGuestMemory,
+	    .read_specialization_memory = ReadShaderGuestMemory,
+	    .sync_memory                = SyncShaderGuestMemory,
+	    .try_read_memory_span       = ReadShaderMemorySpan,
+	};
+	return ShaderRecompiler::IR::TraceLinearSrtReads(found->second.first->resource_plan, runtime, trace);
+}
+
+bool PipelineCache::RematerializeStage(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                       std::span<const uint32_t> user_data, uint64_t shader_base,
+                                       ShaderRecompiler::IR::ResourceSnapshot& resources) {
+	Common::LockGuard lock(m_mutex);
+	auto&             cache = *m_program_cache;
+	const auto        found = FindProgramSource(cache, program);
+	if (found == cache.by_program.end()) return false;
+	auto& [source, permutation] = found->second;
+	const ShaderRecompiler::IR::SrtRuntime input_runtime {
+	    .user_data                  = user_data,
+	    .shader_base                = shader_base,
+	    .read_memory                = ReadShaderRawGuestMemory,
+	    .read_specialization_memory = ReadShaderGuestMemory,
+	    .sync_memory                = SyncShaderGuestMemory,
+	    .try_read_memory_span       = ReadShaderMemorySpan,
+	};
+	ShaderReadObserver::Runtime observed_runtime(input_runtime);
+	ShaderRecompiler::IR::ResourceSpecialization        specialization;
+	const ShaderRecompiler::IR::ResourceSpecialization* borrowed = nullptr;
+	ShaderRecompiler::IR::MaterializeReport             report;
+	if (!ShaderRecompiler::IR::MaterializeResources(source->resource_plan, observed_runtime.Get(),
+	                                                resources, specialization, &report,
+	                                                &source->specialization_guard, &borrowed)) {
+		return false;
+	}
+	return (borrowed != nullptr ? *borrowed : specialization) == permutation->specialization;
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -946,7 +1013,7 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const ShaderProgram& vertex_program,
-    const ShaderProgram& pixel_program) {
+    const ShaderProgram& pixel_program, bool native_bindings) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -966,6 +1033,7 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	GraphicsPipelineKey key {};
 	key.vs_shader_id            = vs_id;
 	key.ps_shader_id            = ps_id;
+	key.native_bindings         = native_bindings;
 	auto& static_params         = key.static_params;
 	auto& rendering             = key.rendering;
 	rendering.color_count       = color_count;
@@ -1108,7 +1176,7 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program, ps_input_info, pixel_program, static_params,
-	                       m_driver_cache);
+	                       m_driver_cache, native_bindings);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -1118,6 +1186,10 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	EXIT_IF(!inserted);
 	if (indexed) {
 		m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+	}
+	// Warmup recipes describe the normal variant only.
+	if (native_bindings) {
+		return *iter->second;
 	}
 	LocalShaderWarmup::PipelineRecord recipe;
 	recipe.vertex = m_program_cache->RecordedIndex(vertex_program);

@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
@@ -123,6 +124,8 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// Native XPR variant: ordinary set, flattened SRT/shader data dynamic.
+		bool                    native_bindings       = false;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// Immutable encoding plan; queued packets keep their own shared ownership.
 		mutable std::shared_ptr<const LocalDescriptorPlan> local_descriptor_plan;
@@ -150,9 +153,21 @@ public:
 	                       const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	                       const ShaderPixelInputInfo* ps_input_info,
 	                       vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program);
+	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program,
+	                       bool native_bindings = false);
 	Pipeline& CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	                                const ShaderProgram&          compute_program);
+	// Native XPR records (src/local/native-xpr.inc): the SRT evaluation of a stage
+	// whose compiled permutation is already chosen, with the readers the normal
+	// path uses. False when the evaluation fails or would select another
+	// permutation (a different resource specialization).
+	[[nodiscard]] bool RematerializeStage(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                                      std::span<const uint32_t> user_data, uint64_t shader_base,
+	                                      ShaderRecompiler::IR::ResourceSnapshot& resources);
+	// The same stage's reads split into data and structural (TraceLinearSrtReads).
+	[[nodiscard]] bool TraceStage(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                              std::span<const uint32_t> user_data, uint64_t shader_base,
+	                              ShaderRecompiler::IR::SrtReadTrace& trace);
 
 private:
 	struct ProgramCache;
@@ -163,11 +178,13 @@ private:
 		uint64_t                 ps_shader_id = 0;
 		PipelineVertexInputState vertex_input;
 		PipelineStaticParameters static_params;
+		bool                     native_bindings = false;
 
 		bool operator==(const GraphicsPipelineKey& other) const {
 			return rendering == other.rendering && vs_shader_id == other.vs_shader_id &&
 			       ps_shader_id == other.ps_shader_id && vertex_input == other.vertex_input &&
-			       static_params == other.static_params;
+			       static_params == other.static_params &&
+			       native_bindings == other.native_bindings;
 		}
 	};
 
@@ -200,6 +217,7 @@ private:
 			PipelineKeyHash::MixRendering(hash, key.rendering);
 			PipelineKeyHash::Mix(hash, key.vs_shader_id);
 			PipelineKeyHash::Mix(hash, key.ps_shader_id);
+			PipelineKeyHash::Mix(hash, key.native_bindings);
 			PipelineKeyHash::Mix(hash, key.vertex_input.binding_count);
 			for (uint32_t i = 0; i < key.vertex_input.binding_count; i++) {
 				PipelineKeyHash::Mix(hash, key.vertex_input.bindings[i].stride);
@@ -246,7 +264,8 @@ void CreatePipelineInternal(
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     const ShaderVertexInputInfo& vs_input_info, const ShaderProgram& vertex_program,
     const ShaderPixelInputInfo* ps_input_info, const ShaderProgram& pixel_program,
-    const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache);
+    const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache,
+    bool native_bindings = false);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);

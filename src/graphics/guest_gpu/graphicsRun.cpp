@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -20,6 +21,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#include "draw-state-observer.h"
 #include "performance-switches.h"
 #include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -34,6 +36,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <thread>
 #include <vector>
@@ -806,6 +809,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+			if (kyty_local_native_xpr_mode.load(std::memory_order_relaxed) != 0)
+				DrawStateObserver::ObservePacket(opcode, packet, packet_dw, true);
+#endif
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
 			static std::atomic<uint32_t> skip_log_count {0};
 			if (skip_log_count.fetch_add(1) < 2048) {
@@ -840,6 +847,44 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				XprCapture::ObserveDraw(0);
 			}
 		}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		// Native XPR draws; on refusal the normal path stores a record, with the
+		// reads of its SRT evaluation logged until this packet completes.
+		std::optional<ShaderReadObserver> native_reads;
+		struct NativeStoreEnd {
+			RenderExecutor* executor = nullptr;
+			~NativeStoreEnd() {
+				if (executor) executor->NativeXprEndPacket();
+			}
+		} native_store_end;
+		if (const auto native = kyty_local_native_xpr_mode.load(std::memory_order_relaxed); native != 0) {
+			DrawStateObserver::ObservePacket(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw),
+			                                 false);
+			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT &&
+			    (packet_header != 0xc0032500u || GraphicsRunDebugDumpEnabled()))
+				m_renderer.GetRenderExecutor().NativeXprForgetState();
+			if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
+				const auto consumed =
+				    TryNativeXprDraws({packet, remaining_dw}, DrawStateObserver::g_shadow.last_clean);
+				if (consumed) {
+					m_draw_run_skip = 0;
+					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
+					execution.m_made_progress = true;
+					continue;
+				}
+				auto& executor            = m_renderer.GetRenderExecutor();
+				native_store_end.executor = &executor;
+				if (auto* log = executor.NativeXprReadLog()) {
+					native_reads.emplace(
+					    [](void* userdata, uint64_t address, uint64_t size) {
+						    static_cast<std::vector<std::pair<uint64_t, uint64_t>>*>(userdata)->emplace_back(
+						        address, size);
+					    },
+					    log);
+				}
+			}
+		}
+#endif
 		if (opcode != Pm4::IT_DRAW_INDEX_INDIRECT) m_draw_run_skip = 0;
 		if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
 			const auto consumed = TryDrawIndirectRun({packet, remaining_dw});
@@ -971,6 +1016,44 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	    m_index_base_addr + static_cast<uint64_t>(index_offset) * index_size);
 
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
+}
+
+uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, bool clean) {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	auto& executor = m_renderer.GetRenderExecutor();
+	if (packets.size() < 5 || (packets[4] & ~0x20u) != 2u || m_index_type_and_size > 1 ||
+	    !m_index_base_addr || !m_index_buffer_size || !m_draw_indirect_args_base_addr ||
+	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList) {
+		// The cached draw-state key covers only draws the native path saw.
+		executor.NativeXprForgetState();
+		return 0;
+	}
+	// A run: consecutive packets that differ only in the argument offset draw
+	// the same object (no register write between them).
+	constexpr uint32_t max_draws = 64;
+	uint32_t           count     = 1;
+	while (count < max_draws && (count + 1u) * 5u <= packets.size()) {
+		const auto* next = packets.data() + count * 5u;
+		if (next[0] != 0xc0032500u || next[2] != packets[2] || next[3] != packets[3] ||
+		    next[4] != packets[4])
+			break;
+		++count;
+	}
+	std::array<uint64_t, max_draws> commands {};
+	for (uint32_t i = 0; i < count; ++i) commands[i] = m_draw_indirect_args_base_addr + packets[i * 5u + 1u];
+	CheckBuffer();
+	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
+	// On refusal NativeXprTry has asked the normal path to store when that helps.
+	if (!executor.NativeXprTry(CurrentBuffer(), clean, {commands.data(), count}, m_index_base_addr,
+	                           uint64_t {m_index_buffer_size} * element,
+	                           m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32))
+		return 0;
+	return count * 5u;
+#else
+	(void)packets;
+	(void)clean;
+	return 0;
+#endif
 }
 
 uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets) {

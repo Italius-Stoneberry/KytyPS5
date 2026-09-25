@@ -1,0 +1,140 @@
+#ifndef EMULATOR_SRC_LOCAL_DRAW_STATE_OBSERVER_H_
+#define EMULATOR_SRC_LOCAL_DRAW_STATE_OBSERVER_H_
+// Tracks whether the graphics state changed between consecutive indexed indirect
+// draws, for the native XPR draw path: a draw is "clean" when nothing but the
+// per-draw user-data SGPRs (the XPR geometry root), the index state and the
+// indirect offset changed since the previous DRAW_INDEX_INDIRECT, so the previous
+// draw-state key still applies.
+//
+// A register write only dirties the gap when it changes a value (shadow copies
+// of the CX/SH/UC spaces). Graphics user-data SGPRs (PS 0x0c-0x2b, GS 0x8c-0xab,
+// HS 0x10c-0x12b) and the compute space (0x200+) never dirty it; dispatches,
+// synchronisation, index state and indirect bases never do either.
+#include "graphics/guest_gpu/pm4.h"
+
+#include <array>
+#include <bitset>
+#include <cstdint>
+
+namespace Libs::Graphics::DrawStateObserver {
+
+struct Shadow {
+	std::array<uint32_t, Pm4::CX_NUM> cx {};
+	std::array<uint32_t, Pm4::SH_NUM> sh {};
+	std::array<uint32_t, Pm4::UC_NUM> uc {};
+	std::bitset<Pm4::CX_NUM>          cx_valid;
+	std::bitset<Pm4::SH_NUM>          sh_valid;
+	std::bitset<Pm4::UC_NUM>          uc_valid;
+	bool chain      = false; // the previous graphics draw was an indexed indirect draw
+	bool dirty      = true;  // graphics state changed since that draw
+	bool last_clean = false; // the latest DRAW_INDEX_INDIRECT was clean
+};
+inline thread_local Shadow g_shadow;
+
+[[nodiscard]] inline bool ShFree(uint32_t offset) {
+	return (offset >= 0x0cu && offset <= 0x2bu) || (offset >= 0x8cu && offset <= 0xabu) ||
+	       (offset >= 0x10cu && offset <= 0x12bu) || offset >= 0x200u;
+}
+
+// space: 0 CX, 1 SH, 2 UC.
+inline void WriteRegister(uint32_t space, uint32_t raw_offset, uint32_t value) {
+	auto&      s      = g_shadow;
+	const auto offset = raw_offset & 0xffffu;
+	const auto update = [&](auto& values, auto& valid) {
+		if (offset >= values.size()) {
+			s.dirty = true;
+			return;
+		}
+		if (!valid[offset] || values[offset] != value) {
+			valid[offset]  = true;
+			values[offset] = value;
+			s.dirty        = true;
+		}
+	};
+	if (space == 1) {
+		if (offset < Pm4::SH_NUM && ShFree(offset)) return;
+		update(s.sh, s.sh_valid);
+	} else if (space == 0) {
+		update(s.cx, s.cx_valid);
+	} else {
+		update(s.uc, s.uc_valid);
+	}
+}
+
+inline void WriteIndirectBlock(uint32_t space, const uint32_t* packet) {
+	const auto* block = reinterpret_cast<const uint32_t*>((uint64_t(packet[1]) & 0xfffffffcu) |
+	                                                      (uint64_t(packet[2]) << 32u));
+	const uint32_t pairs = packet[4] & 0x3fffu;
+	if (block == nullptr) return;
+	for (uint32_t i = 0; i < pairs; ++i) {
+		if (block[2 * i] == 0xffffffffu) continue;
+		WriteRegister(space, block[2 * i], block[2 * i + 1]);
+	}
+}
+
+// Every packet the command processor is about to execute.
+inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t packet_dw, bool predicated_skip) {
+	auto& s = g_shadow;
+	if (predicated_skip) {
+		s.dirty = true;
+		return;
+	}
+	switch (opcode) {
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+			s.last_clean = s.chain && !s.dirty;
+			s.chain      = true;
+			s.dirty      = false;
+			return;
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX: {
+			const uint32_t space = opcode == Pm4::IT_SET_CONTEXT_REG ? 0u
+			                       : opcode == Pm4::IT_SET_SH_REG    ? 1u
+			                                                         : 2u;
+			for (uint32_t i = 2; i < packet_dw; ++i) WriteRegister(space, packet[1] + (i - 2), packet[i]);
+			return;
+		}
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+			if (packet_dw < 5) {
+				s.dirty = true;
+				return;
+			}
+			WriteIndirectBlock(opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT ? 0u
+			                   : opcode == Pm4::IT_SET_SH_REG_INDIRECT    ? 1u
+			                                                              : 2u,
+			                   packet);
+			return;
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_NOP:
+		case Pm4::IT_ACQUIRE_MEM:
+		case Pm4::IT_RELEASE_MEM:
+		case Pm4::IT_WAIT_REG_MEM:
+		case Pm4::IT_WAIT_REG_MEM_64:
+		case Pm4::IT_EVENT_WRITE:
+		case Pm4::IT_EVENT_WRITE_EOP:
+		case Pm4::IT_EVENT_WRITE_EOS:
+		case Pm4::IT_WRITE_DATA:
+		case Pm4::IT_PFP_SYNC_ME:
+		case Pm4::IT_INDIRECT_BUFFER:
+		case Pm4::IT_COPY_DATA:
+		case Pm4::IT_DMA_DATA: return;
+		default:
+			// Any other draw ends the chain; anything unknown may change state.
+			s.chain = false;
+			s.dirty = true;
+			return;
+	}
+}
+
+} // namespace Libs::Graphics::DrawStateObserver
+
+#endif // EMULATOR_SRC_LOCAL_DRAW_STATE_OBSERVER_H_

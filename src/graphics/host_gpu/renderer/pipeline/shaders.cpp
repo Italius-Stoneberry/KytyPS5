@@ -180,23 +180,33 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 	return vk::BlendOp::eAdd;
 }
 
+// native_bindings: the native XPR variant (src/local/native-xpr.inc). The same
+// SPIR-V, but one ordinary descriptor set per object in which the flattened SRT
+// and shader data are dynamic storage buffers, so each draw only supplies offsets.
 static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                              vk::ShaderStageFlagBits              stage) {
+                              vk::ShaderStageFlagBits stage, bool native_bindings) {
+	using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
 	for (const auto& binding: program.bindings.descriptors) {
+		auto type = NativeDescriptorType(binding.kind);
+		if (native_bindings && (binding.kind == Kind::FlattenedSrt || binding.kind == Kind::ShaderData)) {
+			type = vk::DescriptorType::eStorageBufferDynamic;
+		}
 		descriptor_bindings.push_back(
-		    {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
-		     NativeDescriptorType(binding.kind), NativeDescriptorCount(binding), stage, nullptr});
+		    {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind), type,
+		     NativeDescriptorCount(binding), stage, nullptr});
 	}
 }
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                   std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+                                   std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                   bool native_bindings) {
 	uint32_t descriptor_count = 0;
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
 	}
-	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	pipeline.native_bindings       = native_bindings;
+	pipeline.uses_push_descriptors = !native_bindings && descriptor_count <= graphics.max_push_descriptors;
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
@@ -214,7 +224,8 @@ void CreatePipelineInternal(
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     const ShaderVertexInputInfo& vs_input_info, const ShaderProgram& vertex_program,
     const ShaderPixelInputInfo* ps_input_info, const ShaderProgram& pixel_program,
-    const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache) {
+    const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache,
+    bool native_bindings) {
 	const bool ps_active = ps_input_info != nullptr;
 	EXIT_IF(!vertex_program || (ps_active && !pixel_program));
 	const bool with_depth = rendering.depth_format != vk::Format::eUndefined ||
@@ -449,13 +460,14 @@ void CreatePipelineInternal(
 	color_blending.pAttachments    = color_blend_attachment;
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	AddLayoutBindings(descriptor_bindings, *vs_input_info.stage.program, vertex_stage);
+	AddLayoutBindings(descriptor_bindings, *vs_input_info.stage.program, vertex_stage,
+	                  native_bindings);
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);
 		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
-		                  vk::ShaderStageFlagBits::eFragment);
+		                  vk::ShaderStageFlagBits::eFragment, native_bindings);
 	}
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings, native_bindings);
 	const auto                  GraphicsStages = vertex_stage | vk::ShaderStageFlagBits::eFragment;
 	const vk::PushConstantRange push_constants {GraphicsStages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
@@ -602,8 +614,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
-	                  vk::ShaderStageFlagBits::eCompute);
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	                  vk::ShaderStageFlagBits::eCompute, false);
+	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings, false);
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 

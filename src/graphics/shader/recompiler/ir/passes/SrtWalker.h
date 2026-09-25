@@ -55,6 +55,40 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
 bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
              std::vector<uint32_t>& flat);
 
+// Every guest dword one linear SRT evaluation reads, split by use (native XPR
+// records). A `data` read reaches only the flattened SRT, unchanged: its flat
+// positions are plain copies of its address. Every other read - one feeding an
+// address, a descriptor dword or a computed value, or a clean read - is
+// `structural`, with the value it had. False when the program is not evaluated
+// by a single linear plan (no plan, control-flow variants, a failed read).
+struct SrtReadTrace {
+	// Why a read is structural (bits): it feeds another read's address, a
+	// descriptor dword, a computed value, or it is a control-flow predicate input.
+	enum Use : uint8_t { Address = 1, Descriptor = 2, Computed = 4, Predicate = 8 };
+	struct Read {
+		uint64_t address = 0;
+		uint32_t value   = 0;
+		bool     clean   = false;
+		uint8_t  use     = 0;
+	};
+	// Structural reads copied unchanged into a descriptor dword of the snapshot.
+	enum class Kind : uint8_t { Buffer, Image, Sampler };
+	struct Feed {
+		uint32_t read  = 0; // index into structural
+		Kind     kind  = Kind::Buffer;
+		uint32_t index = 0; // resource index in the snapshot
+		uint32_t dword = 0;
+	};
+	std::vector<std::pair<uint32_t, uint64_t>> data; // (flat index, address)
+	std::vector<Read>                          structural;
+	std::vector<Feed>                          feeds;
+	// Structural reads that are also copied unchanged into the flattened SRT:
+	// (index into structural, flat index).
+	std::vector<std::pair<uint32_t, uint32_t>> flat_feeds;
+	size_t                                     flat_words = 0;
+};
+bool TraceLinearSrtReads(const ResourcePlan& program, const SrtRuntime& runtime, SrtReadTrace& trace);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_ */

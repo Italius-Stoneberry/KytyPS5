@@ -77,6 +77,8 @@ public:
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
+	// Native XPR draws (kyty_local_native_xpr_mode): packets consumed, 0 = normal path.
+	[[nodiscard]] uint32_t TryNativeXprDraws(std::span<const uint32_t> packets, bool clean);
 	uint32_t TryDrawIndirectRun(std::span<const uint32_t> packets);
 	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,

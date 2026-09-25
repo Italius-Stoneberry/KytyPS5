@@ -51,7 +51,11 @@ def generate(registry, header):
     # still being recorded could never have been waited for in the direct design).
     NO_DRAIN_CALLS = {'vkGetSemaphoreCounterValue', 'vkGetSemaphoreCounterValueKHR',
                       'vkWaitSemaphores', 'vkWaitSemaphoresKHR', 'vkCreateImageView',
-                      'vkGetBufferDeviceAddress', 'vkGetBufferDeviceAddressKHR'}
+                      'vkGetBufferDeviceAddress', 'vkGetBufferDeviceAddressKHR',
+                      # Native XPR records allocate while the worker may still write
+                      # other sets of the same pool (vkUpdateDescriptorSets needs only
+                      # the destination set synchronized).
+                      'vkAllocateDescriptorSets'}
     declarations, installs, names, deferred = [], [], [], []
     section = header.read_text().split('class DispatchLoaderDynamic :', 1)[1].split(
         'DispatchLoaderDynamic()', 1)[0]
