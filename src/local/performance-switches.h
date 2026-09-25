@@ -16,6 +16,7 @@
 
 extern "C" {
 extern volatile std::atomic_uint32_t kyty_local_backing_read_mode;
+extern volatile std::atomic_uint32_t kyty_local_stream_upload_mode;
 extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
 extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
@@ -44,6 +45,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_COPY_FEEDBACK", &kyty_local_copy_feedback_mode},
 	    Switch {"KYTY_ASYNC_LOD_STATS", &kyty_local_async_lod_stats_mode},
 	    Switch {"KYTY_BACKING_READ", &kyty_local_backing_read_mode},
+	    Switch {"KYTY_STREAM_UPLOAD", &kyty_local_stream_upload_mode},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {

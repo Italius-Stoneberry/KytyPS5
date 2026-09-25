@@ -58,6 +58,9 @@ public:
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
+	// CPU-written snapshots consumed as shader storage buffers. Each selected
+	// ring keeps its own GPU retirement watches across runtime mode changes.
+	[[nodiscard]] StreamBuffer& GetShaderUploadBuffer() noexcept;
 	[[nodiscard]] const Buffer* GetLodStatsBuffer() const noexcept { return &m_lod_stats_buffer; }
 	void ReportLodStats(void* dst, uint32_t size, bool reset);
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
@@ -157,6 +160,7 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
+	StreamBuffer                                      m_host_shader_upload;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;

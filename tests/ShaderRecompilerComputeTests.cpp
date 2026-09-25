@@ -4,6 +4,7 @@
 #include "native-preparation-scratch.h"
 extern "C" volatile std::atomic_uint32_t kyty_local_backing_read_mode;
 #include <barrier>
+extern "C" volatile std::atomic_uint32_t kyty_local_stream_upload_mode;
 extern "C" volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode;
 #endif
 #include "common/emulatorConfig.h"
@@ -161,6 +162,9 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
 
 struct BufferCacheTestAccess {
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  static uint64_t CpuEpoch(const BufferCache& cache, uint64_t address, uint64_t size) {
+    return cache.m_memory_tracker.CpuModificationEpoch(address, size);
+  }
   static void DownloadLodReport(BufferCache& cache, uint64_t address) {
     cache.ReadMemoryOnGpu(address, 0x840, false);
   }
@@ -2668,6 +2672,94 @@ public:
   }
 
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  void CheckStreamSnapshots() {
+    constexpr const char* name = "StreamSnapshots";
+    namespace Memory = Libs::LibKernel::Memory;
+    constexpr uint64_t base = 0x201680000ull, page = 0x4000;
+    constexpr uint64_t alias = base + 2 * page;
+    constexpr size_t words = 13, stride = 64;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", Memory::KernelAllocateDirectMemory(
+        0, Memory::KernelGetDirectMemorySize(), page, page, 0, &physical) == 0,
+        "backing allocation failed");
+    for (const auto address : {base, alias}) {
+      void* target = reinterpret_cast<void*>(address);
+      Require(name, "map", Memory::KernelMapDirectMemory(
+          &target, page, 3, 0x10, physical, page) == 0 &&
+          reinterpret_cast<uint64_t>(target) == address, "backing mapping failed");
+    }
+    const auto saved_upload = kyty_local_stream_upload_mode.load();
+    {
+      CommandScheduler scheduler(Renderer(), m_runtime_context);
+      HW::Context registers {};
+      HW::UserConfig user_config {};
+      HW::Shader shaders {};
+      scheduler.Begin(registers, user_config, shaders);
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      auto& cache = resources.GetBufferCache();
+      Libs::Graphics::Buffer result(m_runtime_context, scheduler, MemoryUsage::Download,
+          0, vk::BufferUsageFlagBits::eTransferDst, 128 * stride);
+      std::vector<std::array<uint32_t, words>> expected;
+      std::array<uint32_t, words> bytes {};
+      const auto acquire = [&] {
+        const auto value = cache.ObtainBuffer(base, sizeof(bytes), false, false);
+        Require(name, "stream path", value.first == &cache.GetShaderUploadBuffer(),
+                "small writable guest input did not use the selected upload ring");
+        result.CopyFrom(scheduler.Current(), *value.first, value.second,
+            expected.size() * stride, sizeof(bytes), vk::AccessFlagBits::eHostWrite, {},
+            vk::AccessFlagBits::eShaderRead, vk::AccessFlagBits::eHostRead);
+        expected.push_back(bytes);
+        return value;
+      };
+      for (const auto pool : {0u, 1u}) {
+        kyty_local_stream_upload_mode.store(pool);
+        for (size_t i = 0; i < words; ++i) bytes[i] = 0x12000000u + expected.size() * 256u + i;
+        std::memcpy(reinterpret_cast<void*>(base), bytes.data(), sizeof(bytes));
+        const auto first = acquire();
+        const auto repeated = acquire();
+        Require(name, "same bytes", first != repeated,
+                "repeated input unexpectedly reused an upload reservation");
+        const auto epoch = BufferCacheTestAccess::CpuEpoch(cache, base, sizeof(bytes));
+        bytes[words - 1] ^= 0xffffffffu;
+        // This page is already writable. No page fault or CPU epoch update
+        // accompanies this ordinary write, including through a physical alias.
+        std::memcpy(reinterpret_cast<void*>(alias), bytes.data(), sizeof(bytes));
+        Require(name, "writable alias", BufferCacheTestAccess::CpuEpoch(
+            cache, base, sizeof(bytes)) == epoch, "fixture unexpectedly advanced the CPU epoch");
+        const auto changed = acquire();
+        Require(name, "changed bytes", changed != repeated,
+                "the old upload survived a byte change with an unchanged CPU epoch");
+        const auto changed_again = acquire();
+        Require(name, "new snapshot reusable", changed != changed_again,
+                "the changed snapshot unexpectedly reused an upload reservation");
+      }
+      scheduler.Finish();
+      result.Invalidate(0, result.Size());
+      for (size_t i = 0; i < expected.size(); ++i)
+        Require(name, "all in-flight snapshots", std::memcmp(result.Mapped().data() + i * stride,
+            expected[i].data(), sizeof(bytes)) == 0,
+            "a later byte change or runtime switch changed an earlier GPU consumer");
+      const auto before = acquire();
+      scheduler.Finish();
+      const auto after = acquire();
+      Require(name, "new submission", before != after,
+              "reuse crossed the upload ring's submission watch boundary");
+      scheduler.Finish();
+      result.Invalidate(0, result.Size());
+      for (size_t i = 0; i < expected.size(); ++i)
+        Require(name, "retired snapshots", std::memcmp(result.Mapped().data() + i * stride,
+            expected[i].data(), sizeof(bytes)) == 0,
+            "submission retirement changed a stored GPU result");
+    }
+    kyty_local_stream_upload_mode.store(saved_upload);
+    for (const auto address : {base, alias})
+      Require(name, "unmap", Memory::KernelMunmap(address, page) == 0, "unmap failed");
+    Require(name, "release", Memory::KernelReleaseDirectMemory(physical, page) == 0,
+            "backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckDrawRunReadRanges() {
     constexpr const char* name = "DrawRunReadRanges";
     constexpr uint64_t base = 0x0000000207c00000ull, size = 0x40000, alias = base + 2 * size;
@@ -2800,6 +2892,54 @@ public:
             "guest mapping release failed");
     Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
             "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckShaderUploadRing() {
+    constexpr const char* name = "ShaderUploadRing";
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers {};
+    HW::UserConfig user_config {};
+    HW::Shader shaders {};
+    scheduler.Begin(registers, user_config, shaders);
+    GpuResourceManager resources(m_runtime_context, scheduler);
+    auto& cache = resources.GetBufferCache();
+    constexpr std::array<uint32_t, 12> modes {0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0};
+    constexpr size_t words = 13, stride = 64;
+    std::array<std::array<uint32_t, words>, modes.size()> payloads {};
+    Libs::Graphics::Buffer result(m_runtime_context, scheduler, MemoryUsage::Download,
+                                 0, vk::BufferUsageFlagBits::eTransferDst,
+                                 stride * modes.size());
+    const auto saved_mode = kyty_local_stream_upload_mode.load();
+    std::array<vk::Buffer, 2> rings {};
+    for (size_t i = 0; i < modes.size(); ++i) {
+      kyty_local_stream_upload_mode.store(modes[i], std::memory_order_relaxed);
+      auto& upload = cache.GetShaderUploadBuffer();
+      const auto alignment = 256;
+      for (size_t j = 0; j < words; ++j) payloads[i][j] = uint32_t(0x12340000 + i * 0x100 + j);
+      const auto offset = upload.Copy(payloads[i].data(), sizeof(payloads[i]), alignment);
+      Require(name, "storage alignment", offset % m_runtime_context.StorageMinAlignment() == 0,
+              "shader upload lost the storage-buffer alignment requirement");
+      auto& identity = rings[modes[i]];
+      Require(name, "ring identity", !identity || identity == upload.Handle(),
+              "switching away destroyed an existing ring");
+      identity = upload.Handle();
+      // Queue every copy before waiting. Switching back must preserve the
+      // earlier snapshots until their GPU consumers have actually completed.
+      result.CopyFrom(scheduler.Current(), upload, offset, i * stride, sizeof(payloads[i]),
+                      vk::AccessFlagBits::eHostWrite, {}, vk::AccessFlagBits::eShaderRead,
+                      vk::AccessFlagBits::eHostRead);
+    }
+    kyty_local_stream_upload_mode.store(saved_mode, std::memory_order_relaxed);
+    Require(name, "independent rings", rings[0] && rings[1] && rings[0] != rings[1],
+            "upload memory choices unexpectedly share the same ring");
+    scheduler.Finish();
+    result.Invalidate(0, result.Size());
+    for (size_t i = 0; i < modes.size(); ++i)
+      Require(name, "in-flight bytes", std::memcmp(result.Mapped().data() + i * stride,
+              payloads[i].data(), sizeof(payloads[i])) == 0,
+              "queued snapshot changed after a mode switch");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 #endif
@@ -31556,6 +31696,15 @@ int main(int argc, char **argv) {
     vulkan.CheckPreparedBindingScratch();
     vulkan.CheckUnifiedTextureCacheFlow();
     kyty_local_binding_scratch_mode.store(0, std::memory_order_relaxed);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-upload-ring-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckShaderUploadRing();
+    vulkan.CheckStreamSnapshots();
+    kyty_local_stream_upload_mode.store(1, std::memory_order_relaxed);
+    vulkan.CheckUnifiedTextureCacheFlow();
+    kyty_local_stream_upload_mode.store(0, std::memory_order_relaxed);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--host-backing-read-only") == 0) {

@@ -9,6 +9,8 @@ volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
 volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 // 1: pack the LOD report on the GPU instead of a CPU wait and copy.
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
+// 1: shader constants stream through a host-visible upload ring.
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_stream_upload_mode {0};
 }
 
 #include "common/assert.h"
@@ -475,6 +477,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
+      m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache), m_resources(resources) {
@@ -780,6 +783,11 @@ void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 }
 
+StreamBuffer& BufferCache::GetShaderUploadBuffer() noexcept {
+	return kyty_local_stream_upload_mode.load(std::memory_order_relaxed) != 0 ? m_host_shader_upload
+	                                                                        : m_stream_buffer;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -791,12 +799,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		auto& upload = GetShaderUploadBuffer();
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		auto [mapped, offset] = upload.Map(size, alignment, false);
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(vaddr, mapped, size)) {
-			m_stream_buffer.Commit();
-			return {&m_stream_buffer, offset};
+			upload.Commit();
+			return {&upload, offset};
 		}
 	}
 

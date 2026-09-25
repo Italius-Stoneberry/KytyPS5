@@ -851,7 +851,7 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	EXIT_IF(data.empty());
 	auto& command_buffer = context.GetCommandScheduler().Current();
 	EXIT_IF(command_buffer.IsInvalid());
-	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	auto&      buffer = context.GetBufferCache().GetShaderUploadBuffer();
 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
