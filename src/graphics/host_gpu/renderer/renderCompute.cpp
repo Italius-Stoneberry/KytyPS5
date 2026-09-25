@@ -472,7 +472,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
-	auto bindings = PrepareBindings(input_info.stage);
+	NativePreparationScratch<PreparedBindings> binding_storage(
+	    kyty_local_binding_scratch_mode.load(std::memory_order_relaxed) != 0);
+	auto& bindings = binding_storage.Get();
+	PrepareBindingsInto(input_info.stage, bindings);
 	FindBuffers(bindings);
 	PrepareBdaBindings(bindings);
 	// Materialize the persistent argument owner before final descriptor handles:

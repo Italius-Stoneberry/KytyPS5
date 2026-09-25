@@ -419,6 +419,13 @@ struct RenderExecutorTestAccess {
     return executor.PrepareGraphicsBindings(vertex, pixel, pixel_active);
   }
 
+  static void PrepareGraphicsBindingsInto(RenderExecutor &executor,
+                                           const ShaderStageRuntime &vertex,
+                                           const ShaderStageRuntime &pixel,
+                                           bool pixel_active, auto &bindings) {
+    executor.PrepareGraphicsBindingsInto(vertex, pixel, pixel_active, bindings);
+  }
+
   static PipelineCache::Pipeline
   CreateDescriptorPipeline(RenderExecutor &executor,
                            std::span<PreparedBindings *const> stages) {
@@ -2163,6 +2170,87 @@ public:
     m_device.destroyDescriptorSetLayout(layout, nullptr);
     std::printf("[host]    %-32s ok\n", "DescriptorHeapLargeSet");
   }
+
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  void CheckPreparedBindingScratch() {
+    constexpr const char *name = "PreparedBindingScratch";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &executor = context.GetRenderExecutor();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    ShaderRecompiler::IR::CompiledShaderInfo program{};
+    program.stage = ShaderType::Vertex;
+    program.bindings.user_data_registers = {0};
+    program.bindings.memory_offset_dword = 1;
+    ShaderStageRuntime first{.program = &program};
+    first.resources.user_data = {0x12345678u};
+    ShaderStageRuntime next{.program = &program};
+    next.resources.user_data = {0xabcdef01u};
+    PreparedBindings *original = nullptr;
+    size_t capacity = 0;
+    {
+      NativePreparationScratch<PreparedBindings> outer(true);
+      auto &prepared = outer.Get();
+      original = &prepared;
+      executor.PrepareBindingsInto(first, prepared);
+      prepared.shader_data.reserve(64);
+      capacity = prepared.shader_data.capacity();
+      prepared.buffer_sources.push_back({});
+      prepared.buffers.push_back({});
+      prepared.images.emplace_back();
+      prepared.samplers.push_back(nullptr);
+      const auto handle = context.GetBufferCache().GetGdsBuffer()->Handle();
+      prepared.gds = prepared.flattened_srt = prepared.shader_data_buffer = {handle, 16, 32};
+      NativePreparationScratch<PreparedBindings> inner(true);
+      executor.PrepareBindingsInto(next, inner.Get());
+      Require(name, "nested lease", &inner.Get() != original &&
+                  prepared.runtime == &first && prepared.shader_data[0] == 0x12345678u,
+              "nested preparation overwrote a live outer binding");
+    }
+    {
+      NativePreparationScratch<PreparedBindings> storage(true);
+      auto &prepared = storage.Get();
+      executor.PrepareBindingsInto(next, prepared);
+      Require(name, "fresh logical state", &prepared == original &&
+                  prepared.runtime == &next && prepared.buffer_sources.empty() &&
+                  prepared.buffers.empty() && prepared.images.empty() &&
+                  prepared.samplers.empty() && prepared.gds.buffer == nullptr &&
+                  prepared.gds.offset == 0 && prepared.gds.range == VK_WHOLE_SIZE &&
+                  prepared.flattened_srt == vk::DescriptorBufferInfo{} &&
+                  prepared.shader_data_buffer == vk::DescriptorBufferInfo{} &&
+                  prepared.shader_data == std::vector<uint32_t>{0xabcdef01u} &&
+                  prepared.shader_data.capacity() == capacity,
+              "storage reuse retained stale resources or lost reserved capacity");
+      NativePreparationScratch<PreparedBindings> disabled(false);
+      Require(name, "disabled lease", &disabled.Get() != original,
+              "reference mode reused a live pooled binding");
+    }
+    auto graphics = RenderExecutorTestAccess::PrepareGraphicsBindings(executor, first, next, true);
+    RenderExecutorTestAccess::PrepareGraphicsBindingsInto(executor, next, first, false, graphics);
+    Require(name, "pixel disabled", !graphics.pixel && graphics.vertex.runtime == &next,
+            "disabling the pixel stage retained its previous bindings");
+    RenderExecutorTestAccess::PrepareGraphicsBindingsInto(executor, first, next, true, graphics);
+    Require(name, "pixel restored", graphics.pixel && graphics.pixel->runtime == &next &&
+                graphics.pixel->shader_data == std::vector<uint32_t>{0xabcdef01u},
+            "reenabling the pixel stage did not rebuild its bindings");
+    program.bindings.descriptors = {
+        {ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt, {}},
+        {ShaderRecompiler::IR::DescriptorBindingKind::ShaderData, {}}};
+    first.resources.flattened_srt = {0x10203040u, 0x50607080u};
+    executor.PrepareBindingsInto(first, graphics.vertex);
+    executor.FindBuffers(graphics.vertex);
+    executor.RebindBuffers(graphics.vertex);
+    const auto pipeline = RenderExecutorTestAccess::CommitBindings(
+        executor, scheduler.Current(), graphics.vertex);
+    scheduler.Finish();
+    RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, std::span{&pipeline, 1u});
+    std::printf("[host]    %-32s ok\n", name);
+  }
+#endif
 
   void CheckGraphicsPushConstantBank() {
     constexpr const char *name = "GraphicsPushConstantStages";
@@ -30932,6 +31020,14 @@ int main(int argc, char **argv) {
       vulkan.CheckNativeDispatchIndirect();
     }
     kyty_local_specialization_guard_mode.store(0);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--binding-scratch-only") == 0) {
+    VulkanHarness vulkan;
+    kyty_local_binding_scratch_mode.store(1, std::memory_order_relaxed);
+    vulkan.CheckPreparedBindingScratch();
+    vulkan.CheckUnifiedTextureCacheFlow();
+    kyty_local_binding_scratch_mode.store(0, std::memory_order_relaxed);
     return 0;
   }
 #endif

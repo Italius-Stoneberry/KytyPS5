@@ -169,6 +169,7 @@ public:
 	                    uint64_t indirect_args = 0);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
+	void PrepareBindingsInto(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void PrepareBdaBindings(const PreparedBindings& first, const PreparedBindings* second = nullptr);
 	void                           RebindBuffers(PreparedBindings& bindings);
@@ -199,6 +200,9 @@ private:
 	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	                                                       const ShaderStageRuntime& pixel,
 	                                                       bool                      pixel_active);
+	void PrepareGraphicsBindingsInto(const ShaderStageRuntime& vertex,
+	                                  const ShaderStageRuntime& pixel, bool pixel_active,
+	                                  GraphicsBindings& bindings);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);

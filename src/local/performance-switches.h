@@ -13,6 +13,9 @@
 #include <pthread.h>
 #include <string>
 
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
+}
 
 inline void InitializePerformanceSwitches() {
 	struct Switch {
@@ -30,6 +33,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_PREPARATION_TRIM", &kyty_local_preparation_trim_mode},
 	    Switch {"KYTY_SPECIALIZATION_GUARD", &kyty_local_specialization_guard_mode},
 	    Switch {"KYTY_PIPELINE_INDEX", &kyty_local_pipeline_index_mode},
+	    Switch {"KYTY_BINDING_SCRATCH", &kyty_local_binding_scratch_mode},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {

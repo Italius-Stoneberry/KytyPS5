@@ -42,6 +42,10 @@
 #undef max
 #endif
 
+extern "C" {
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_binding_scratch_mode {0};
+}
+
 namespace Libs::Graphics {
 
 namespace {
@@ -888,11 +892,27 @@ void RenderExecutor::ResetBindings() {
 }
 
 PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
+	PreparedBindings prepared;
+	PrepareBindingsInto(runtime, prepared);
+	return prepared;
+}
+
+void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
+                                         PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = runtime.resources;
-	PreparedBindings prepared;
+	// Retain vector capacity only. Every resource and upload belongs to this
+	// invocation; previous handles, shader data and stage associations are stale.
+	prepared.buffer_sources.clear();
+	prepared.buffers.clear();
+	prepared.images.clear();
+	prepared.samplers.clear();
+	prepared.shader_data.clear();
+	prepared.gds = vk::DescriptorBufferInfo {nullptr, 0, VK_WHOLE_SIZE};
+	prepared.flattened_srt = vk::DescriptorBufferInfo {};
+	prepared.shader_data_buffer = vk::DescriptorBufferInfo {};
 	prepared.runtime = &runtime;
 	prepared.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -913,7 +933,6 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
-	return prepared;
 }
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
@@ -1042,11 +1061,20 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 RenderExecutor::GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
-	GraphicsBindings bindings {
-	    .vertex = PrepareBindings(vertex),
-	};
+	GraphicsBindings bindings;
+	PrepareGraphicsBindingsInto(vertex, pixel, pixel_active, bindings);
+	return bindings;
+}
+
+void RenderExecutor::PrepareGraphicsBindingsInto(const ShaderStageRuntime& vertex,
+                                                  const ShaderStageRuntime& pixel,
+                                                  bool pixel_active, GraphicsBindings& bindings) {
+	PrepareBindingsInto(vertex, bindings.vertex);
 	if (pixel_active) {
-		bindings.pixel.emplace(PrepareBindings(pixel));
+		if (!bindings.pixel) bindings.pixel.emplace();
+		PrepareBindingsInto(pixel, *bindings.pixel);
+	} else {
+		bindings.pixel.reset();
 	}
 	FindBuffers(bindings.vertex);
 	if (bindings.pixel) {
@@ -1061,7 +1089,6 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	if (bindings.pixel) {
 		RebindImages(*bindings.pixel);
 	}
-	return bindings;
 }
 
 void RenderExecutor::PrepareBdaBindings(const PreparedBindings& first, const PreparedBindings* second) {

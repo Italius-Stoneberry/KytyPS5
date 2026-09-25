@@ -9,12 +9,16 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// 1: reuse PreparedBindings storage across operations (fresh contents each time).
+extern "C" volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
 
 struct ShaderStageRuntime;
 

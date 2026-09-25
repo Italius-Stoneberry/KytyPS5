@@ -1158,8 +1158,11 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.name, "PrepareBindings");
-	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
-	                                        state.ps_active);
+	NativePreparationScratch<GraphicsBindings> binding_storage(
+	    kyty_local_binding_scratch_mode.load(std::memory_order_relaxed) != 0);
+	auto& bindings = binding_storage.Get();
+	PrepareGraphicsBindingsInto(state.vs_input_info.stage, state.ps_input_info.stage,
+	                            state.ps_active, bindings);
 	if (!emit.direct_run.empty()) {
 		const auto safe_images = [&](const PreparedBindings& prepared) {
 			for (size_t index = 0; index < prepared.images.size(); ++index) {
