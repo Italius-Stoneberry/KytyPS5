@@ -920,6 +920,12 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 }
 
+	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	       IsGpuAddressRange(vaddr, size) && g_gpu_resources->HasReadWatchers(vaddr, size) &&
+	       TryReadGpuCleanBacking(vaddr, data, size);
+}
+}
+
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;

@@ -110,6 +110,8 @@ void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Avoid false-sharing read faults only when exact ownership proves clean.
+bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size);
 bool                   SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
 bool                   IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size);
 // On failure, optionally return a static diagnostic string (no allocation).

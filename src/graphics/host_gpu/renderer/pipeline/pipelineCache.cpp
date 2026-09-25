@@ -107,6 +107,17 @@ bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
 }
 
+bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
+	// A GPU-written neighbour may protect a clean descriptor on the same page.
+	// Reading its checked backing alias avoids an unnecessary GPU drain. Dirty,
+	// unmapped and untracked addresses retain the original load/fault behavior.
+	if (!Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value,
+	                                                                  sizeof(*value))) {
+		std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+	}
+	return true;
+}
+
 void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
                            const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
 	if (!ok) {
@@ -325,6 +336,7 @@ struct PipelineCache::ProgramCache {
 		const ShaderRecompiler::IR::SrtRuntime input_runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderRawGuestMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .sync_memory                = SyncShaderGuestMemory,
 		};

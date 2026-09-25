@@ -23,6 +23,9 @@ public:
 
 	[[nodiscard]] BufferCache&  GetBufferCache() { return m_buffer_cache; }
 	[[nodiscard]] TextureCache& GetTextureCache() { return m_texture_cache; }
+	[[nodiscard]] bool          HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept {
+        return m_page_manager.HasReadWatchers(vaddr, size);
+	}
 	void                        SetGpu(GuestGpu* gpu) noexcept { m_gpu = gpu; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
