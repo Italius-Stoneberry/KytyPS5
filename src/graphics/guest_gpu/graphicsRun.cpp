@@ -22,6 +22,7 @@
 #include "libs/errno.h"
 
 #include "draw-state-observer.h"
+#include "live-control.h"
 #include "performance-switches.h"
 #include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -525,6 +526,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	InitializePerformanceSwitches();
+	LiveControl::Start();
 	XprCapture::Initialize();
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::ProducerScope recording;
@@ -1814,6 +1816,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 }
 
 void CommandProcessor::Flip() {
+	LiveControl::Flip();
 	CheckBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
