@@ -1771,6 +1771,115 @@ public:
     return Renderer();
   }
 
+  void CheckCpuWriteWindow() {
+	  using namespace Libs::Graphics;
+	  namespace Memory           = Libs::LibKernel::Memory;
+	  constexpr const char* name = "CpuWriteWindow";
+	  constexpr uint64_t    base = 0x000000020c000000ull, bytes = 0x40000;
+	  constexpr uint64_t    window = 0x4000, other = base + window + 0x100;
+	  constexpr uint64_t    alias = base + 0x1000000;
+	  EnsureRuntimeContext();
+	  auto&            context = Renderer();
+	  CommandScheduler scheduler(context, m_runtime_context);
+	  HW::Context      registers {};
+	  HW::UserConfig   user_config {};
+	  HW::Shader       shaders {};
+	  scheduler.Begin(registers, user_config, shaders);
+	  context.InitializeGpu(nullptr);
+	  auto&   gpu        = context.GetGpu();
+	  int64_t allocation = 0;
+	  Require(name, "allocate",
+		      Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(), bytes,
+		                                         0x10000, 0, &allocation) == 0,
+		      "allocation failed");
+	  void* mapped = reinterpret_cast<void*>(base);
+	  Require(name, "map",
+		      Memory::KernelMapDirectMemory(&mapped, bytes, 3, 0x10, allocation, 0x10000) == 0 &&
+		          mapped == reinterpret_cast<void*>(base),
+		      "mapping failed");
+	  {
+		  GpuResourceManager resources(m_runtime_context, scheduler);
+		  resources.SetGpu(&gpu);
+		  resources.MapMemory(base, bytes);
+		  auto& cache    = resources.GetBufferCache();
+		  auto& textures = resources.GetTextureCache();
+		  (void)cache.ObtainBuffer(base, window, false);
+		  (void)cache.ObtainBuffer(other, 4, true);
+		  cache.FillBuffer(other, 4, 0x31415926, false);
+		  Require(name, "fault window",
+			      resources.HandleFault(PageFaultAccess::Write, base + 7) &&
+			          cache.IsRegionCpuModified(base + window - 1, 1) &&
+			          cache.HasGpuDirtyBytes(other, 4),
+			      "fault missed window or invalidated unrelated GPU data");
+		  *reinterpret_cast<uint32_t*>(base + window - 0x100) = 0xabcdef12;
+		  auto bound = cache.ObtainBuffer(base, window, false);
+		  cache.ReadMemory(other, 4);
+		  Require(name, "neighbour GPU value", *reinterpret_cast<uint32_t*>(other) == 0x31415926,
+			      "window overwrote adjacent GPU contents");
+		  (void)cache.ObtainBuffer(base, window, true);
+		  auto destination = cache.ObtainBuffer(base + 2 * window, window, true);
+		  cache.CopyBuffer(base + 2 * window, base, window, false, false);
+		  cache.ReadMemory(base + 2 * window + window - 0x100, 4);
+		  Require(name, "CPU write upload",
+			      *reinterpret_cast<uint32_t*>(base + 3 * window - 0x100) == 0xabcdef12,
+			      "widened window hid a new CPU write from native buffers");
+		  (void)bound;
+		  (void)destination;
+
+		  (void)cache.ObtainBuffer(base, window, false);
+		  (void)cache.ObtainBuffer(base + 0x2000, 4, true);
+		  cache.FillBuffer(base + 0x2000, 4, 0x76543210, false);
+		  Require(name, "GPU exclusion",
+			      !cache.TryInvalidateCpuWriteWindow(base + 7, base, window) &&
+			          !cache.IsRegionCpuModified(base, 4) &&
+			          cache.HasGpuDirtyBytes(base + 0x2000, 4),
+			      "GPU-owned window accepted");
+		  cache.ReadMemory(base + 0x2000, 4);
+
+		  ImageInfo image {};
+		  image.data      = {base + 0x3040, 4};
+		  image.extent    = {1, 1, 1};
+		  image.resources = {1, 1};
+		  image.samples   = 1;
+		  const auto id   = TextureCacheTestAccess::InsertImage(textures, image);
+		  Require(name, "image exclusion",
+			      !cache.TryInvalidateCpuWriteWindow(base + 7, base, window) &&
+			          !cache.IsRegionCpuModified(base, 4),
+			      "neighbour image did not exclude window");
+		  TextureCacheTestAccess::DeleteImage(textures, id);
+
+		  void* alias_map = reinterpret_cast<void*>(alias);
+		  Require(name, "alias map",
+			      Memory::KernelMapDirectMemory(&alias_map, 0x4000, 3, 0x10, allocation, 0x4000) ==
+			              0 &&
+			          alias_map == reinterpret_cast<void*>(alias),
+			      "alias failed");
+		  resources.MapMemory(alias, 0x4000);
+		  Require(name, "physical alias exclusion",
+			      resources.HandleFault(PageFaultAccess::Write, base + 7) &&
+			          !cache.IsRegionCpuModified(base + 0x2000, 4),
+			      "physically aliased window accepted");
+		  resources.UnmapMemory(alias, 0x4000);
+		  Require(name, "alias unmap", Memory::KernelMunmap(alias, 0x4000) == 0,
+			      "alias unmap failed");
+
+		  (void)cache.ObtainBuffer(base, window, false);
+		  resources.UnmapMemory(base + 0x3000, 0x1000);
+		  Require(name, "mapping clip",
+			      resources.HandleFault(PageFaultAccess::Write, base + 7) &&
+			          cache.IsRegionCpuModified(base + 0x2000, 4) &&
+			          !cache.IsRegionCpuModified(base + 0x4000, 4),
+			      "fault window crossed a mapped range boundary");
+		  resources.MapMemory(base + 0x3000, 0x1000);
+		  resources.UnmapMemory(base, bytes);
+		  scheduler.Finish();
+	  }
+	  Require(name, "unmap", Memory::KernelMunmap(base, bytes) == 0, "unmap failed");
+	  Require(name, "release", Memory::KernelReleaseDirectMemory(allocation, bytes) == 0,
+		      "release failed");
+	  std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckHostImageAllocation() {
     constexpr const char *name = "HostImageAllocation";
     auto &graphics = RuntimeContext();
@@ -30127,6 +30236,11 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   CheckDrawRunArguments();
+  if (argc == 2 && std::strcmp(argv[1], "--cpu-write-window-only") == 0) {
+	  VulkanHarness vulkan;
+	  vulkan.CheckCpuWriteWindow();
+	  return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckPackedTextureComponents();

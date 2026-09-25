@@ -423,6 +423,90 @@ void TestRangeInvalidation() {
   Release(memory);
 }
 
+void TestCpuWriteWindow() {
+	TrackerHarness     harness;
+	auto&              tracker    = harness.tracker;
+	constexpr auto     page       = Libs::Graphics::TRACKER_PAGE_SIZE;
+	constexpr auto     region     = Libs::Graphics::TRACKER_REGION_SIZE;
+	auto*              memory     = Allocate(harness.page_manager, 2 * region / page);
+	const auto         allocation = reinterpret_cast<uint64_t>(memory);
+	const auto         begin      = (allocation + region - 1) & ~(region - 1);
+	constexpr uint64_t bytes      = 4 * page;
+	const auto         fault      = begin + page + 7;
+	Check(!tracker.TryInvalidateCpuWriteWindow(fault, begin, bytes),
+	      "untracked write window accepted");
+	auto upload = [&](uint64_t address, uint64_t size, bool written = false) {
+		tracker.ForEachUploadRange(
+		    address, size, written, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	};
+	upload(begin, 2 * bytes);
+	const auto epoch = tracker.CpuModificationEpoch(begin, bytes);
+	tracker.MarkRegionAsGpuModified(begin + 3 * page, page);
+	Check(!tracker.TryInvalidateCpuWriteWindow(fault, begin, bytes) &&
+	          !tracker.IsRegionCpuModified(begin, bytes) &&
+	          tracker.IsRegionGpuModified(begin + 3 * page, page) &&
+	          !IsWritable(reinterpret_cast<void*>(fault)) &&
+	          tracker.CpuModificationEpoch(begin, bytes) == epoch,
+	      "rejected window changed GPU ownership, protection, or epoch");
+	tracker.UnmarkRegionAsGpuModified(begin + 3 * page, page);
+	tracker.MarkRegionAsGpuModified(begin + bytes, page);
+	Check(!tracker.TryInvalidateCpuWriteWindow(fault, begin + 1, bytes) &&
+	          !tracker.TryInvalidateCpuWriteWindow(fault, begin, page) &&
+	          !tracker.TryInvalidateCpuWriteWindow(begin + bytes, begin, bytes) &&
+	          !tracker.TryInvalidateCpuWriteWindow(begin + region - 1, begin + region - page,
+	                                               2 * page) &&
+	          !tracker.TryInvalidateCpuWriteWindow(UINT64_MAX, UINT64_MAX - page + 1, 2 * page),
+	      "invalid window was accepted");
+	g_epoch_tracker = &tracker;
+	g_epoch_address = begin;
+	g_epoch_before  = epoch;
+	g_epoch_checked = false;
+	Check(tracker.TryInvalidateCpuWriteWindow(fault, begin, bytes), "clean write window rejected");
+	g_epoch_tracker = nullptr;
+	Check(tracker.IsRegionCpuModified(begin, bytes) &&
+	          !tracker.IsRegionCpuModified(begin + bytes, page) &&
+	          tracker.IsRegionGpuModified(begin + bytes, page),
+	      "write window escaped its bound or kept a stale read proof");
+	for (auto p = begin; p < begin + bytes; p += page) {
+		Check(IsWritable(reinterpret_cast<void*>(p)), "window page remained protected");
+		*reinterpret_cast<volatile uint32_t*>(p) = uint32_t(p);
+	}
+	Check(!IsWritable(reinterpret_cast<void*>(begin + bytes)), "neighbour GPU page unprotected");
+	Check(g_epoch_checked, "write window did not publish epoch before unprotect");
+
+	// Hold an actual upload transaction while a fault tries this window. The
+	// fault must observe committed GPU ownership and reject, never race a check.
+	std::binary_semaphore uploading {0}, finish_upload {0}, attempting {0};
+	std::atomic<bool>     finished {false};
+	std::jthread          publisher([&] {
+        tracker.ForEachUploadRange(
+            begin, bytes, true, [](uint64_t, uint64_t) noexcept {},
+            [&]() noexcept {
+                uploading.release();
+                finish_upload.acquire();
+            });
+    });
+	uploading.acquire();
+	bool         accepted = true;
+	std::jthread fault_thread([&] {
+		attempting.release();
+		accepted = tracker.TryInvalidateCpuWriteWindow(fault, begin, bytes);
+		finished.store(true);
+	});
+	attempting.acquire();
+	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	Check(!finished.load(), "write fault bypassed an unfinished GPU upload");
+	finish_upload.release();
+	publisher.join();
+	fault_thread.join();
+	Check(!accepted && tracker.IsRegionFullyGpuModified(begin, bytes) &&
+	          !tracker.IsRegionCpuModified(begin, bytes),
+	      "write fault invalidated a new GPU owner");
+	tracker.UnmarkRegionAsGpuModified(begin, 2 * bytes);
+	tracker.UntrackMemory(allocation, 2 * region);
+	Release(memory);
+}
+
 void TestGpuReacquisitionAfterInvalidation() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1000,6 +1084,7 @@ int main(int argc, char **argv) {
   TestCpuDirtyUpload();
   TestLocalCpuEpochs();
   TestFullGpuOwnership();
+  TestCpuWriteWindow();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
