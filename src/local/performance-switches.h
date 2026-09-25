@@ -15,6 +15,7 @@
 
 extern "C" {
 extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
+extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
 }
 
 inline void InitializePerformanceSwitches() {
@@ -34,6 +35,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_SPECIALIZATION_GUARD", &kyty_local_specialization_guard_mode},
 	    Switch {"KYTY_PIPELINE_INDEX", &kyty_local_pipeline_index_mode},
 	    Switch {"KYTY_BINDING_SCRATCH", &kyty_local_binding_scratch_mode},
+	    Switch {"KYTY_DRAW_RUN_RANGES", &kyty_local_draw_run_ranges_mode},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {

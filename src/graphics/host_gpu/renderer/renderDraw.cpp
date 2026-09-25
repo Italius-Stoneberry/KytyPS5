@@ -48,6 +48,12 @@
 
 namespace Libs::Graphics {
 
+extern "C" {
+// 0: a draw run reads no buffer range that any image overlaps; 1: sampled
+// images whose contents still come from the CPU may overlap its read ranges.
+volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode {0};
+}
+
 // Draw state in reusable preparation storage when that switch is on.
 class NativeDrawState {
 	const bool                                enabled = NativePreparationScratchEnabled();
@@ -483,24 +489,6 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	       db.shader_dual_export_enable || db.shader_execute_on_noop;
 }
 
-struct DrawRenderState {
-	RenderDepthInfo       depth_info;
-	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	uint32_t              color_count                              = 0;
-	bool                  ps_active                                = true;
-	ShaderVertexInputInfo vs_input_info;
-	ShaderPixelInputInfo  ps_input_info;
-	PipelineCache::GraphicsPrograms programs;
-};
-
-struct DrawCallInfo {
-	const char*          name           = nullptr;
-	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
-	uint32_t             index_count    = 0;
-	uint32_t             instance_count = 0;
-	uint32_t             first_instance = 0;
-};
-
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  const std::optional<PreparedBindings>& pixel) {
@@ -711,17 +699,6 @@ static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
 	       mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
 }
-
-struct DrawEmitInfo {
-	std::span<const vk::DrawIndexedIndirectCommand> direct_run;
-	uint64_t run_mapping_epoch = 0, run_alias_epoch = 0;
-	bool     indexed       = false;
-	int32_t  vertex_offset = 0;
-	uint32_t first_vertex  = 0;
-	uint32_t first_instance = 0;
-};
-
-
 
 struct PreparedIndexBuffer {
 	vk::Buffer     buffer = nullptr;
@@ -1344,6 +1321,46 @@ bool BuildDrawIndexRun(std::span<const DrawIndexArgs> draws, DrawIndexRun& run) 
 	run                             = next;
 	return true;
 }
+// A draw run reads `range` as a buffer only when its guest backing is unique,
+// no render target of the run aliases it and no image overlaps it, except, with
+// `sampled_overlaps`, sampled images whose contents still come from the CPU:
+// nothing in the run writes those.
+bool RenderExecutor::ReadOnlyDrawBufferRangeSafe(GuestRange range, const DrawRenderState& state,
+                                                 bool sampled_overlaps) {
+	if (!range.address || !range.size) {
+		return true;
+	}
+	if (!range.Valid() || !LibKernel::Memory::IsUniqueGuestBackingRange(range.address, range.size)) {
+		return false;
+	}
+	auto& textures = m_context.GetTextureCache();
+	if (sampled_overlaps ? textures.ClassifyReadOnlyBufferOverlap(range.address, range.size) ==
+	                           TextureCache::ReadOnlyBufferOverlap::Unsafe
+	                     : textures.HasTrackedDataOverlap(range.address, range.size)) {
+		return false;
+	}
+	const auto overlaps = [&](ImageId id, const ImageInfo& image) {
+		if (!id) {
+			return false;
+		}
+		for (const auto target: {image.data, image.stencil, image.metadata.range}) {
+			if (!target.Empty() && ImageRangeOverlaps(range, target)) {
+				return true;
+			}
+		}
+		return false;
+	};
+	if (overlaps(state.depth_info.image_id, state.depth_info.desc.info)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < state.color_count; ++i) {
+		if (overlaps(state.color_info[i].image_id, state.color_info[i].desc.info)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool RenderExecutor::TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer,
                                      std::span<const DrawIndexArgs> draws,
                                      std::span<const uint64_t>      argument_addresses) {
@@ -1448,11 +1465,10 @@ bool RenderExecutor::TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	// Exclude buffer/attachment feedback through either virtual or physical
 	// aliases. Ordinary attachment depth/stencil ordering stays on Vulkan.
+	const bool sampled_overlaps =
+	    kyty_local_draw_run_ranges_mode.load(std::memory_order_relaxed) != 0;
 	const auto safe_range = [&](uint64_t address, uint64_t size) {
-		return !address || !size ||
-		       (LibKernel::Memory::IsUniqueGuestBackingRange(address, size) &&
-		        !m_context.GetTextureCache().HasTrackedDataOverlap(address, size) &&
-		        !overlaps_target({address, size}));
+		return ReadOnlyDrawBufferRangeSafe({address, size}, state, sampled_overlaps);
 	};
 	const auto safe_buffers = [&](const ShaderStageRuntime& stage) {
 		for (const auto& value: stage.resources.buffers) {

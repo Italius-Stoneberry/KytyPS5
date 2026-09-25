@@ -67,6 +67,8 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool HasTrackedDataOverlap(uint64_t address, uint64_t size);
+	enum class ReadOnlyBufferOverlap { None, CpuSampled, Unsafe };
+	[[nodiscard]] ReadOnlyBufferOverlap ClassifyReadOnlyBufferOverlap(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);

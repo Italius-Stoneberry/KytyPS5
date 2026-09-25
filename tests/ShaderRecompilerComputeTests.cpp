@@ -386,6 +386,10 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static bool ReadOnlyDrawBufferRangeSafe(RenderExecutor& executor, GuestRange range,
+                                          const DrawRenderState& state, bool sampled_overlaps) {
+    return executor.ReadOnlyDrawBufferRangeSafe(range, state, sampled_overlaps);
+  }
   static bool TryConsumeComputeImageClear(RenderExecutor &executor,
       const ShaderComputeInputInfo &input, CommandBuffer &command,
       uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
@@ -2654,6 +2658,143 @@ public:
     download.Invalidate(download_offset, 16);
     std::printf("[host]    %-32s ok\n", "StreamBufferRing");
   }
+
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  void CheckDrawRunReadRanges() {
+    constexpr const char* name = "DrawRunReadRanges";
+    constexpr uint64_t base = 0x0000000207c00000ull, size = 0x40000, alias = base + 2 * size;
+    constexpr uint32_t extent = 16, image_bytes = extent * extent * 4;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+        0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, 0x10000, 0, &physical) == 0,
+        "guest allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, 0x10000) == 0 && mapped == reinterpret_cast<void*>(base),
+        "guest mapping failed");
+    std::memset(mapped, 0, size);
+    for (uint32_t i = 0; i < image_bytes / 4; ++i)
+      static_cast<uint32_t*>(mapped)[i] = 0x12340000u + i;
+    {
+      RenderContext context(m_runtime_context);
+      auto& scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user, shaders);
+      auto& resources = context.GetGpuResources();
+      auto& textures = context.GetTextureCache();
+      auto& executor = context.GetRenderExecutor();
+      resources.MapMemory(base, size);
+      TextureCache::ImageDesc sampled{};
+      sampled.type = TextureCache::BindingType::Texture;
+      sampled.info.data = {base, image_bytes};
+      sampled.info.type = Prospero::ImageType::kColor2D;
+      sampled.info.pixel_format = vk::Format::eR32Uint;
+      sampled.info.guest_format = Prospero::BufferFormat::k32UInt;
+      sampled.info.extent = {extent, extent, 1};
+      sampled.info.resources = {1, 1};
+      sampled.info.pitch = extent;
+      sampled.info.bytes_per_block = 4;
+      sampled.info.tile_mode = Prospero::TileMode::kLinear;
+      sampled.info.mip_layout[0] = {0, image_bytes, extent, extent};
+      sampled.view_info.format = sampled.info.pixel_format;
+      sampled.view_info.type = vk::ImageViewType::e2D;
+      sampled.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto image_id = textures.FindImage(sampled);
+      Require(name, "sampled view", textures.FindTexture(image_id, sampled) != nullptr,
+              "sampled source was not acquired");
+      ShaderRecompiler::IR::CompiledShaderInfo source_program{};
+      source_program.stage = ShaderType::Pixel;
+      source_program.info.images.resize(1);
+      ShaderStageRuntime source_runtime{.program = &source_program};
+      PreparedBindings source_binding;
+      source_binding.runtime = &source_runtime;
+      source_binding.images.push_back({.image_id = image_id, .desc = sampled});
+      // Actual descriptor rebinding publishes image.usage.texture. Merely
+      // looking up a view does not establish that historical binding usage.
+      executor.RebindImages(source_binding);
+      auto target = sampled;
+      target.type = TextureCache::BindingType::RenderTarget;
+      target.info.data.address = base + 0x10000;
+      target.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      const auto target_id = textures.FindImage(target);
+      DrawRenderState state{};
+      state.color_count = 1;
+      state.color_info[0].image_id = target_id;
+      state.color_info[0].desc = target;
+      const auto safe = [&](GuestRange range, uint32_t mode) {
+        return RenderExecutorTestAccess::ReadOnlyDrawBufferRangeSafe(executor, range, state, mode != 0);
+      };
+      Require(name, "real overlap", textures.HasTrackedDataOverlap(base, 16),
+              "fixture failed to register overlapping image data");
+      for (const auto mode : {0u, 1u, 1u, 0u}) {
+        Require(name, "runtime range choice", safe({base, 16}, mode) == (mode == 1),
+                "CPU sampled source did not follow the selected guard");
+        Require(name, "attachment exclusion", !safe({target.info.data.address, 16}, mode),
+                "current attachment became a mergeable buffer input");
+        Require(name, "unmapped exclusion", !safe({base + size, 16}, mode),
+                "unmapped source was accepted");
+      }
+      // A sampled image that is also a current attachment must still be rejected,
+      // independently of the cache's prior binding usage.
+      state.color_info[0].image_id = image_id;
+      state.color_info[0].desc = sampled;
+      Require(name, "exact target feedback", !safe({base, 16}, 1),
+              "a read-only view hid the current attachment overlap");
+      state.color_info[0].image_id = target_id;
+      state.color_info[0].desc = target;
+      void* alias_pointer = reinterpret_cast<void*>(alias);
+      Require(name, "alias map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+          &alias_pointer, size, 0x3, 0x10, physical, 0x10000) == 0,
+          "physical alias mapping failed");
+      Require(name, "physical exclusion", !safe({base, 16}, 1) && !safe({alias, 16}, 1),
+              "physical alias bypassed the original uniqueness requirement");
+      Require(name, "alias unmap", Libs::LibKernel::Memory::KernelMunmap(alias, size) == 0,
+              "physical alias release failed");
+      Require(name, "alias removal", safe({base, 16}, 1),
+              "removing the alias did not restore unique backing");
+      Libs::Graphics::Buffer output(m_runtime_context, scheduler, MemoryUsage::Download,
+          0, vk::BufferUsageFlagBits::eTransferDst, 64);
+      for (uint32_t i = 0; i < 4; ++i) {
+        auto source = resources.GetBufferCache().ObtainBuffer(base, 16, false, true);
+        output.CopyFrom(scheduler.Current(), *source.first, source.second, 16 * i, 16);
+      }
+      scheduler.Finish();
+      output.Invalidate(0, output.Size());
+      for (uint32_t i = 0; i < 16; ++i) {
+        uint32_t observed;
+        std::memcpy(&observed, output.Mapped().data() + i * 4, 4);
+        Require(name, "GPU buffer consumers", observed == 0x12340000u + i % 4,
+                "repeated GPU readers changed the overlapping source");
+      }
+      Require(name, "GPU image consumer", ReadCachedTexel(name, context, image_id) ==
+              std::vector<u32>{0x12340000u}, "the buffer path changed the sampled image");
+      auto& image = textures.GetImage(image_id);
+      image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                    {}, scheduler.Current().Handle());
+      vk::ClearColorValue clear{};
+      clear.uint32[0] = 0x33445566u;
+      const vk::ImageSubresourceRange subresource{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+      scheduler.Current().Handle().clearColorImage(image.backing.image,
+          vk::ImageLayout::eTransferDstOptimal, clear, subresource);
+      textures.MarkGpuWritten(image_id);
+      Require(name, "GPU authority exclusion", !safe({base, 16}, 1),
+              "GPU-written image was treated as CPU-authoritative");
+      Require(name, "GPU updated texel", ReadCachedTexel(name, context, image_id) ==
+              std::vector<u32>{0x33445566u}, "GPU ownership probe lost the write");
+      resources.UnmapMemory(base, size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "guest mapping release failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+#endif
 
   void CheckGpuCommandLane() {
     EnsureRuntimeContext();
@@ -31012,6 +31153,13 @@ int main(int argc, char **argv) {
     return 0;
   }
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  if (argc == 2 && std::strcmp(argv[1], "--draw-run-ranges-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDrawRunReadRanges();
+    vulkan.CheckRasterization(false);
+    vulkan.CheckRasterization(true);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--specialization-guard-only") == 0) {
     VulkanHarness vulkan;
     // The PM4 compute fixture verifies its results with the guard off and on.

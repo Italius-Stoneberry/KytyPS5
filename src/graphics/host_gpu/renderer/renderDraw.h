@@ -2,9 +2,38 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERDRAW_H_
 
 #include <cstdint>
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 namespace Libs::Graphics {
+
+struct DrawRenderState {
+	RenderDepthInfo       depth_info;
+	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint32_t              color_count = 0;
+	bool                  ps_active = true;
+	ShaderVertexInputInfo vs_input_info;
+	ShaderPixelInputInfo  ps_input_info;
+	PipelineCache::GraphicsPrograms programs;
+};
+
+struct DrawCallInfo {
+	const char*          name = nullptr;
+	CommandBufferDebugOp debug_op = CommandBufferDebugOp::DrawIndex;
+	uint32_t             index_count = 0;
+	uint32_t             instance_count = 0;
+	uint32_t             first_instance = 0;
+};
+
+struct DrawEmitInfo {
+	std::span<const vk::DrawIndexedIndirectCommand> direct_run;
+	uint64_t run_mapping_epoch = 0, run_alias_epoch = 0;
+	bool     indexed = false;
+	int32_t  vertex_offset = 0;
+	uint32_t first_vertex = 0;
+	uint32_t first_instance = 0;
+};
 
 struct DrawIndexBufferSource {
 	uint64_t      address   = 0;

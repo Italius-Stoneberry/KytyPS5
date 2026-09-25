@@ -179,6 +179,8 @@ public:
 	                    std::span<PreparedBindings* const> bindings, bool compute_chain = false);
 
 private:
+	[[nodiscard]] bool ReadOnlyDrawBufferRangeSafe(GuestRange range, const DrawRenderState& state,
+	                                               bool sampled_overlaps);
 	struct TextureResolveCache;
 	std::shared_ptr<TextureResolveCache> m_texture_resolve_cache;
 

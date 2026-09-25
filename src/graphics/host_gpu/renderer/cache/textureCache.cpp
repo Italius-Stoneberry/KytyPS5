@@ -2007,6 +2007,26 @@ bool TextureCache::HasTrackedDataOverlap(uint64_t address, uint64_t size) {
 	return !FindImagesInRegion(address, size, false).empty();
 }
 
+TextureCache::ReadOnlyBufferOverlap TextureCache::ClassifyReadOnlyBufferOverlap(
+    uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) return ReadOnlyBufferOverlap::Unsafe;
+	std::scoped_lock lock {m_lock};
+	const auto images = FindImagesInRegion(address, size, false);
+	for (const auto id : images) {
+		const auto& image = m_slot_images[id];
+		// Only ordinary sampled images whose contents still come from the CPU.
+		// In particular, derived depth/stencil views are not covered by the
+		// simpler IsRegionGpuModified query and must remain excluded here.
+		if (!image.usage.texture || image.usage.storage || image.usage.render_target ||
+		    image.usage.depth_target || image.usage.video_out || image.depth_id ||
+		    image.info.IsDepth() || image.info.HasStencil() ||
+		    image.info.metadata.kind != ImageMetadataKind::None ||
+		    image.IsGpuModified() || image.IsStencilModified() || image.IsBufferModified())
+			return ReadOnlyBufferOverlap::Unsafe;
+	}
+	return images.empty() ? ReadOnlyBufferOverlap::None : ReadOnlyBufferOverlap::CpuSampled;
+}
+
 bool BufferCache::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size) {
 	if (!GuestRange {begin, size}.Valid()) return false;
 	// Follow image -> buffer-region -> page lock order. Hold the image lock
