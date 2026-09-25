@@ -11,6 +11,7 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <chrono>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -727,6 +728,55 @@ void TestRuntimeUnsignedGreaterEqual() {
     Check(EvaluateUniformValues(fixture.program, std::span(&predicate, 1), runtime,
                                 std::span(&value, 1)) && value == item[2],
           "runtime unsigned >= must preserve equality and unsigned high-bit ordering");
+  }
+}
+
+void TestLargeRuntimeEvaluation() {
+  Fixture fixture;
+  const auto input = fixture.UserData(0);
+  std::vector<Value> values;
+  constexpr uint32_t count = 4096;
+  for (uint32_t i = 0; i < count; ++i) {
+    values.push_back(fixture.Emit(ValueOpcode::IAdd32, {input, Value(i)}));
+    if (i % 16 == 0) {
+      values.back() = fixture.Emit(ValueOpcode::Identity, {values.back()});
+    }
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    values.push_back(values[count - i - 1]);
+  }
+  BuildSrtPlan(fixture.program);
+  std::vector<uint32_t> result(values.size());
+  for (uint32_t input_value : {17u, 0xffffff00u}) {
+    Check(EvaluateUniformValues(fixture.program, values,
+                                {.user_data = std::span(&input_value, 1)}, result),
+          "large runtime evaluation failed after cache growth");
+    for (uint32_t i = 0; i < count; ++i) {
+      Check(result[i] == input_value + i &&
+                result[count + i] == input_value + count - i - 1,
+            "runtime cache lost a value or retained data from a previous draw");
+    }
+  }
+}
+
+void TestExtractedRuntimeEvaluation() {
+  Fixture fixture;
+  const auto input = fixture.UserData(0);
+  constexpr uint32_t count = 4096;
+  for (uint32_t i = 0; i < count; ++i) {
+    const auto value = fixture.Emit(ValueOpcode::IAdd32, {input, Value(i)});
+    fixture.program.srt_reads.push_back({value, i});
+  }
+  fixture.program.srt_plan_complete = true;
+  auto plan = ExtractResourcePlan(fixture.program);
+  std::vector<uint32_t> result;
+  for (uint32_t input_value : {17u, 0xffffff00u}) {
+    Check(WalkSrt(plan, {.user_data = std::span(&input_value, 1)}, result),
+          "extracted runtime evaluation failed");
+    Check(result.size() == count, "extracted runtime evaluation lost outputs");
+    for (uint32_t i = 0; i < count; ++i) {
+      Check(result[i] == input_value + i, "extracted runtime cache returned stale data");
+    }
   }
 }
 
@@ -2800,7 +2850,31 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--benchmark-srt") == 0) {
+    Fixture fixture;
+    const auto input = fixture.UserData(0);
+    constexpr uint32_t count = 1024, repeats = 5000;
+    for (uint32_t i = 0; i < count; ++i) {
+      auto value = fixture.Emit(ValueOpcode::IAdd32, {input, Value(i)});
+      value = fixture.Emit(ValueOpcode::BitwiseAnd32, {value, Value(0xffffu)});
+      fixture.program.srt_reads.push_back({value, i});
+    }
+    fixture.program.srt_plan_complete = true;
+    auto plan = ExtractResourcePlan(fixture.program);
+    std::vector<uint32_t> result;
+    uint64_t checksum = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t iteration = 0; iteration < repeats; ++iteration) {
+      Check(WalkSrt(plan, {.user_data = std::span(&iteration, 1)}, result), "benchmark evaluation failed");
+      checksum += result.back();
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::cout << "SRT nodes=" << plan.value_storage.size() << " batches=" << repeats
+              << " seconds=" << seconds << " checksum=" << checksum << '\n';
+    return 0;
+  }
+
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -2838,6 +2912,8 @@ int main() {
     Run("null descriptor path", TestNullDescriptorPathCollapse);
     Run("mixed null descriptor paths", TestMixedNullDescriptorPathsRejected);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
+    Run("large runtime evaluation", TestLargeRuntimeEvaluation);
+    Run("extracted runtime evaluation", TestExtractedRuntimeEvaluation);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
