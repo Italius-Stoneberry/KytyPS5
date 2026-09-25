@@ -1,5 +1,10 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <array>
+#include <atomic>
+#include <mutex>
+#include <vector>
+
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnullability-completeness"
@@ -52,10 +57,13 @@ bool GraphicContext::CreateAllocator() {
 	return true;
 }
 
+static void DestroyImagePool(VmaAllocator allocator);
+
 void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	DestroyImagePool(allocator);
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -128,9 +136,88 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
+// Recycling of freed images (KYTY_IMAGE_POOL). The game aliases transient render
+// targets in one heap, so the texture cache deletes and re-creates the same few
+// images every frame. An image reaches DeleteImage only after the GPU is done
+// with it; a new image always starts in eUndefined layout, so reusing the VkImage
+// and its memory for identical creation parameters is equivalent to a fresh
+// allocation.
+extern "C" {
+volatile std::atomic<uint32_t> kyty_local_image_pool_mode {0};
+}
+namespace {
+struct PooledImage {
+	std::array<uint32_t, 10> key {};
+	VkImage                  image      = VK_NULL_HANDLE;
+	VmaAllocation            allocation = nullptr;
+	uint64_t                 bytes      = 0;
+};
+std::mutex               g_image_pool_mutex;
+std::vector<PooledImage> g_image_pool;
+uint64_t                 g_image_pool_bytes = 0;
+constexpr uint64_t       ImagePoolBudget    = 1024ull << 20;
+
+std::array<uint32_t, 10> ImagePoolKey(const vk::ImageCreateInfo& info) {
+	return {static_cast<uint32_t>(static_cast<VkImageCreateFlags>(info.flags)), static_cast<uint32_t>(info.imageType),
+	        static_cast<uint32_t>(info.format), info.extent.width, info.extent.height, info.extent.depth,
+	        info.mipLevels, info.arrayLayers,
+	        static_cast<uint32_t>(info.samples) | (static_cast<uint32_t>(info.tiling) << 16u),
+	        static_cast<uint32_t>(static_cast<VkImageUsageFlags>(info.usage))};
+}
+std::array<uint32_t, 10> ImagePoolKey(const VulkanImage& image) {
+	vk::ImageCreateInfo info {};
+	info.flags       = image.flags;
+	info.imageType   = image.image_type;
+	info.format      = image.format;
+	info.extent      = image.extent;
+	info.mipLevels   = image.mip_levels;
+	info.arrayLayers = image.layers;
+	info.samples     = static_cast<vk::SampleCountFlagBits>(image.samples);
+	info.tiling      = vk::ImageTiling::eOptimal;
+	info.usage       = image.usage;
+	return ImagePoolKey(info);
+}
+} // namespace
+
+static void DestroyImagePool(VmaAllocator allocator) {
+	std::scoped_lock lock(g_image_pool_mutex);
+	for (const auto& pooled: g_image_pool) {
+		vmaDestroyImage(allocator, pooled.image, pooled.allocation);
+	}
+	g_image_pool.clear();
+	g_image_pool_bytes = 0;
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
+
+	if (kyty_local_image_pool_mode.load(std::memory_order_relaxed) != 0 && image_info.pNext == nullptr &&
+	    image_info.tiling == vk::ImageTiling::eOptimal &&
+	    image_info.initialLayout == vk::ImageLayout::eUndefined) {
+		const auto key = ImagePoolKey(image_info);
+		std::scoped_lock lock(g_image_pool_mutex);
+		for (auto it = g_image_pool.begin(); it != g_image_pool.end(); ++it) {
+			if (it->key != key) {
+				continue;
+			}
+			image.image      = it->image;
+			image.allocation = it->allocation;
+			g_image_pool_bytes -= it->bytes;
+			g_image_pool.erase(it);
+			image.format     = image_info.format;
+			image.image_type = image_info.imageType;
+			image.extent     = image_info.extent;
+			image.layers     = image_info.arrayLayers;
+			image.mip_levels = image_info.mipLevels;
+			image.samples    = static_cast<uint32_t>(image_info.samples);
+			image.usage      = image_info.usage;
+			image.flags      = image_info.flags;
+			image.state      = {.layout = image_info.initialLayout};
+			image.subresource_states.clear();
+			return true;
+		}
+	}
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -163,6 +250,22 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
+	if (kyty_local_image_pool_mode.load(std::memory_order_relaxed) != 0) {
+		VmaAllocationInfo allocation_info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+		std::scoped_lock lock(g_image_pool_mutex);
+		g_image_pool.push_back({ImagePoolKey(image), image.image, image.allocation, allocation_info.size});
+		g_image_pool_bytes += allocation_info.size;
+		while (g_image_pool_bytes > ImagePoolBudget && !g_image_pool.empty()) {
+			auto& oldest = g_image_pool.front();
+			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
+			g_image_pool_bytes -= oldest.bytes;
+			g_image_pool.erase(g_image_pool.begin());
+		}
+		image.image      = nullptr;
+		image.allocation = nullptr;
+		return;
+	}
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;
 	image.allocation = nullptr;
