@@ -2,10 +2,13 @@
 
 #include "native-buffer-residency.h"
 #include "native-resource-state.h"
+#include "gpu_tiler_shaders/lod_stats_pack_spv.h"
 
 extern "C" {
 volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
 volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
+// 1: pack the LOD report on the GPU instead of a CPU wait and copy.
+volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 }
 
 #include "common/assert.h"
@@ -362,10 +365,77 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	}
 }
 
+bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
+    constexpr uint64_t ReportSize = 0x840;
+    if (address % 4 || !m_resources || !m_resources->IsMapped(address, ReportSize) ||
+        !LibKernel::Memory::IsUniqueGuestBackingRange(address, ReportSize) ||
+        m_texture_cache.HasTrackedDataOverlap(address, ReportSize)) return false;
+    if (!m_lod_pack_pipeline) {
+        std::array<vk::DescriptorSetLayoutBinding, 2> bindings {};
+        for (uint32_t i = 0; i < bindings.size(); ++i)
+            bindings[i] = {i, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr};
+        vk::DescriptorSetLayoutCreateInfo descriptors {};
+        descriptors.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+        descriptors.bindingCount = bindings.size(); descriptors.pBindings = bindings.data();
+        RequireVulkanSuccess(m_graphics.device.createDescriptorSetLayout(&descriptors, nullptr, &m_lod_pack_descriptors),
+                             "create LOD report descriptors");
+        vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, 8};
+        vk::PipelineLayoutCreateInfo layout {};
+        layout.setLayoutCount = 1; layout.pSetLayouts = &m_lod_pack_descriptors;
+        layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &push;
+        RequireVulkanSuccess(m_graphics.device.createPipelineLayout(&layout, nullptr, &m_lod_pack_layout),
+                             "create LOD report pipeline layout");
+        vk::ShaderModuleCreateInfo shader {};
+        shader.codeSize = sizeof(LOD_STATS_PACK_SPV); shader.pCode = LOD_STATS_PACK_SPV;
+        vk::ShaderModule module;
+        RequireVulkanSuccess(m_graphics.device.createShaderModule(&shader, nullptr, &module), "create LOD report shader");
+        vk::ComputePipelineCreateInfo pipeline {};
+        pipeline.stage.stage = vk::ShaderStageFlagBits::eCompute;
+        pipeline.stage.module = module; pipeline.stage.pName = "main";
+        pipeline.layout = m_lod_pack_layout;
+        RequireVulkanSuccess(m_graphics.device.createComputePipelines(nullptr, 1, &pipeline, nullptr, &m_lod_pack_pipeline),
+                             "create LOD report pipeline");
+        m_graphics.device.destroyShaderModule(module, nullptr);
+    }
+    // The output remains GPU-owned until the normal checked readback path
+    // publishes all bytes. A CPU polling the ready word faults and waits for
+    // this dispatch; never publish readiness on the CPU before GPU completion.
+    const auto [output, offset] = ObtainBuffer(address, ReportSize, true);
+    const auto alignment = m_graphics.GetPhysicalDeviceProperties().limits.minStorageBufferOffsetAlignment;
+    const auto base = offset & ~(alignment - 1);
+    const uint32_t constants[] {uint32_t((offset - base) / 4), reset ? 1u : 0u};
+    const vk::DescriptorBufferInfo buffers[] {{m_lod_stats_buffer.Handle(), 0, 256 * 16},
+                                             {output->Handle(), base, offset - base + ReportSize}};
+    std::array<vk::WriteDescriptorSet, 2> writes {};
+    for (uint32_t i = 0; i < writes.size(); ++i) {
+        writes[i].dstBinding = i; writes[i].descriptorCount = 1;
+        writes[i].descriptorType = vk::DescriptorType::eStorageBuffer; writes[i].pBufferInfo = &buffers[i];
+    }
+    m_scheduler.EndRendering();
+    const auto command = m_scheduler.Current().Handle();
+    vk::MemoryBarrier barrier {};
+    barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eComputeShader,
+                            {}, 1, &barrier, 0, nullptr, 0, nullptr);
+    command.bindPipeline(vk::PipelineBindPoint::eCompute, m_lod_pack_pipeline);
+    command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_lod_pack_layout, 0, writes);
+    command.pushConstants(m_lod_pack_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(constants), constants);
+    command.dispatch(4, 1, 1);
+    barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eAllCommands,
+                            {}, 1, &barrier, 0, nullptr, 0, nullptr);
+    return true;
+}
+
 void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 	// Pack the 64-byte completion header and 256 eight-byte LOD counters.
 	// The command processor keeps other packet layouts on the existing path.
 	EXIT_IF(dst == nullptr || size != 0x840);
+	if (kyty_local_async_lod_stats_mode.load(std::memory_order_relaxed) &&
+	    TryReportLodStatsOnGpu(reinterpret_cast<uint64_t>(dst), reset))
+		return;
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
 	vk::BufferMemoryBarrier barrier {};
@@ -436,6 +506,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+    m_graphics.device.destroyPipeline(m_lod_pack_pipeline, nullptr);
+    m_graphics.device.destroyPipelineLayout(m_lod_pack_layout, nullptr);
+    m_graphics.device.destroyDescriptorSetLayout(m_lod_pack_descriptors, nullptr);
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}

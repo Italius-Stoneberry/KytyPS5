@@ -126,6 +126,10 @@ private:
 	void InvalidateCopyFeedback(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	std::unique_ptr<CopyFeedback> m_copy_feedback;
+	bool TryReportLodStatsOnGpu(uint64_t address, bool reset);
+	vk::Pipeline m_lod_pack_pipeline = nullptr;
+	vk::PipelineLayout m_lod_pack_layout = nullptr;
+	vk::DescriptorSetLayout m_lod_pack_descriptors = nullptr;
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

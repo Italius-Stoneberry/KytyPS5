@@ -2,6 +2,7 @@
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
 #include "native-resource-state.h"
 #include "native-preparation-scratch.h"
+extern "C" volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode;
 #endif
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
@@ -157,6 +158,11 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 struct BufferCacheTestAccess {
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  static void DownloadLodReport(BufferCache& cache, uint64_t address) {
+    cache.ReadMemoryOnGpu(address, 0x840, false);
+  }
+#endif
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
 
@@ -13267,7 +13273,7 @@ OpFunctionEnd
         (depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization");
     const uint32_t extent = lod_stats ? lod_extent : (depth_feedback ? 8 : 32);
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
-    constexpr uint64_t allocation_size = 0x20000;
+    constexpr uint64_t allocation_size = 0x40000;
     EnsureRuntimeContext();
     if (lod_subgroup && !m_runtime_context.fragment_subgroup_reduction) return;
     RenderContext context(m_runtime_context);
@@ -13503,18 +13509,61 @@ OpFunctionEnd
     if (lod_stats) {
       std::array<uint8_t, 0x840> report{};
       auto &buffers = resources.GetBufferCache();
-      buffers.ReportLodStats(report.data(), report.size(), true);
+      const auto get_report = [&](bool reset = true) {
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+        if (kyty_local_async_lod_stats_mode.load() != 0) {
+          const auto report_address = depth_address + 0x30000;
+          const auto tick = scheduler.CurrentTick();
+          buffers.ReportLodStats(reinterpret_cast<void*>(report_address), report.size(), reset);
+          Require(name, "deferred LOD report", scheduler.CurrentTick() == tick &&
+                  buffers.HasGpuDirtyBytes(report_address, report.size()),
+                  "LOD report waited on the host or failed to track its output");
+          BufferCacheTestAccess::DownloadLodReport(buffers, report_address);
+          std::memcpy(report.data(), reinterpret_cast<const void*>(report_address), report.size());
+          Require(name, "LOD report ready", report[0] == 1, "LOD report was not published after completion");
+          return;
+        }
+#endif
+        buffers.ReportLodStats(report.data(), report.size(), reset);
+      };
+      get_report();
       uint64_t entry = 0;
       std::memcpy(&entry, report.data() + 64 + 7 * 8, sizeof(entry));
       Require(name, "GPU LOD samples", (entry & 0xffffffffu) == extent * extent &&
           ((entry >> 32u) & 0xffffffu) == extent * extent && (entry >> 56u) == 0,
           "real pixel samples did not produce the expected count and mip");
-      buffers.ReportLodStats(report.data(), report.size(), true);
+      get_report();
       for (uint32_t i = 0; i < 256; ++i) {
         std::memcpy(&entry, report.data() + 64 + i * 8, sizeof(entry));
         Require(name, "GPU LOD reset", entry == (uint64_t{15} << 56u),
                 "unused or reset LOD counter retained a sample");
       }
+      // Compare all packed bytes at saturation/wrap boundaries, and verify
+      // non-reset reports remain stable before a later reset consumes them.
+      std::array<uint32_t, 256 * 4> seeded {};
+      constexpr uint32_t counts[] {0, 1, 0xffffffu, 0x1000000u, 0xffffffffu};
+      for (uint32_t i = 0; i < 256; ++i) {
+        seeded[i * 4] = i * 7; seeded[i * 4 + 1] = counts[i % 5];
+      }
+      const_cast<Libs::Graphics::Buffer*>(buffers.GetLodStatsBuffer())->Write(0, seeded.data(), sizeof(seeded));
+      get_report(false);
+      const auto expected_report = report;
+      for (uint32_t i = 0; i < 256; ++i) {
+        const uint64_t expected = (uint64_t(seeded[i * 4] & 15u) << 56u) |
+            (uint64_t(std::min(seeded[i * 4 + 1], 0xffffffu)) << 32u) | seeded[i * 4 + 1];
+        std::memcpy(&entry, report.data() + 64 + i * 8, sizeof(entry));
+        Require(name, "LOD saturation and packing", entry == expected, "LOD report packing changed a counter");
+      }
+      get_report(false);
+      Require(name, "LOD report without reset", report == expected_report, "non-reset report changed counters");
+      get_report(true);
+      Require(name, "LOD report then reset", report == expected_report, "reset report lost current counters");
+      get_report(true);
+      for (uint32_t i = 0; i < 256; ++i) {
+        std::memcpy(&entry, report.data() + 64 + i * 8, sizeof(entry));
+        Require(name, "LOD seeded reset", entry == (uint64_t{15} << 56u), "reset did not consume seeded counters");
+      }
+
     }
     if (packed_vertex_color) {
       const std::array<float, 4> expected{0.5f, 1.0f, 2.0f, 1.0f};
@@ -31106,10 +31155,18 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--lodstats-gpu-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckRasterization(true, true);
-    vulkan.CheckRasterization(true, true, 7);
-    vulkan.CheckRasterization(true, true, 8, false, true);
-    vulkan.CheckRasterization(true, true, 7, false, true);
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+    for (const uint32_t async_reports : {0u, 1u}) {
+      kyty_local_async_lod_stats_mode.store(async_reports);
+#endif
+      vulkan.CheckRasterization(true, true);
+      vulkan.CheckRasterization(true, true, 7);
+      vulkan.CheckRasterization(true, true, 8, false, true);
+      vulkan.CheckRasterization(true, true, 7, false, true);
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+    }
+    kyty_local_async_lod_stats_mode.store(0);
+#endif
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lodstats-emission-only") == 0) {

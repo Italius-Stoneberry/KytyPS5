@@ -281,6 +281,22 @@ add_custom_command(
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
+# Packed LOD report shader used by the buffer cache's report path.
+set(lod_stats_pack_source "${KYTY_SOURCE_DIR}/local/lod-stats-pack.comp")
+set(lod_stats_pack_spv "${gpu_tiler_generated_dir}/lod_stats_pack.spv")
+set(lod_stats_pack_header "${gpu_tiler_generated_dir}/lod_stats_pack_spv.h")
+add_custom_command(
+	OUTPUT "${lod_stats_pack_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${lod_stats_pack_spv}" "${lod_stats_pack_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${lod_stats_pack_spv} -DOUTPUT=${lod_stats_pack_header}
+	        -DSYMBOL=LOD_STATS_PACK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${lod_stats_pack_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${lod_stats_pack_header}")
+
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
@@ -723,6 +739,7 @@ install(TARGETS kyty_emulator DESTINATION .)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	foreach(native_resource_target kyty_emulator shader_recompiler_compute_tests shader_cfg_tests
 			resource_tracking_tests resource_materialization_tests)
+		target_sources(${native_resource_target} PRIVATE "${lod_stats_pack_header}")
 		target_compile_definitions(${native_resource_target} PRIVATE KYTY_LOCAL_NATIVE_RESOURCES=1)
 		target_link_libraries(${native_resource_target} ${CMAKE_DL_LIBS})
 	endforeach()

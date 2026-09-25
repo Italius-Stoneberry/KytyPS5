@@ -17,6 +17,7 @@
 extern "C" {
 extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
+extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 }
 
 inline void InitializePerformanceSwitches() {
@@ -40,6 +41,7 @@ inline void InitializePerformanceSwitches() {
 	    // Buffers and guest memory.
 	    Switch {"KYTY_BUFFER_RESIDENCY", &kyty_local_buffer_residency_mode},
 	    Switch {"KYTY_COPY_FEEDBACK", &kyty_local_copy_feedback_mode},
+	    Switch {"KYTY_ASYNC_LOD_STATS", &kyty_local_async_lod_stats_mode},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {
