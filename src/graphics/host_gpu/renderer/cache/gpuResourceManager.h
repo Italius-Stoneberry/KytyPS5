@@ -31,6 +31,15 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	void BeginAliasWrite() noexcept;
+	void EndAliasWrite() noexcept;
+	[[nodiscard]] uint64_t PreparationAliasEpoch() const noexcept;
+	// Written only under m_mapped_ranges_mutex; readers compare it for change only,
+	// so an acquire load needs no lock.
+	[[nodiscard]] uint64_t MappingEpoch() const noexcept {
+		return m_mapping_epoch.load(std::memory_order_acquire);
+	}
+
 	bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
 	void               RunGarbageCollector();
 
@@ -46,6 +55,7 @@ private:
 	uint64_t m_bda_mapping_epoch = 0, m_bda_registration_epoch = 0;
 	std::vector<BufferCache::SyncRegionRequest> m_bda_region_requests;
 	GuestGpu*                 m_gpu = nullptr;
+	std::atomic<uint64_t> m_preparation_alias_epoch {uint64_t{1} << 32};
 	bool                      m_fault_process_pending = false;
 };
 
