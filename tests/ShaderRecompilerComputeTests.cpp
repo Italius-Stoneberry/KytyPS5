@@ -1771,6 +1771,147 @@ public:
     return Renderer();
   }
 
+  void CheckNativeDispatchIndirect() {
+	  constexpr const char* name = "NativeDispatchIndirect";
+	  constexpr uint64_t    base = 0x205000000ull, bytes = 0x20000;
+	  constexpr uint64_t    args_address = base + 0x10004;
+	  EnsureRuntimeContext();
+	  static const bool shader_map_initialized = [] {
+		  ShaderInit();
+		  return true;
+	  }();
+	  (void)shader_map_initialized;
+	  std::vector<u32> code;
+	  AppendVMovU32(&code, 0, 0);
+	  AppendVMovU32(&code, 1, 1);
+	  code.push_back(EncodeMubuf0(0x32)); // atomic add: count actual invocations
+	  code.push_back(EncodeMubuf1(1, 0, 0));
+	  AppendEnd(&code);
+	  const auto code_address = reinterpret_cast<uint64_t>(code.data());
+	  ShaderMapUserData(code_address, {.code_size_bytes = static_cast<u32>(code.size() * 4)});
+	  int64_t allocation = -1;
+	  Require(name, "allocate",
+		      Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+		          0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), bytes, 0x10000, 0,
+		          &allocation) == 0,
+		      "cannot allocate guest memory");
+	  void* mapped = reinterpret_cast<void*>(base);
+	  Require(name, "map",
+		      Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, bytes, 0x3, 0x10, allocation,
+		                                                     0x10000) == 0 &&
+		          mapped == reinterpret_cast<void*>(base),
+		      "cannot map guest memory");
+	  std::memset(mapped, 0, bytes);
+	  {
+		  RenderContext context(m_runtime_context);
+		  context.InitializeGpu(nullptr);
+		  auto& gpu       = context.GetGpu();
+		  auto& resources = context.GetGpuResources();
+		  auto& scheduler = context.GetCommandScheduler();
+		  auto& cache     = context.GetBufferCache();
+		  Libs::LibKernel::Memory::InstallGpuResources(&resources);
+		  gpu.SendCommandSync([&] {
+			  resources.MapMemory(base, bytes);
+			  CommandProcessor processor(context, 0);
+			  processor.BufferInit();
+			  HW::CsStageRegisters cs {};
+			  cs.data_addr    = code_address;
+			  cs.num_thread_x = 4;
+			  cs.num_thread_y = cs.num_thread_z = 1;
+			  cs.user_sgpr                      = 4;
+			  processor.GetShCtx().SetCsShader(cs);
+			  auto descriptor = MakeStructuredStorageBufferData(0, 4);
+			  descriptor[0]   = static_cast<u32>(base);
+			  descriptor[1] |= static_cast<u32>(base >> 32);
+			  for (u32 i = 0; i < 4; ++i)
+				  processor.GetShCtx().SetCsUserSgpr(i, descriptor[i], HW::UserSgprType::Vsharp);
+			  processor.SetDispatchIndirectArgsBaseAddress(args_address - 4);
+			  struct Case {
+				  std::array<u32, 3> counts;
+				  u32                mode, expected;
+			  };
+			  const Case cases[] {
+				  {{3, 1, 1}, 0x41, 12},
+				  {{0, 1, 1}, 0x41, 0},
+				  {{2, 2, 1}, 0x41, 16},
+				  {{2, 0, 1}, 0x41, 0},
+				  // The existing fallback rounds thread dimensions to full groups.
+				  // Preserve that path; this fixture does not claim partial-group masking.
+				  {{1, 1, 0}, 0x41, 0},
+				  {{9, 1, 1}, 0x61, 12},
+				  {{8, 1, 1}, 0x61, 8},
+				  {{5, 1, 1}, 0x41, 20},
+				  {{2, 1, 1}, 0x41, 8}};
+			  for (const bool cpu_arguments: {false, true})
+				  for (const bool absolute_packet: {false, true})
+					  for (const auto& test: cases) {
+						  auto [output, output_offset] = cache.ObtainBuffer(base, 4, true, false);
+						  output->Fill(output_offset, 4, 0);
+						  if (cpu_arguments) {
+							  cache.InvalidateMemory(args_address, 12);
+							  std::memcpy(reinterpret_cast<void*>(args_address), test.counts.data(),
+								          12);
+						  } else {
+							  auto [args, offset] =
+								  cache.ObtainBuffer(args_address, 12, true, false);
+							  scheduler.Current().Handle().updateBuffer(args->Handle(), offset, 12,
+								                                        test.counts.data());
+						  }
+						  std::array<u32, 3> before {}, after {};
+						  Require(name, "stale backing",
+							      Libs::LibKernel::Memory::TryReadBacking(args_address,
+							                                              before.data(), 12),
+							      "cannot inspect CPU backing");
+						  const auto               tick = scheduler.CurrentTick();
+						  Pm4Execution             execution;
+						  const std::array<u32, 4> absolute {
+							  0xc0021600u, static_cast<u32>(args_address),
+							  static_cast<u32>(args_address >> 32), test.mode};
+						  const std::array<u32, 3> relative {0xc0011600u, 4u, test.mode};
+						  Require(
+							  name, "PM4 execution",
+							  processor.Process(execution, absolute_packet
+							                                   ? std::span<const u32>(absolute)
+							                                   : std::span<const u32>(relative)) ==
+							      Pm4ProcessResult::Complete,
+							  "indirect packet failed to complete");
+						  const bool fast = (test.mode & 0x20) == 0;
+						  if (fast) {
+							  Require(
+								  name, "no argument submit/readback",
+								  scheduler.CurrentTick() == tick &&
+								      (cpu_arguments || cache.HasGpuDirtyBytes(args_address, 12)),
+								  "native indirect dispatch submitted/downloaded argument "
+								  "contents");
+							  Require(name, "no CPU argument read",
+								      Libs::LibKernel::Memory::TryReadBacking(args_address,
+								                                              after.data(), 12) &&
+								          before == after,
+								      "dispatch changed stale CPU argument backing");
+						  }
+						  cache.ReadMemory(base, 4);
+						  u32 actual = UINT32_MAX;
+						  Require(name, "GPU invocation count",
+							      Libs::LibKernel::Memory::TryReadBacking(base, &actual, 4) &&
+							          actual == test.expected,
+							      "actual=" + std::to_string(actual) +
+							          " expected=" + std::to_string(test.expected) +
+							          " mode=" + std::to_string(test.mode));
+					  }
+			  scheduler.Finish();
+			  resources.UnmapMemory(base, bytes);
+		  });
+		  Libs::LibKernel::Memory::InstallGpuResources(nullptr);
+		  context.ShutdownGpu();
+	  }
+	  Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, bytes) == 0,
+		      "cannot release test mapping");
+	  Require(name, "release",
+		      Libs::LibKernel::Memory::KernelReleaseDirectMemory(allocation, bytes) == 0,
+		      "cannot release test allocation");
+	  std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckCpuWriteWindow() {
 	  using namespace Libs::Graphics;
 	  namespace Memory           = Libs::LibKernel::Memory;
@@ -30236,6 +30377,11 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   CheckDrawRunArguments();
+  if (argc == 2 && std::strcmp(argv[1], "--native-dispatch-indirect-only") == 0) {
+	  VulkanHarness vulkan;
+	  vulkan.CheckNativeDispatchIndirect();
+	  return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cpu-write-window-only") == 0) {
 	  VulkanHarness vulkan;
 	  vulkan.CheckCpuWriteWindow();
