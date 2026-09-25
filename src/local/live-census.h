@@ -17,7 +17,9 @@ enum Kind : uint32_t {
 	GpuWait       = 4, // a, b: return addresses (caller, its caller)
 	ReadbackWait  = 5, // a, b: return addresses
 	SyncDownload  = 6, // a: 1 MiB granule, b: write access
-	Kinds         = 7
+	GraphicsPrograms = 7, // program lookup and SRT evaluation of a draw
+	NativeGather  = 8, // native XPR record word gather
+	Kinds         = 9
 };
 
 struct Entry {

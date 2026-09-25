@@ -162,6 +162,7 @@ void GuestGpu::ProcessCommands() {
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
 		// Fault, readback and mapping callbacks cannot overtake a queued draw.
+		LiveCounters::Add(LiveCounters::GuestCommands);
 		command();
 	}
 }
@@ -591,6 +592,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			LiveCounters::Add(LiveCounters::GuestCommands);
 			command();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -605,7 +607,9 @@ void GuestGpu::ThreadRun(void* data) {
 		const bool complete = gpu->Process(submission);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		LiveCounters::Add(LiveCounters::Submissions);
 		if (!complete) {
+			LiveCounters::Add(LiveCounters::SubmissionRequeues);
 			submission.blocked = true;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
@@ -765,6 +769,7 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands)
 
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
+	LiveCounters::Add(LiveCounters::Pm4Suspends);
 	g_current_execution->m_suspended = true;
 }
 
@@ -841,6 +846,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		LiveCounters::g_pm4[opcode].fetch_add(1, std::memory_order_relaxed);
 		if (XprCapture::Enabled()) {
 			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT) {
 				XprCapture::ObserveDraw(m_draw_indirect_args_base_addr + packet[1]);

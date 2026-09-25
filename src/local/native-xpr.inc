@@ -1699,6 +1699,7 @@ private:
 // Traced records: false when a structural read changed (the caller evaluates
 // again); otherwise the data reads are copied into the flattened SRT.
 bool RenderExecutor::NativeXprGather(NativeXprRecord& record) {
+	LiveCensus::Scope census(LiveCensus::NativeGather, 0);
 	auto&           gather = record.gather;
 	NativeXprReader reader(m_context.GetGpuResources());
 	auto& changed = m_native_xpr->changed; // (value index, new value)

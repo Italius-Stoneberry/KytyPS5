@@ -22,6 +22,8 @@
 #include "native-preparation-scratch.h"
 #include "native-resource-state.h"
 #include "shader-warmup-cache.h"
+#include "live-census.h"
+#include "live-counters.h"
 
 #include <algorithm>
 #include <array>
@@ -134,8 +136,9 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	// A GPU-written neighbour may protect a clean descriptor on the same page.
 	// Reading its checked backing alias avoids an unnecessary GPU drain. Dirty,
 	// unmapped and untracked addresses retain the original load/fault behavior.
-	if (!Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value,
-	                                                                  sizeof(*value))) {
+	if (Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value, sizeof(*value))) {
+		LiveCounters::Add(LiveCounters::SrtWatchedReads);
+	} else {
 		std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
 	}
 	return true;
@@ -936,6 +939,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	LiveCensus::Scope census(LiveCensus::GraphicsPrograms, 0);
 	const auto vertex_params = PrepareProgram(vertex_regs, context, user_config, vertex_info);
 	const bool mesh_active   = vertex_info.mesh.threads_num[0] != 0;
 	if (mesh_active) {

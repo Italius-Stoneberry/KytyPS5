@@ -25,13 +25,19 @@ enum Id : uint32_t {
 	ReadbackDetaches,   // pending guest readbacks detached by a GPU write
 	DispatchAfterDispatch, // dispatches whose previous draw/dispatch was a dispatch
 	DispatchSameShader,    // ... of the same compute shader
+	Pm4Suspends,           // PM4 executions suspended (WAIT_REG_MEM and similar)
+	SubmissionRequeues,    // submissions put back blocked
+	GuestCommands,         // host commands run for guest threads (SendCommand)
+	RenderReadFaults,      // read faults taken by the render thread itself
+	SrtWatchedReads,       // SRT word reads on watched (GPU-owned neighbour) pages
+	Submissions,           // submissions processed (slices)
 	Count
 };
 
 inline constexpr const char* Names[Count] = {
     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "dispatch_after_dispatch", "dispatch_same_shader"};
+    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices"};
 
 inline std::atomic<uint64_t> g_values[Count];
 // Render thread: the last draw (0) or dispatch shader address.
@@ -64,5 +70,8 @@ inline void AddGranule(uint64_t address, GranuleField field, uint64_t n) {
 	}
 	g_granule_overflow.fetch_add(1, std::memory_order_relaxed);
 }
+
+// PM4 packets per opcode (render thread; relaxed atomics so the live thread can read).
+inline std::atomic<uint64_t> g_pm4[256];
 
 } // namespace LiveCounters

@@ -277,6 +277,19 @@ inline void Run(uint64_t id, const std::string& line) {
 			            double(granule.values[5].load()) / 1024.0 / frames);
 		}
 		std::printf("LIVE_GRANULE_OVERFLOW id=%" PRIu64 " count=%" PRIu64 "\n", id, LiveCounters::g_granule_overflow.load());
+	} else if (cmd == "pm4" && n >= 2) {
+		// pm4 <seconds>: PM4 packets per frame by opcode.
+		std::array<uint64_t, 256> before {};
+		for (size_t i = 0; i < before.size(); ++i) before[i] = LiveCounters::g_pm4[i].load();
+		const auto flips0 = g_flips.load();
+		std::this_thread::sleep_for(std::chrono::duration<double>(std::strtod(arg1, nullptr)));
+		const auto frames = std::max<uint64_t>(g_flips.load() - flips0, 1);
+		for (size_t i = 0; i < before.size(); ++i) {
+			const auto count = LiveCounters::g_pm4[i].load() - before[i];
+			if (count != 0)
+				std::printf("LIVE_PM4 id=%" PRIu64 " opcode=0x%02zx per_frame=%.2f\n", id, i,
+				            static_cast<double>(count) / static_cast<double>(frames));
+		}
 	} else if (cmd == "sleep" && n >= 2) {
 		std::this_thread::sleep_for(std::chrono::duration<double>(std::strtod(arg1, nullptr)));
 	} else {

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
+#include "live-census.h"
 #include "live-counters.h"
 
 #include "common/assert.h"
@@ -82,6 +83,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		LiveCounters::Add(LiveCounters::ReadFault);
+		if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::RenderReadFaults);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
