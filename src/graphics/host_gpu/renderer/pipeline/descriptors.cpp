@@ -1112,6 +1112,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings, bool compute_chain) {
+	// Every transition below prepares the one draw or dispatch that follows this
+	// call, and none of them records a command, so repeats inside it are safe to
+	// drop.
+	const TransitGroup transit_group;
 	KYTY_PROFILER_FUNCTION();
 	auto   vk_buffer        = compute_chain ? buffer.ChainHandle() : buffer.Handle();
 	size_t descriptor_count = 0;

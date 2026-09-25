@@ -20,6 +20,7 @@ extern volatile std::atomic_uint32_t kyty_local_backing_read_mode;
 extern volatile std::atomic_uint32_t kyty_local_stream_upload_mode;
 extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
+extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
 extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 }
 
@@ -48,6 +49,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_BACKING_READ", &kyty_local_backing_read_mode},
 	    Switch {"KYTY_STREAM_UPLOAD", &kyty_local_stream_upload_mode},
 	    Switch {"KYTY_FRAME_PIPELINE", &kyty_local_frame_pipeline_mode},
+	    // Images and command submission.
+	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {

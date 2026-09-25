@@ -46,6 +46,21 @@ struct ImageBinding {
 	vk::ImageAspectFlags other_sampled_aspects;
 };
 
+// Scopes a group of transitions that all precede the same recorded command. No
+// command executes between transitions in one group, so repeating an identical
+// transition of the same image inside a group cannot be covering a hazard.
+// Transitions recorded outside any group are never treated as repeats, which is
+// what keeps the copy and upload paths correct.
+void BeginTransitGroup() noexcept;
+void EndTransitGroup() noexcept;
+
+class TransitGroup final {
+public:
+	TransitGroup() noexcept { BeginTransitGroup(); }
+	~TransitGroup() { EndTransitGroup(); }
+	KYTY_CLASS_NO_COPY(TransitGroup);
+};
+
 class Image final {
 public:
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
@@ -155,6 +170,8 @@ public:
 	ImageId          depth_id {};
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// Transit group that last set the whole-image state; see BeginTransitGroup.
+	uint64_t         transit_group      = 0;
 
 private:
 	friend struct ImageTestAccess;

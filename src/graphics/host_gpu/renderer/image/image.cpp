@@ -10,12 +10,28 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <xxhash.h>
+
+extern "C" {
+// 1: drop a repeated-write barrier that repeats an identical transition of the
+// same image inside one transit group.
+volatile std::atomic<uint32_t> kyty_local_image_barrier_dedupe {0};
+}
 
 namespace Libs::Graphics {
 
 namespace {
+
+// Groups are only ever opened and read from the thread that records commands.
+// Zero means no group is open, so nothing can match it and nothing is skipped.
+uint64_t g_transit_group      = 0;
+uint64_t g_transit_group_next = 1;
+
+[[nodiscard]] inline bool DedupeTransitGroups() {
+	return kyty_local_image_barrier_dedupe.load(std::memory_order_relaxed) != 0;
+}
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
@@ -166,7 +182,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		                                vk::AccessFlagBits2::eMemoryWrite;
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
-		    !repeated_write) {
+		    (!repeated_write || (DedupeTransitGroups() && g_transit_group != 0 &&
+		                         transit_group == g_transit_group))) {
 			return {};
 		}
 
@@ -188,8 +205,17 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barriers.push_back(barrier);
 	}
 
-	state = {destination_stage, destination_access, destination_layout};
+	state         = {destination_stage, destination_access, destination_layout};
+	transit_group = g_transit_group;
 	return barriers;
+}
+
+void BeginTransitGroup() noexcept {
+	g_transit_group = g_transit_group_next++;
+}
+
+void EndTransitGroup() noexcept {
+	g_transit_group = 0;
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
