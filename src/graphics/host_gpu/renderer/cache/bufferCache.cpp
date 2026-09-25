@@ -1,5 +1,11 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include "native-buffer-residency.h"
+
+extern "C" {
+volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
+}
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -25,6 +31,15 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+
+// DownloadBufferMemory can process priority operations while waiting. Its
+// exact intervals are retired after the entire copy batch, so a reentrant
+// query must use the page tracker until that transaction has finished.
+thread_local uint32_t native_buffer_download_depth = 0;
+struct NativeBufferDownloadScope {
+	NativeBufferDownloadScope() { ++native_buffer_download_depth; }
+	~NativeBufferDownloadScope() { --native_buffer_download_depth; }
+};
 
 } // namespace
 
@@ -135,6 +150,7 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 }
 
 void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
+	NativeBufferDownloadScope native_download_scope;
 	std::vector<DownloadCopy> batch;
 	batch.reserve(copies.size());
 	uint64_t                  packed_size = 0;
@@ -437,7 +453,17 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		// CPU cleanliness does not prove that an aliased image is current.
 		return is_texel_buffer && SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
-	if (is_written && m_memory_tracker.IsRegionFullyGpuModified(vaddr, size)) {
+	bool fully_gpu_modified = false;
+	if (is_written && kyty_local_buffer_residency_mode.load(std::memory_order_relaxed) != 0 &&
+	    native_buffer_download_depth == 0 && m_gpu_modified_ranges.Contains(vaddr, size)) {
+		// Exact ranges are added only after SynchronizeBuffer marks their
+		// pages GPU-owned. Readback subtracts them before clearing page
+		// ownership; CPU writes and unmapping take that readback path.
+		// A complete byte cover is sufficient, while a hole or partial
+		// cover still takes the original page query.
+		fully_gpu_modified = true;
+	}
+	if (is_written && (fully_gpu_modified || m_memory_tracker.IsRegionFullyGpuModified(vaddr, size))) {
 		// ObtainBuffer still records the exact write range and invalidates its epoch.
 		return false;
 	}

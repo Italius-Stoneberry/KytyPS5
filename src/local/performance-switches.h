@@ -3,6 +3,7 @@
 // behaviour unless its environment variable is set; the GPU thread applies them
 // once, before it consumes commands. Values outside a switch's range abort.
 
+#include "native-buffer-residency.h"
 #include "native-resource-state.h"
 
 #include <array>
@@ -36,6 +37,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_PIPELINE_INDEX", &kyty_local_pipeline_index_mode},
 	    Switch {"KYTY_BINDING_SCRATCH", &kyty_local_binding_scratch_mode},
 	    Switch {"KYTY_DRAW_RUN_RANGES", &kyty_local_draw_run_ranges_mode},
+	    // Buffers and guest memory.
+	    Switch {"KYTY_BUFFER_RESIDENCY", &kyty_local_buffer_residency_mode},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {
