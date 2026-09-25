@@ -32,8 +32,10 @@ public:
 	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin,
-	                                               uint64_t size) noexcept;
+	// `handoff` (a held caller lock) is released once the region lock is held, so the
+	// protection change does not extend the caller's critical section.
+	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size,
+	                                               std::unique_lock<TrackingSpinLock>* handoff = nullptr) noexcept;
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);

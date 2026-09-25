@@ -23,4 +23,7 @@ extern volatile std::atomic<uint32_t> kyty_local_specialization_guard_mode;
 extern volatile std::atomic<uint32_t> kyty_local_pipeline_index_mode;
 // 1: exact copy readbacks served from completed GPU mirrors.
 extern volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode;
+// 1: a CPU write-window fault hands the image lock over once it holds the region lock,
+// so the page protection change runs outside the image lock.
+extern volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode;
 }

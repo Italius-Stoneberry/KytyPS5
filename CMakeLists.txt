@@ -790,6 +790,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
 		add_test(NAME buffer_cache_guest_readback
 			COMMAND shader_recompiler_compute_tests --guest-readback-only)
 		add_test(NAME copy_feedback COMMAND shader_recompiler_compute_tests --copy-feedback-only)
+		add_test(NAME write_window_handoff
+			COMMAND shader_recompiler_compute_tests --write-window-handoff-only)
 	endif()
 endif()
 

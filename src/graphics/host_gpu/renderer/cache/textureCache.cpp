@@ -27,6 +27,8 @@
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode {0};
+
 namespace Libs::Graphics {
 
 namespace {
@@ -2094,9 +2096,13 @@ bool BufferCache::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, ui
 	if (!GuestRange {begin, size}.Valid()) return false;
 	// Follow image -> buffer-region -> page lock order. Hold the image lock
 	// through invalidation so registration cannot introduce an alias in between.
-	std::scoped_lock lock(m_texture_cache.m_lock);
+	std::unique_lock lock(m_texture_cache.m_lock);
 	if (!m_texture_cache.FindImagesInRegion(begin, size, true).empty()) return false;
-	return m_memory_tracker.TryInvalidateCpuWriteWindow(fault, begin, size);
+	// Registration takes the image lock and then this region lock, so handing the image
+	// lock over once the region lock is held keeps the check and the state change atomic
+	// for it, while the page protection change no longer blocks image lookups.
+	const bool handoff = kyty_local_write_window_handoff_mode.load(std::memory_order_relaxed) != 0;
+	return m_memory_tracker.TryInvalidateCpuWriteWindow(fault, begin, size, handoff ? &lock : nullptr);
 }
 
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {

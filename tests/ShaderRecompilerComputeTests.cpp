@@ -32083,6 +32083,13 @@ int main(int argc, char **argv) {
     vulkan.CheckCompletedCopyFeedback();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--write-window-handoff-only") == 0) {
+    VulkanHarness vulkan;
+    kyty_local_write_window_handoff_mode.store(1, std::memory_order_relaxed);
+    vulkan.CheckCpuWriteWindow();
+    kyty_local_write_window_handoff_mode.store(0, std::memory_order_relaxed);
+    return 0;
+  }
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
