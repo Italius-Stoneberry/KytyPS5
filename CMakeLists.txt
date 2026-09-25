@@ -547,6 +547,9 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
+	add_executable(atrac9_initialization_tests EXCLUDE_FROM_ALL tests/Atrac9InitializationTests.cpp)
+	target_link_libraries(atrac9_initialization_tests PRIVATE LibAtrac9 Threads::Threads)
+	add_test(NAME atrac9_initialization COMMAND $<TARGET_FILE:atrac9_initialization_tests>)
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
 	add_test(NAME emulator_user_name_too_long
@@ -640,6 +643,7 @@ if(BUILD_TESTING)
 		demons_souls_copy_tests
 		demons_souls_idle_tests
 		page_protection_table_tests
+		atrac9_initialization_tests
 		bit_array_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
