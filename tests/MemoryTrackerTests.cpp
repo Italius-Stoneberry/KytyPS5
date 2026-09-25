@@ -360,6 +360,33 @@ void TestLocalCpuEpochs() {
   Release(memory);
 }
 
+void TestFullGpuOwnership() {
+	TrackerHarness harness;
+	auto&          tracker    = harness.tracker;
+	const auto     page       = harness.page_manager.GetPageSize();
+	constexpr auto region     = Libs::Graphics::TRACKER_REGION_SIZE;
+	auto*          memory     = Allocate(harness.page_manager, 2 * region / page);
+	const auto     allocation = reinterpret_cast<uint64_t>(memory);
+	const auto     boundary   = (allocation + region - 1) & ~(region - 1);
+	const auto     begin      = boundary - page;
+	Check(!tracker.IsRegionFullyGpuModified(begin, 2 * page), "new regions reported GPU ownership");
+	tracker.ForEachUploadRange(
+	    begin, page, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	Check(tracker.IsRegionFullyGpuModified(begin + 16, page - 16) &&
+	          !tracker.IsRegionFullyGpuModified(begin, 2 * page),
+	      "full GPU ownership ignored a missing region or partial page boundary");
+	tracker.ForEachUploadRange(
+	    boundary, page, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	Check(tracker.IsRegionFullyGpuModified(begin + 16, 2 * page - 32),
+	      "full GPU ownership failed across regions");
+	tracker.UnmarkRegionAsGpuModified(boundary, page);
+	Check(!tracker.IsRegionFullyGpuModified(begin, 2 * page),
+	      "GPU ownership removal was not visible");
+	tracker.UnmarkRegionAsGpuModified(begin, page);
+	tracker.UntrackMemory(allocation, 2 * region);
+	Release(memory);
+}
+
 void TestRangeInvalidation() {
   constexpr uintptr_t base = 0x0000000201000000ull;
   TrackerHarness harness;
@@ -972,6 +999,7 @@ int main(int argc, char **argv) {
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
   TestLocalCpuEpochs();
+  TestFullGpuOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();

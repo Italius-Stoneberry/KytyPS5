@@ -88,10 +88,11 @@ public:
 		return m_cpu_epoch.load(std::memory_order_acquire);
 	}
 
-	template <DirtySource source>
+	template <DirtySource source, bool all = false>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
 		const auto& bits        = GetBits<source>();
+		if constexpr (all) return bits.AllInRange(start, end);
 		return bits.AnyInRange(start, end);
 	}
 

@@ -433,6 +433,14 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	if (!is_written && !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		// CPU cleanliness does not prove that an aliased image is current.
+		return is_texel_buffer && SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
+	if (is_written && m_memory_tracker.IsRegionFullyGpuModified(vaddr, size)) {
+		// ObtainBuffer still records the exact write range and invalidates its epoch.
+		return false;
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
