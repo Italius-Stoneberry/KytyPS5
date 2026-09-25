@@ -405,6 +405,11 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
+add_executable(page_protection_table_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PageProtectionTableTests.cpp")
+target_link_libraries(page_protection_table_tests fmt::fmt common)
+target_include_directories(page_protection_table_tests PRIVATE ${inc_headers})
+
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
 )
@@ -548,6 +553,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME page_protection_table COMMAND $<TARGET_FILE:page_protection_table_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -614,6 +620,7 @@ if(BUILD_TESTING)
 		image_page_table_tests
 		memory_tracker_tests
 		page_manager_tests
+		page_protection_table_tests
 		bit_array_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
