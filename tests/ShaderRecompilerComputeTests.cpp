@@ -32,6 +32,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -12422,7 +12423,7 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
-  void CheckStreamingCompute() {
+  void CheckStreamingCompute(bool guest_chain = false) {
     constexpr const char *name = "StreamingCompute";
     EnsureRuntimeContext();
     // Independent test kernel: output[dst+x] = input[src+x] + add. No atomics
@@ -12542,10 +12543,10 @@ OpFunctionEnd
       write.descriptorCount = 1;
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = &view;
-      const auto dispatch = [&](u32 src, u32 dst, u32 add, u32 groups, bool indirect) {
+      const auto dispatch = [&](u32 src, u32 dst, u32 add, u32 groups, bool indirect, bool independent = false) {
         auto &command = scheduler.Current();
-        auto handle = command.Handle();
-        {
+        auto handle = guest_chain && independent ? command.ChainHandle() : command.Handle();
+        if (!command.ComputeChainPending()) {
           ShaderWriteHazardBarrier(handle, vk::PipelineStageFlagBits::eComputeShader);
           if (indirect) {
             vk::MemoryBarrier args{};
@@ -12564,7 +12565,8 @@ OpFunctionEnd
           handle.dispatchIndirect(data.Handle(), 0);
         else
           handle.dispatch(groups, 1, 1);
-        ShaderAccessBarrier(handle, vk::PipelineStageFlagBits::eComputeShader);
+        if (guest_chain) command.ContinueComputeChain();
+        else ShaderAccessBarrier(handle, vk::PipelineStageFlagBits::eComputeShader);
         if (scenario)
           scheduler.CompleteDispatch();
         for (u32 i = 0; i < groups; ++i)
@@ -12580,6 +12582,21 @@ OpFunctionEnd
           expected[first] = step * 91;
           scheduler.Current().Handle().updateBuffer(data.Handle(), first * 4, 4, &expected[first]);
         }
+      }
+      if (guest_chain) {
+        (void)scheduler.Current().Handle();
+        for (u32 piece = 0; piece < 128; ++piece)
+          dispatch(first + piece * 32, second + piece * 32, piece + 91, 32, false, true);
+        // A host write must wait for every pending reader, including after a
+        // partial submission. The next dependent dispatch consumes prior output.
+        scheduler.Current().Handle().updateBuffer(data.Handle(), first * 4, 4, &expected[first]);
+        Require(name, "transfer drains", !scheduler.Current().ComputeChainPending(),
+                "host transfer bypassed pending compute work");
+        dispatch(second, first, 17, count, false);
+        ShaderAccessBarrier(scheduler.Current().HandleForFullBarrier(),
+                            vk::PipelineStageFlagBits::eComputeShader);
+        Require(name, "explicit dependency drains", !scheduler.Current().ComputeChainPending(),
+                "explicit dependency retained a pending chain");
       }
       Require(name, "bounded asynchronous submissions",
               scheduler.CurrentTick() >= initial_tick + (scenario ? 4 : 0),
@@ -30390,6 +30407,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckPackedTextureComponents();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--demons-compute-chain-only") == 0) {
+    Require("DemonsSoulsProfile", "version isolation",
+            DemonsSouls::IsSupportedVersion("PPSA01341", "01.007.000") &&
+            !DemonsSouls::IsSupportedVersion("PPSA01341", "01.008.000") &&
+            !DemonsSouls::IsSupportedVersion("PPSA01340", "01.007.000") &&
+            !DemonsSouls::IsSupportedVersion("", ""), "unknown title/version enabled the profile");
+    VulkanHarness vulkan;
+    vulkan.CheckStreamingCompute(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--streaming-compute-only") == 0) {
