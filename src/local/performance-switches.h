@@ -28,6 +28,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_PREPARATION_SCRATCH", &kyty_local_preparation_scratch_mode},
 	    Switch {"KYTY_PREPARATION_LOOKUP", &kyty_local_preparation_lookup_mode},
 	    Switch {"KYTY_PREPARATION_TRIM", &kyty_local_preparation_trim_mode},
+	    Switch {"KYTY_SPECIALIZATION_GUARD", &kyty_local_specialization_guard_mode},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {

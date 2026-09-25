@@ -30893,6 +30893,18 @@ int main(int argc, char **argv) {
     vulkan.CheckDepthSliceGrowth();
     return 0;
   }
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  if (argc == 2 && std::strcmp(argv[1], "--specialization-guard-only") == 0) {
+    VulkanHarness vulkan;
+    // The PM4 compute fixture verifies its results with the guard off and on.
+    for (const auto mode : {0u, 1u, 0u, 1u}) {
+      kyty_local_specialization_guard_mode.store(mode);
+      vulkan.CheckNativeDispatchIndirect();
+    }
+    kyty_local_specialization_guard_mode.store(0);
+    return 0;
+  }
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();

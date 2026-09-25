@@ -16,6 +16,10 @@
 #include <numeric>
 #include <unordered_set>
 
+extern "C" {
+volatile std::atomic<uint32_t> kyty_local_specialization_guard_mode {0};
+}
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
@@ -44,6 +48,7 @@ struct MaterializeWorkspace {
 	std::vector<DescriptorValue> values;
 	std::vector<uint32_t> flattened_srt;
 	std::vector<uint8_t> active_sources;
+	ResourceSpecializationGuard guard_candidate;
 };
 
 bool SpecializationFail(MaterializeReport* report, std::string_view message) {
@@ -1000,6 +1005,108 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 	return true;
 }
 
+// These masks are conservative supersets of every descriptor bit consumed by
+// BuildResourceSpecialization. Image validity has already been checked by
+// MaterializeSnapshot, including array bounds and MSAA restrictions.
+static constexpr uint32_t GuardBufferStride = 0xbfff0000u; // stride + swizzle enable
+static constexpr uint32_t GuardBufferFlags = 0xc0e00000u;  // type, index stride, add-TID
+static constexpr uint32_t GuardBufferFormat = 0x0007ffffu; // format + destination swizzle
+static constexpr uint32_t GuardImageFormat = 0x1ff00000u;
+static constexpr uint32_t GuardImageInterpretation = 0xf00fffffu; // type, mips, swizzle
+
+static bool MatchesSpecializationGuard(const ResourcePlan& program,
+                                       const MaterializedSnapshot& materialized,
+                                       const ResourceSpecializationGuard& guard) {
+	const auto& snapshot = materialized.resources;
+	if (guard.owner != &program || !materialized.indirect_images.empty() ||
+	    snapshot.buffers.size() != guard.buffers.size() ||
+	    snapshot.images.size() != guard.images.size()) return false;
+	for (size_t i = 0; i < guard.buffers.size(); ++i) {
+		const auto& descriptor = snapshot.buffers[i];
+		const auto& probe = guard.buffers[i];
+		if (descriptor.dword_count != 4 ||
+		    (descriptor.dwords[0] & 3u) != probe.low_address ||
+		    (descriptor.dwords[1] & GuardBufferStride) != probe.stride ||
+		    (descriptor.dwords[3] & probe.flag_mask) != probe.flags) return false;
+	}
+	for (size_t i = 0; i < guard.images.size(); ++i) {
+		const auto& descriptor = snapshot.images[i];
+		const auto& probe = guard.images[i];
+		if (descriptor.dword_count != 8 || NullImageDescriptor(descriptor) != probe.null ||
+		    (descriptor.dwords[1] & GuardImageFormat) != probe.format ||
+		    (descriptor.dwords[3] & GuardImageInterpretation) != probe.interpretation) return false;
+	}
+	return true;
+}
+
+static bool CaptureSpecializationGuard(const ResourcePlan& program,
+                                       const MaterializedSnapshot& materialized,
+                                       ResourceSpecializationGuard& guard) {
+	// Indirect tables can expand resources and append a fresh SRT lookup table.
+	// They continue through the reference path, even when inactive this time.
+	if (program.requires_specialization_memory || !materialized.indirect_images.empty() ||
+	    std::ranges::any_of(program.descriptor_sources,
+	        [](const auto& source) { return source.indirect_image.has_value(); }) ||
+	    std::ranges::any_of(program.info.images, [](const auto& image) {
+		    return image.indirect_root != ImageResource::NoIndirectImage;
+	    })) return false;
+	const auto& snapshot = materialized.resources;
+	if (snapshot.buffers.size() != program.info.buffers.size() ||
+	    snapshot.images.size() != program.info.images.size()) return false;
+	guard.buffers.reserve(snapshot.buffers.size());
+	for (size_t i = 0; i < snapshot.buffers.size(); ++i) {
+		const auto& descriptor = snapshot.buffers[i];
+		// The reference sanitizes invalid types. Do not reuse that transformation.
+		if (descriptor.dword_count != 4 || (descriptor.dwords[3] >> 30u) != 0) return false;
+		const auto mask = GuardBufferFlags | (program.info.buffers[i].formatted ? GuardBufferFormat : 0u);
+		guard.buffers.push_back({descriptor.dwords[0] & 3u,
+		    descriptor.dwords[1] & GuardBufferStride, descriptor.dwords[3] & mask, mask});
+	}
+	guard.images.reserve(snapshot.images.size());
+	for (const auto& descriptor : snapshot.images) {
+		if (descriptor.dword_count != 8) return false;
+		guard.images.push_back({descriptor.dwords[1] & GuardImageFormat,
+		    descriptor.dwords[3] & GuardImageInterpretation, NullImageDescriptor(descriptor)});
+	}
+	guard.owner = &program;
+	return true;
+}
+
+static void PublishSpecializationGuard(const ResourcePlan& program,
+                                       const ResourceSpecialization& specialization,
+                                       ResourceSpecializationGuard& next,
+                                       ResourceSpecializationGuard& guard) {
+	SamplerPlan samplers;
+	EXIT_IF(!BuildSamplerPlan(program.info, specialization.images, samplers));
+	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
+		if (samplers.point_sampler[i] != UINT32_MAX &&
+		    samplers.point_sampler[i] >= program.info.samplers.size()) next.duplicate_samplers.push_back(i);
+	}
+	next.compact_images = std::ranges::any_of(specialization.images,
+	    [](const auto& image) { return image.fmask; });
+	next.specialization = specialization;
+	next.publication = guard.publication + 1;
+	// The previous guard's storage becomes the next candidate.
+	std::swap(guard, next);
+}
+
+static void ApplySpecializationGuard(const ResourceSpecializationGuard& guard,
+                                     ResourceSnapshot& snapshot) {
+	// Copy sampler payloads from this invocation, never from the captured shape.
+	snapshot.samplers.reserve(snapshot.samplers.size() + guard.duplicate_samplers.size());
+	for (const auto source : guard.duplicate_samplers) snapshot.samplers.push_back(snapshot.samplers[source]);
+	if (guard.compact_images) {
+		uint32_t output = 0;
+		for (uint32_t i = 0; i < guard.specialization.images.size(); ++i) {
+			if (!guard.specialization.images[i].fmask) {
+				if (output != i) snapshot.images[output] = std::move(snapshot.images[i]);
+				++output;
+			}
+		}
+		snapshot.images.resize(output);
+	}
+}
+
 static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 	if (program.blocks.size() != program.block_info.size()) {
 		return {};
@@ -1325,7 +1432,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
-                          MaterializeReport* report) {
+                          MaterializeReport* report, ResourceSpecializationGuard* shape_guard,
+                          const ResourceSpecialization** borrowed_specialization) {
 	if (report != nullptr) {
 		*report = {};
 	}
@@ -1334,7 +1442,43 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (!MaterializeSnapshot(program, runtime, workspace, report)) {
 		return false;
 	}
-	return BuildResourceSpecialization(program, workspace, snapshot, specialization, report);
+	if (shape_guard != nullptr &&
+	    kyty_local_specialization_guard_mode.load(std::memory_order_relaxed) != 0) {
+		if (MatchesSpecializationGuard(program, workspace.materialized, *shape_guard)) {
+			ApplySpecializationGuard(*shape_guard, workspace.materialized.resources);
+			if (borrowed_specialization != nullptr) {
+				*borrowed_specialization = &shape_guard->specialization;
+			} else {
+				specialization = shape_guard->specialization;
+			}
+			std::swap(snapshot, workspace.materialized.resources);
+			return true;
+		}
+		auto& next = workspace.guard_candidate;
+		next.owner = nullptr;
+		next.buffers.clear();
+		next.images.clear();
+		next.duplicate_samplers.clear();
+		next.compact_images = false;
+		const bool eligible = CaptureSpecializationGuard(program, workspace.materialized, next);
+		if (!BuildResourceSpecialization(program, workspace, snapshot, specialization, report)) {
+			return false;
+		}
+		if (eligible) {
+			PublishSpecializationGuard(program, specialization, next, *shape_guard);
+		}
+		if (borrowed_specialization != nullptr) {
+			*borrowed_specialization = eligible ? &shape_guard->specialization : nullptr;
+		}
+		return true;
+	}
+	if (!BuildResourceSpecialization(program, workspace, snapshot, specialization, report)) {
+		return false;
+	}
+	if (borrowed_specialization != nullptr) {
+		*borrowed_specialization = nullptr;
+	}
+	return true;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

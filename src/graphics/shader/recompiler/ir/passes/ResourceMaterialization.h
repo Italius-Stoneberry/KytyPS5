@@ -51,9 +51,35 @@ struct MaterializeReport {
 	std::string dropped_summary;
 };
 
+// Rendering-thread owned, tied to one immutable ResourcePlan. Only shader
+// interpretation is reusable: addresses, sizes, SRT values, sampler payloads
+// and uniform-fill values are always taken from the current transaction.
+struct ResourceSpecializationGuard {
+	struct BufferProbe {
+		uint32_t low_address, stride, flags, flag_mask;
+	};
+	struct ImageProbe {
+		uint32_t format, interpretation;
+		bool null;
+	};
+	const ResourcePlan* owner = nullptr;
+	std::vector<BufferProbe> buffers;
+	std::vector<ImageProbe> images;
+	std::vector<uint32_t> duplicate_samplers;
+	ResourceSpecialization specialization;
+	bool compact_images = false;
+	uint64_t publication = 0;
+};
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
-                          MaterializeReport* report = nullptr);
+                          MaterializeReport* report = nullptr,
+                          ResourceSpecializationGuard* shape_guard = nullptr,
+                          const ResourceSpecialization** borrowed_specialization = nullptr);
+// With borrowed_specialization supplied, a successful guard hit may leave the
+// owned specialization unchanged and return the guard's specialization there.
+// Other successful paths set it to null. A borrowed pointer is valid only until
+// the next call using that guard; callers must consume it before reentering.
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

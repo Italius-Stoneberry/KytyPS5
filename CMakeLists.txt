@@ -735,6 +735,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
 		target_link_options(shader_cfg_tests PRIVATE "-fuse-ld=${CMAKE_LINKER}")
 	endif()
 
+	if(BUILD_TESTING)
+		add_test(NAME specialization_guard
+			COMMAND shader_recompiler_compute_tests --specialization-guard-only)
+	endif()
 endif()
 
 if(KYTY_BUILD_LAUNCHER)

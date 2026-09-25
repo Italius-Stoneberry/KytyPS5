@@ -240,10 +240,14 @@ struct PipelineCache::ProgramCache {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {}
 
-		ShaderRecompiler::IR::ResourcePlan resource_plan;
+		ShaderRecompiler::IR::ResourcePlan                resource_plan;
+		ShaderRecompiler::IR::ResourceSpecializationGuard specialization_guard;
 		// ShaderStageRuntime keeps a pointer into a compiled permutation. Later
 		// specializations of the same source must not invalidate an earlier draw.
 		std::deque<Permutation> permutations;
+		// The permutation the specialization guard selected at `guarded_publication`.
+		const Permutation* guarded_permutation = nullptr;
+		uint64_t           guarded_publication = 0;
 	};
 
 	struct ProgramKeyHash {
@@ -361,23 +365,48 @@ struct PipelineCache::ProgramCache {
 		const auto& runtime = observed_runtime.Get();
 		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
+			const ShaderRecompiler::IR::ResourceSpecialization* borrowed_specialization = nullptr;
 			ReportMaterialization(label, stage, params.hash, report,
 			                      ShaderRecompiler::IR::MaterializeResources(
 			                          entry->second.resource_plan, runtime, resources,
-			                          specialization, &report));
-			if (const auto permutation = std::ranges::find_if(
+			                          specialization, &report, &entry->second.specialization_guard,
+			                          &borrowed_specialization));
+			const auto& active_specialization =
+			    borrowed_specialization ? *borrowed_specialization : specialization;
+			const auto compatible_push_data = [&](const Permutation& candidate) {
+				const auto& layout = candidate.program.bindings;
+				return layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
+				    push_data_cursor, layout.ShaderDataDwords());
+			};
+			const auto find_permutation = [&] { return std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == specialization;
-			        });
+				        return compatible_push_data(candidate) &&
+				               candidate.specialization == active_specialization;
+			        }); };
+			// A borrowed specialization comes from the guard: the permutation it
+			// selected under the same publication is still the right one.
+			auto& source = entry->second;
+			if (borrowed_specialization && source.guarded_permutation &&
+			    source.guarded_publication == source.specialization_guard.publication &&
+			    compatible_push_data(*source.guarded_permutation)) {
+				const auto* selected = source.guarded_permutation;
+				publish_stage(selected->program);
+				selected->program.bindings.AdvancePushData(push_data_cursor);
+				return selected->handle;
+			}
+			if (const auto permutation = find_permutation();
 			    permutation != entry->second.permutations.end()) {
+				// Only a borrowed result certifies this exact guard publication.
+				// An ineligible reference transaction must not relabel an old guard.
+				if (borrowed_specialization) {
+					source.guarded_permutation = &*permutation;
+					source.guarded_publication = source.specialization_guard.publication;
+				}
 				publish_stage(permutation->program);
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
+			if (borrowed_specialization) specialization = *borrowed_specialization;
 		}
 
 		ShaderStageInputInfo stage_input {};

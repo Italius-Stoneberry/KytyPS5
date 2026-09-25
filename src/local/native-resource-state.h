@@ -16,4 +16,7 @@ extern volatile std::atomic<uint32_t> kyty_local_preparation_scratch_mode;
 extern volatile std::atomic<uint32_t> kyty_local_preparation_lookup_mode;
 // 1: remove redundant attachment clearing and the temporary snapshot remap index.
 extern volatile std::atomic<uint32_t> kyty_local_preparation_trim_mode;
+// 1: semantic shape guard for resource specialization, with reusable miss
+// storage and the guarded compiled-permutation shortcut.
+extern volatile std::atomic<uint32_t> kyty_local_specialization_guard_mode;
 }

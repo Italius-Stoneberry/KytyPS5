@@ -382,6 +382,188 @@ void TestBdaReadPlanTransactions() {
 }
 
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
+// The shape guard against the reference materializer (guard off). The memory
+// source changes on every transaction.
+void TestSpecializationGuard() {
+  using namespace Libs::Graphics;
+  using namespace ShaderRecompiler::IR;
+  struct Memory {
+    std::array<uint32_t, 32> words{};
+    uint32_t calls = 0;
+    uint32_t fail_word = UINT32_MAX;
+    static bool Read(void* opaque, uint64_t address, uint32_t* out) {
+      auto& self = *static_cast<Memory*>(opaque);
+      ++self.calls;
+      if (address < 0x1000 || address >= 0x1080 || address % 4) return false;
+      const auto index = uint32_t((address - 0x1000) / 4);
+      if (index == self.fail_word) return false;
+      *out = self.words[index];
+      return true;
+    }
+  } memory;
+  const auto make_plan = [&](bool storage, bool fmask_only) {
+    Program program;
+    program.stage = ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    auto& block = AddValueBlock(program);
+    program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+    auto& handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                      {Value(0x1000u), Value(0u)});
+    uint32_t cursor = 0;
+    const auto source = [&](uint32_t size) {
+      DescriptorSource descriptor;
+      descriptor.dword_count = size;
+      for (uint32_t i = 0; i < size; ++i) {
+        auto& load = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+            {Value(&handle), Value(cursor++ * 4), Value(0u), Value(true)});
+        load.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
+        descriptor.dwords[i] = Value(&load);
+      }
+      program.descriptor_sources.push_back(descriptor);
+      return uint32_t(program.descriptor_sources.size() - 1);
+    };
+    program.info.buffers.push_back({.source = source(4)});
+    program.info.buffers.push_back({.source = source(4), .formatted = true});
+    for (uint32_t i = 0; i < 2; ++i) {
+      program.info.images.push_back({.source = source(8),
+          .resource_class = storage ? ImageResourceClass::Storage : ImageResourceClass::Sampled,
+          .numeric_class = Prospero::TextureNumericClass::Float,
+          .dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D,
+          .mip_mode = storage ? ImageMipMode::DynamicStorage : ImageMipMode::None,
+          .read = true, .written = storage});
+    }
+    program.info.samplers.push_back({.source = source(4)});
+    program.info.samplers.push_back({.source = source(4)});
+    if (!storage && !fmask_only) {
+      program.info.sampled_pairs.push_back({.image = 0, .sampler = 0});
+      program.info.sampled_pairs.push_back({.image = 1, .sampler = 0});
+      program.info.sampled_pairs.push_back({.image = 0, .sampler = 1});
+    }
+    return ExtractResourcePlan(program);
+  };
+  auto plan = make_plan(false, false);
+  auto storage_plan = make_plan(true, false);
+  auto fmask_plan = make_plan(false, true);
+  std::array<uint32_t, 32> baseline{};
+  baseline[0] = 0x4000;
+  baseline[1] = 16u << 16;
+  baseline[2] = 128;
+  baseline[3] = DstSel(4, 5, 6, 7);
+  baseline[4] = 0x8000;
+  baseline[5] = 4u << 16;
+  baseline[6] = 256;
+  baseline[7] = DstSel(4, 5, 6, 7) | (uint32_t(Prospero::BufferFormat::k32Float) << 12);
+  for (uint32_t base : {8u, 16u}) {
+    baseline[base] = 0x100;
+    baseline[base + 1] = uint32_t(Prospero::BufferFormat::k32Float) << 20;
+    baseline[base + 2] = 7u | (7u << 14);
+    baseline[base + 3] = DstSel(4, 5, 6, 7) | (uint32_t(Prospero::ImageType::kColor2D) << 28);
+  }
+  baseline[24] = 0x12345678;
+  baseline[28] = 0x98765432;
+  const SrtRuntime runtime{.read_memory = Memory::Read, .userdata = &memory};
+  const auto same = [](const ResourceSnapshot& a, const ResourceSnapshot& b) {
+    return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
+        a.flattened_srt == b.flattened_srt && a.user_data == b.user_data && a.uniform_fill == b.uniform_fill;
+  };
+  const auto saved = kyty_local_specialization_guard_mode.load();
+  ResourceSpecializationGuard guard;
+  ResourceSnapshot actual;
+  ResourceSpecialization actual_spec;
+  uint32_t compared = 0, rejected = 0;
+  const auto compare = [&](const ResourcePlan& current, uint32_t mode) {
+    ResourceSnapshot reference = actual;
+    auto reference_spec = actual_spec;
+    const auto old_snapshot = actual;
+    const auto old_spec = actual_spec;
+    kyty_local_specialization_guard_mode.store(0);
+    const auto begin = memory.calls;
+    const bool expected = MaterializeResources(current, runtime, reference, reference_spec);
+    const auto reads = memory.calls - begin;
+    kyty_local_specialization_guard_mode.store(mode != 0 ? 1 : 0);
+    const ResourceSpecialization* borrowed = nullptr;
+    const auto before = memory.calls;
+    const bool ok = MaterializeResources(current, runtime, actual, actual_spec, nullptr, &guard,
+                                         &borrowed);
+    Check(ok == expected, "shape guard changed materialization success");
+    Check(memory.calls - before == reads, "shape guard skipped or repeated current guest reads");
+    if (ok) {
+      Check(same(actual, reference) && (borrowed ? *borrowed : actual_spec) == reference_spec,
+            "shape guard changed fresh snapshot or specialization");
+      // Subsequent failure comparisons use an owned expected specialization.
+      if (borrowed) actual_spec = *borrowed;
+    } else {
+      ++rejected;
+      Check(same(actual, old_snapshot) && actual_spec == old_spec && borrowed == nullptr,
+            "shape guard published a partial failed transaction");
+    }
+    ++compared;
+  };
+  // Exercise every descriptor bit, including address, bounds, format, swizzle,
+  // buffer type, add-TID, MSAA validity and nullness transitions.
+  for (uint32_t word = 0; word < baseline.size(); ++word) {
+    for (uint32_t bit = 0; bit < 32; ++bit) {
+      memory.words = baseline;
+      compare(plan, 1);
+      memory.words[word] ^= 1u << bit;
+      compare(plan, 1);
+      compare(plan, 2);
+    }
+  }
+  uint32_t random = 0x15b2af19;
+  const auto next_random = [&] { random ^= random << 13; random ^= random >> 17; random ^= random << 5; return random; };
+  for (uint32_t i = 0; i < 1024; ++i) {
+    memory.words = baseline;
+    memory.words[0] = next_random() & ~3u;
+    memory.words[1] |= next_random() & 0xffff;
+    memory.words[2] = next_random();
+    memory.words[4] = next_random() & ~3u;
+    memory.words[6] = next_random();
+    memory.words[8] = next_random() | 1u;
+    memory.words[16] = next_random() | 1u;
+    memory.words[19] |= (i & 3u) << 16;
+    memory.words[24] = next_random();
+    memory.words[28] = next_random();
+    if (i & 1) memory.words[17] = uint32_t(Prospero::BufferFormat::k32SInt) << 20;
+    compare(plan, 1);
+    compare(plan, 2);
+    compare(plan, 3);
+    memory.fail_word = i % 32;
+    compare(plan, 1);
+    memory.fail_word = UINT32_MAX;
+  }
+  for (uint32_t i = 0; i < 64; ++i) {
+    memory.words = baseline;
+    memory.words[11] |= (i % 4) << 12 | ((i / 4) % 4) << 16;
+    memory.words[24] += i;
+    compare(storage_plan, 1);
+    compare(storage_plan, 2);
+    memory.words = baseline;
+    memory.words[9] = uint32_t(Prospero::BufferFormat::kFmask8_S2_F1) << 20;
+    compare(fmask_plan, 1);
+    compare(fmask_plan, 2);
+  }
+  // A same-shape address change must borrow without overwriting owned output.
+  memory.words = baseline;
+  compare(plan, 1);
+  memory.words[0] += 0x1000;
+  const auto owned_before = actual_spec;
+  const ResourceSpecialization* borrowed = nullptr;
+  kyty_local_specialization_guard_mode.store(1);
+  Check(MaterializeResources(plan, runtime, actual, actual_spec, nullptr, &guard, &borrowed) &&
+      borrowed == &guard.specialization && actual_spec == owned_before && actual.buffers[0].dwords[0] == memory.words[0],
+      "same-shape buffer address was not kept fresh while borrowing specialization");
+  auto mixed = MixedSamplerPlan();
+  for (uint32_t mode : {1u, 2u, 1u}) compare(mixed, mode);
+  auto empty = UnbasedFlatPlan();
+  for (uint32_t mode : {1u, 2u, 1u}) compare(empty, mode);
+  compare(empty, 0);
+  compare(empty, 1);
+  kyty_local_specialization_guard_mode.store(saved);
+  std::printf("Specialization guard: %u comparisons, %u matched rejections, zero mismatches\n", compared,
+              rejected);
+}
+
 void TestPreparationStorageTransactions() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto mixed = MixedSamplerPlan();
@@ -466,6 +648,7 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  TestSpecializationGuard();
   TestPreparationStorageTransactions();
 #endif
   TestBdaReadPlanIntervals();
