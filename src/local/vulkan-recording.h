@@ -29,6 +29,11 @@ bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
                    std::shared_ptr<const void> owner = {});
 // Preserve order when a packet cannot fit. Does not retain any argument.
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments);
+// Command-buffer begin/end and queue submission, queued in order with the recorded
+// commands instead of draining the recording queue first (KYTY_DEFERRED_SUBMIT).
+// A submit packet is published at once: other threads may wait on its tick.
+bool DeferredSubmitEnabled();
+bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, bool publish);
 uint64_t StateEpoch();
 class ProducerScope {
 public:

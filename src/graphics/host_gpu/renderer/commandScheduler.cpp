@@ -3,6 +3,9 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -385,11 +388,96 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	return m_command;
 }
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+namespace {
+// vkEndCommandBuffer + vkQueueSubmit executed by the recording worker, in order with
+// the commands it has replayed. The tick is assigned on the producer as before.
+struct DeferredSubmit {
+	VkCommandBuffer      command;
+	VkQueue              queue;
+	Common::Mutex*       queue_mutex;
+	uint32_t             waits, signals;
+	VkSemaphore          wait_semaphores[SubmitInfo::MaxSemaphores];
+	uint64_t             wait_ticks[SubmitInfo::MaxSemaphores];
+	VkPipelineStageFlags wait_stages[SubmitInfo::MaxSemaphores];
+	VkSemaphore          signal_semaphores[SubmitInfo::MaxSemaphores];
+	uint64_t             signal_ticks[SubmitInfo::MaxSemaphores];
+	uint64_t             tick;
+};
+void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
+                  const vk::detail::DispatchLoaderDynamic& dispatch) {
+	const auto& submit = *static_cast<const DeferredSubmit*>(segments[0].data);
+	if (dispatch.vkEndCommandBuffer(submit.command) != VK_SUCCESS) {
+		EXIT("deferred vkEndCommandBuffer failed, tick=%" PRIu64 "\n", submit.tick);
+	}
+	VkTimelineSemaphoreSubmitInfo timeline {};
+	timeline.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+	timeline.waitSemaphoreValueCount   = submit.waits;
+	timeline.pWaitSemaphoreValues      = submit.wait_ticks;
+	timeline.signalSemaphoreValueCount = submit.signals;
+	timeline.pSignalSemaphoreValues    = submit.signal_ticks;
+	VkSubmitInfo info {};
+	info.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	info.pNext                = &timeline;
+	info.waitSemaphoreCount   = submit.waits;
+	info.pWaitSemaphores      = submit.wait_semaphores;
+	info.pWaitDstStageMask    = submit.wait_stages;
+	info.commandBufferCount   = 1;
+	info.pCommandBuffers      = &submit.command;
+	info.signalSemaphoreCount = submit.signals;
+	info.pSignalSemaphores    = submit.signal_semaphores;
+	VkResult result;
+	{
+		Common::LockGuard lock(*submit.queue_mutex);
+		result = dispatch.vkQueueSubmit(submit.queue, 1, &info, VK_NULL_HANDLE);
+	}
+	if (result != VK_SUCCESS) {
+		EXIT("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n", static_cast<int>(result), submit.tick);
+	}
+}
+} // namespace
+#endif
+
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (LocalVulkanRecording::DeferredSubmitEnabled()) {
+		m_command.EndRendering();
+		EXIT_IF(m_graphics.queue == nullptr);
+		DeferredSubmit deferred {};
+		{
+			Common::LockGuard lock(m_graphics.queue_mutex);
+			deferred.tick = m_master.NextTick();
+			submit.AddSignal(m_master.Handle(), deferred.tick);
+		}
+		deferred.command     = m_command.m_buffer;
+		deferred.queue       = m_graphics.queue;
+		deferred.queue_mutex = &m_graphics.queue_mutex;
+		deferred.waits       = submit.num_wait_semaphores;
+		deferred.signals     = submit.num_signal_semaphores;
+		for (uint32_t i = 0; i < deferred.waits; ++i) {
+			deferred.wait_semaphores[i] = submit.wait_semaphores[i];
+			deferred.wait_ticks[i]      = submit.wait_ticks[i];
+			deferred.wait_stages[i]     = static_cast<VkPipelineStageFlags>(submit.wait_stages[i]);
+		}
+		for (uint32_t i = 0; i < deferred.signals; ++i) {
+			deferred.signal_semaphores[i] = submit.signal_semaphores[i];
+			deferred.signal_ticks[i]      = submit.signal_ticks[i];
+		}
+		const LocalVulkanRecording::Segment segments[] {{&deferred, sizeof(deferred)}};
+		if (!LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true)) {
+			// Keep order: everything recorded so far, then this exact submit.
+			LocalVulkanRecording::Drain();
+			ReplaySubmit(segments, VULKAN_HPP_DEFAULT_DISPATCHER);
+		}
+		m_command.m_buffer    = nullptr;
+		m_recorded_dispatches = 0;
+		return deferred.tick;
+	}
+#endif
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;

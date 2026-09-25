@@ -19,6 +19,8 @@ extern "C" {
 // 1: record Vulkan commands for the worker thread, draws and descriptor
 // encoding as whole packets (KYTY_VULKAN_RECORDING).
 volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode {0};
+// 1: queue command-buffer begin/end/submit instead of draining (DeferredSubmitEnabled).
+volatile std::atomic<uint32_t> kyty_local_deferred_submit_mode {0};
 }
 
 namespace LocalVulkanRecording {
@@ -294,6 +296,25 @@ bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
         const auto count = segments.size();
         writer.Command([owner, copied, count, replay] { replay({copied.data(), count}, original); });
     });
+}
+bool DeferredSubmitEnabled() {
+    return producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0 &&
+        kyty_local_deferred_submit_mode.load(std::memory_order_relaxed) != 0;
+}
+bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, bool publish) {
+    if (!DeferredSubmitEnabled() || !replay || segments.size() > 8) return false;
+    auto* stream = RecordingStream();
+    if (!stream) return false;
+    const bool queued = stream->Enqueue([&](Writer& writer) {
+        std::array<Segment, 8> copied {};
+        for (size_t i = 0; i < segments.size(); ++i)
+            copied[i] = {writer.Copy(segments[i].data, segments[i].size), segments[i].size};
+        const auto count = segments.size();
+        // A new command buffer may reuse a handle: drop raw-state reuse as a direct call would.
+        writer.Command([copied, count, replay] { InvalidateRawState(); replay({copied.data(), count}, original); });
+    });
+    if (queued && publish) stream->Flush();
+    return queued;
 }
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments) {
     if (producer) producer->BeforeDirect();

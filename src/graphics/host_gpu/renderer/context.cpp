@@ -11,6 +11,9 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <algorithm>
 #include <bit>
@@ -49,9 +52,33 @@ vk::CommandBuffer CommandBuffer::HandleForFullBarrier() const {
 	m_compute_access_pending = false;
 	return m_buffer;
 }
+
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+static void ReplayBegin(std::span<const LocalVulkanRecording::Segment> segments,
+                        const vk::detail::DispatchLoaderDynamic& dispatch) {
+	const auto command = *static_cast<const VkCommandBuffer*>(segments[0].data);
+	VkCommandBufferBeginInfo info {};
+	info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if (dispatch.vkBeginCommandBuffer(command, &info) != VK_SUCCESS) {
+		EXIT("deferred vkBeginCommandBuffer failed\n");
+	}
+}
+#endif
+
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
 	auto buffer = Handle();
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	// The recording worker owns this pool's buffers while it replays them; begin there too.
+	{
+		const VkCommandBuffer               raw = buffer;
+		const LocalVulkanRecording::Segment segments[] {{&raw, sizeof(raw)}};
+		if (LocalVulkanRecording::EnqueueDeferred(ReplayBegin, segments, false)) {
+			return;
+		}
+	}
+#endif
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;

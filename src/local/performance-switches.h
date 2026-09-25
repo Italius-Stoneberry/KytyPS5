@@ -27,6 +27,7 @@ extern volatile std::atomic_uint32_t kyty_local_dispatch_batch;
 extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 extern volatile std::atomic_uint32_t kyty_local_vulkan_recording_mode;
+extern volatile std::atomic_uint32_t kyty_local_deferred_submit_mode;
 #endif
 }
 
@@ -63,6 +64,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_DISPATCH_BATCH", &kyty_local_dispatch_batch, 1, 65536},
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	    Switch {"KYTY_VULKAN_RECORDING", &kyty_local_vulkan_recording_mode},
+	    Switch {"KYTY_DEFERRED_SUBMIT", &kyty_local_deferred_submit_mode},
 #endif
 	};
 	std::string enabled;
