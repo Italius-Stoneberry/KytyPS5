@@ -270,10 +270,11 @@ inline void Run(uint64_t id, const std::string& line) {
 			const auto tag = granule.tag.load();
 			if (tag == 0) continue;
 			std::printf("LIVE_GRANULE id=%" PRIu64 " address=%09" PRIx64 " window_pages=%.1f reprotect_pages=%.1f"
-			            " upload_kb=%.1f upload_calls=%.1f\n",
+			            " upload_kb=%.1f upload_calls=%.1f gpu_writes=%.2f gpu_write_kb=%.1f\n",
 			            id, (tag - 1) << 20u, double(granule.values[0].load()) / frames,
 			            double(granule.values[1].load()) / frames, double(granule.values[2].load()) / 1024.0 / frames,
-			            double(granule.values[3].load()) / frames);
+			            double(granule.values[3].load()) / frames, double(granule.values[4].load()) / frames,
+			            double(granule.values[5].load()) / 1024.0 / frames);
 		}
 		std::printf("LIVE_GRANULE_OVERFLOW id=%" PRIu64 " count=%" PRIu64 "\n", id, LiveCounters::g_granule_overflow.load());
 	} else if (cmd == "sleep" && n >= 2) {

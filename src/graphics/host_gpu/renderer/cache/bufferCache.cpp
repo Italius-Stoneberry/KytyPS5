@@ -749,6 +749,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
+	LiveCensus::Scope census(LiveCensus::SyncDownload, vaddr >> 20u << 20u, is_write);
 	DrainGuestReadback();
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
@@ -1013,7 +1014,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
-
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
@@ -1037,6 +1037,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		InvalidateCopyFeedback(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
+		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
+		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
 	}
 	return {buffer, buffer->Offset(vaddr)};
 }

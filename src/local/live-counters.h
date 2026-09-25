@@ -23,22 +23,26 @@ enum Id : uint32_t {
 	SyncDownloads,      // synchronous GPU downloads for guest access
 	AsyncReadbacks,     // asynchronous guest readbacks started
 	ReadbackDetaches,   // pending guest readbacks detached by a GPU write
+	DispatchAfterDispatch, // dispatches whose previous draw/dispatch was a dispatch
+	DispatchSameShader,    // ... of the same compute shader
 	Count
 };
 
 inline constexpr const char* Names[Count] = {
     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches"};
+    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "dispatch_after_dispatch", "dispatch_same_shader"};
 
 inline std::atomic<uint64_t> g_values[Count];
+// Render thread: the last draw (0) or dispatch shader address.
+inline uint64_t g_last_dispatch_shader = 0;
 
 inline void Add(Id id, uint64_t n = 1) {
 	g_values[id].fetch_add(n, std::memory_order_relaxed);
 }
 
 // Per 1 MiB granule (hashed, tagged): what cycles where.
-enum GranuleField : uint32_t { GWindowPages, GReprotectPages, GUploadBytes, GUploadCalls, GFields };
+enum GranuleField : uint32_t { GWindowPages, GReprotectPages, GUploadBytes, GUploadCalls, GGpuWrites, GGpuWriteBytes, GFields };
 struct Granule {
 	std::atomic<uint64_t> tag {0};
 	std::atomic<uint64_t> values[GFields] {};

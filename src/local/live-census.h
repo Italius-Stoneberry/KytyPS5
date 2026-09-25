@@ -16,7 +16,8 @@ enum Kind : uint32_t {
 	DispatchPhase = 3, // a: compute shader, b: phase
 	GpuWait       = 4, // a, b: return addresses (caller, its caller)
 	ReadbackWait  = 5, // a, b: return addresses
-	Kinds         = 6
+	SyncDownload  = 6, // a: 1 MiB granule, b: write access
+	Kinds         = 7
 };
 
 struct Entry {

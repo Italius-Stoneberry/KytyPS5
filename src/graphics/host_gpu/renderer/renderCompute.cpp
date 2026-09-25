@@ -27,6 +27,7 @@
 #include "native-preparation-state.h"
 #include "xpr-capture.h"
 #include "live-census.h"
+#include "live-counters.h"
 
 #include <algorithm>
 #include <array>
@@ -298,6 +299,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 	LiveCensus::Scope census(LiveCensus::Dispatch, sh_ctx.GetCs().cs_regs.data_addr, indirect_args != 0);
+	if (LiveCounters::g_last_dispatch_shader != 0) {
+		LiveCounters::Add(LiveCounters::DispatchAfterDispatch);
+		if (LiveCounters::g_last_dispatch_shader == sh_ctx.GetCs().cs_regs.data_addr)
+			LiveCounters::Add(LiveCounters::DispatchSameShader);
+	}
+	LiveCounters::g_last_dispatch_shader = sh_ctx.GetCs().cs_regs.data_addr;
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,

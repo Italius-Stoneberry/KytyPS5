@@ -32,6 +32,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "live-census.h"
+#include "live-counters.h"
 #include "native-preparation-state.h"
 #include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -1831,6 +1832,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 	LiveCensus::Scope census(LiveCensus::Draw, sh_ctx.GetVs().gs_regs.data_addr, sh_ctx.GetPs().ps_regs.data_addr);
+	LiveCounters::g_last_dispatch_shader = 0;
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex), submit_id,
 	                    args.index_count, 0, 1, args.instance_count,
