@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -20,12 +21,15 @@
 #include "loader/systemContent.h"
 #include "native-preparation-scratch.h"
 #include "native-resource-state.h"
+#include "shader-warmup-cache.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
@@ -69,15 +73,26 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
-std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
+std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties,
+                                std::string_view binary_key) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
 	for (size_t i = 0; i < VK_UUID_SIZE; i++) {
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	const auto revision = binary_key.empty() ? std::string(KYTY_GIT_REVISION)
+	                                        : fmt::format("{}:local:{}", KYTY_GIT_REVISION, binary_key);
+	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", revision,
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+}
+
+// Compiler inputs are portable across executable rebuilds; the schema version
+// and device capabilities still constrain them. Driver binaries remain scoped
+// to the executable SHA. Every warm program is checked against live source.
+std::string ShaderInputDeviceSignature(const vk::PhysicalDeviceProperties& properties) {
+	const auto signature = DriverCacheSignature(properties, {});
+	return signature.substr(signature.size() - (8 * 3 + VK_UUID_SIZE * 2 + 5));
 }
 
 std::string PipelineCacheTitleId() {
@@ -254,6 +269,9 @@ struct PipelineCache::ProgramCache {
 		// The permutation the specialization guard selected at `guarded_publication`.
 		const Permutation* guarded_permutation = nullptr;
 		uint64_t           guarded_publication = 0;
+		// Verified against live shader bytes on first use, then released. This
+		// also rejects warm records from a changed game with a reused shader hash.
+		std::vector<uint32_t> warm_code, warm_back_code;
 	};
 
 	struct ProgramKeyHash {
@@ -348,6 +366,19 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
+		if (entry != programs.end() && !entry->second.warm_code.empty()) {
+			if (!std::ranges::equal(params.code, entry->second.warm_code) ||
+			    !std::ranges::equal(params.back_code, entry->second.warm_back_code)) {
+				for (const auto& p : entry->second.permutations) {
+					device.destroyShaderModule(p.handle.module, nullptr);
+				}
+				programs.erase(entry);
+				entry = programs.end();
+			} else {
+				std::vector<uint32_t>().swap(entry->second.warm_code);
+				std::vector<uint32_t>().swap(entry->second.warm_back_code);
+			}
+		}
 		ShaderRecompiler::IR::ResourceSnapshot temporary_resources;
 		auto& resources = NativePreparationScratchEnabled() ? input_info.stage.resources
 		                                                    : temporary_resources;
@@ -455,6 +486,22 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();
+		if (warmup.Enabled()) {
+			LocalShaderWarmup::Record record;
+			record.stage = stage;
+			record.hash = params.hash;
+			record.user_data_count = static_cast<uint32_t>(params.user_data.size());
+			record.push_cursor = push_data_cursor;
+			record.static_key = lookup_key.static_state;
+			record.code.assign(params.code.begin(), params.code.end());
+			record.back_code.assign(params.back_code.begin(), params.back_code.end());
+			record.specialization = permutation.specialization;
+			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) record.vertex = input_info;
+			else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) record.pixel = input_info;
+			else record.compute = input_info;
+			const auto index = warmup.Add(record);
+			if (index != LocalShaderWarmup::NoShader) recorded_programs[permutation.handle.id] = index;
+		}
 		publish_stage(permutation.program);
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
@@ -469,6 +516,78 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::Compute)],
 		            counts[static_cast<size_t>(ShaderType::Mesh)]);
 		return permutation.handle;
+	}
+
+	void Warm(const std::filesystem::path& path, const std::string& identity, bool compile) {
+		if (!warmup.Open(path, identity))
+			PipelineCacheLog("Shader warmup: ignoring invalid cache {}", Common::PathToString(path));
+		if (const char* import = std::getenv("KYTY_SHADER_WARMUP_IMPORT"); import && *import) {
+			const auto old_count = warmup.records.size();
+			if (warmup.ImportLegacy(import, identity.substr(identity.find(':'))))
+				PipelineCacheLog("Shader warmup: imported {} legacy inputs", warmup.records.size() - old_count);
+			else PipelineCacheLog("Shader warmup: rejected legacy input cache {}", import);
+		}
+		PipelineCacheLog("Shader warmup: loaded {} shader inputs and {} pipeline recipes", warmup.records.size(), warmup.pipelines.size());
+		if (!compile || warmup.records.empty()) return;
+		const auto begin = std::chrono::steady_clock::now();
+		// 0 means all recorded inputs. A caller can explicitly bound startup time.
+		uint32_t budget_seconds = 0;
+		if (const char* value = std::getenv("KYTY_SHADER_WARMUP_SECONDS"); value && *value) {
+			const auto end = value + std::strlen(value);
+			const auto parsed = std::from_chars(value, end, budget_seconds);
+			if (parsed.ec != std::errc {} || parsed.ptr != end || budget_seconds > 3600) budget_seconds = 0;
+		}
+		if (budget_seconds) warm_deadline = begin + std::chrono::seconds(budget_seconds);
+		warm_permutations.resize(warmup.records.size());
+		size_t compiled = 0;
+		for (size_t remaining = warmup.records.size(); remaining != 0; --remaining) {
+			const size_t index = remaining - 1;
+			if (std::chrono::steady_clock::now() >= warm_deadline) break;
+			const auto& saved = warmup.records[index];
+			LocalShaderWarmup::Record record;
+			LocalShaderWarmup::Reader reader {saved};
+			if (!LocalShaderWarmup::Visit(reader, record) || !LocalShaderWarmup::ValidKey(record)) continue;
+			ProgramKey key {record.stage, record.hash, record.user_data_count,
+			                static_cast<uint32_t>(record.code.size()), record.static_key};
+			auto entry = programs.find(key);
+			if (entry != programs.end() && (entry->second.warm_code != record.code ||
+			    entry->second.warm_back_code != record.back_code)) continue;
+			if (entry != programs.end()) {
+				const auto found = std::ranges::find_if(entry->second.permutations, [&](const auto& p) {
+					return p.specialization == record.specialization && p.program.bindings.push_data_start_dword ==
+					    ShaderRecompiler::IR::PushData::StartFor(record.push_cursor, p.program.bindings.ShaderDataDwords());
+				});
+				if (found != entry->second.permutations.end()) { warm_permutations[index] = &*found; continue; }
+			}
+			// The compiler consumes the user-data width; values are resolved anew by
+			// MaterializeResources when the guest actually draws or dispatches.
+			std::vector<uint32_t> user_data(record.user_data_count);
+			auto options = LocalShaderWarmup::Options(record, user_data);
+			auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
+			if (entry == programs.end()) {
+				auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+				entry = programs.try_emplace(std::move(key), std::move(plan)).first;
+				entry->second.warm_code = record.code;
+				entry->second.warm_back_code = record.back_code;
+			}
+			ShaderParams params {record.code, std::move(user_data), record.hash, record.back_code};
+			entry->second.permutations.push_back(CompilePermutation(params, options, std::move(translated),
+			    std::move(record.specialization), record.push_cursor));
+			auto& permutation = entry->second.permutations.back();
+			recorded_programs[permutation.handle.id] = uint32_t(index);
+			warm_permutations[index] = &permutation;
+			if (++compiled % 250 == 0) PipelineCacheLog("Shader warmup: compiling {}/{}", compiled, warmup.records.size());
+		}
+		PipelineCacheLog("Shader warmup: compiled {}/{} permutations in {} ms", compiled, warmup.records.size(),
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+	}
+	LocalShaderWarmup::Cache warmup;
+	std::unordered_map<uint64_t, uint32_t> recorded_programs;
+	std::vector<Permutation*> warm_permutations;
+	std::chrono::steady_clock::time_point warm_deadline = std::chrono::steady_clock::time_point::max();
+	uint32_t RecordedIndex(const ShaderProgram& program) const {
+		const auto it = recorded_programs.find(program.id);
+		return it == recorded_programs.end() ? LocalShaderWarmup::NoShader : it->second;
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
@@ -493,6 +612,78 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	const char* warmup = std::getenv("KYTY_SHADER_WARMUP");
+	if (warmup && IsBinaryDriverCacheKey(m_driver_cache_key) && m_driver_cache != nullptr &&
+	    (std::string_view(warmup) == "1" || std::string_view(warmup) == "record")) {
+		const auto device = ShaderInputDeviceSignature(m_graphics.GetPhysicalDeviceProperties());
+		const auto title = PipelineCacheTitleId();
+		const auto path = std::filesystem::path("_PipelineCache") / "warmup-v2" /
+		    fmt::format("{:016x}", XXH3_64bits(device.data(), device.size())) / (title + ".shaders");
+		m_program_cache->Warm(path, title + device, std::string_view(warmup) == "1");
+		if (std::string_view(warmup) == "1") WarmPipelines();
+		m_program_cache->warmup.StartWriter();
+		if (const char* only = std::getenv("KYTY_SHADER_WARMUP_ONLY"); only && std::string_view(only) == "1") {
+			if (!Save()) {
+				PipelineCacheLog("Shader precompile: failed to save cache");
+				std::_Exit(1);
+			}
+			PipelineCacheLog("Shader precompile: complete ({} inputs, {} graphics and {} compute pipelines)",
+			    m_program_cache->warmup.records.size(), m_graphics_pipelines.size(), m_compute_pipelines.size());
+			std::fflush(nullptr);
+			std::_Exit(0);
+		}
+	}
+}
+
+void PipelineCache::WarmPipelines() {
+	auto& programs = *m_program_cache;
+	const auto begin = std::chrono::steady_clock::now();
+	size_t compiled = 0, skipped = 0;
+	const auto get = [&](uint32_t index) -> ProgramCache::Permutation* {
+		return index < programs.warm_permutations.size() ? programs.warm_permutations[index] : nullptr;
+	};
+	const auto decode = [&](uint32_t index, LocalShaderWarmup::Record& record) {
+		LocalShaderWarmup::Reader reader {programs.warmup.records[index]};
+		return LocalShaderWarmup::Visit(reader, record);
+	};
+	for (const auto& words : programs.warmup.pipelines) {
+		if (std::chrono::steady_clock::now() >= programs.warm_deadline) break;
+		LocalShaderWarmup::PipelineRecord recipe;
+		LocalShaderWarmup::Reader reader {words};
+		if (!LocalShaderWarmup::VisitPipeline(reader, recipe)) { ++skipped; continue; }
+		if (recipe.compute != LocalShaderWarmup::NoShader) {
+			const auto* compute = get(recipe.compute);
+			if (!compute) { ++skipped; continue; }
+			if (m_compute_pipelines.contains(compute->handle.id)) continue;
+			LocalShaderWarmup::Record input;
+			if (!decode(recipe.compute, input)) { ++skipped; continue; }
+			input.compute.stage.program = &compute->program;
+			auto pipeline = std::make_unique<Pipeline>();
+			CreatePipelineInternal(m_graphics, *pipeline, input.compute, compute->handle.module, m_driver_cache);
+			m_compute_pipelines.emplace(compute->handle.id, std::move(pipeline));
+		} else {
+			const auto* vertex = get(recipe.vertex);
+			const auto* pixel = get(recipe.pixel);
+			if (!vertex || (recipe.pixel != LocalShaderWarmup::NoShader && !pixel)) { ++skipped; continue; }
+			GraphicsPipelineKey key {recipe.rendering, vertex->handle.id, pixel ? pixel->handle.id : 0,
+									 recipe.vertex_input, recipe.state};
+			if (m_graphics_pipelines.contains(key)) continue;
+			LocalShaderWarmup::Record vs, ps;
+			if (!decode(recipe.vertex, vs) || (pixel && !decode(recipe.pixel, ps))) { ++skipped; continue; }
+			vs.vertex.stage.program = &vertex->program;
+			if (pixel) ps.pixel.stage.program = &pixel->program;
+			auto pipeline = std::make_unique<Pipeline>();
+			CreatePipelineInternal(m_graphics, *pipeline, recipe.rendering, recipe.vertex_input,
+				vs.vertex, vertex->handle, pixel ? &ps.pixel : nullptr,
+				pixel ? pixel->handle : ShaderProgram {}, recipe.state, m_driver_cache);
+			m_graphics_pipelines.emplace(std::move(key), std::move(pipeline));
+		}
+		if (++compiled % 250 == 0) PipelineCacheLog("Pipeline warmup: compiling {}/{}", compiled, programs.warmup.pipelines.size());
+	}
+	programs.warm_permutations.clear();
+	PipelineCacheLog("Pipeline warmup: compiled {} of {} recipes, skipped {}, elapsed {} ms", compiled,
+		programs.warmup.pipelines.size(), skipped,
+		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
 }
 
 PipelineCache::~PipelineCache() {
@@ -523,16 +714,27 @@ void PipelineCache::InitializeDriverCache() {
 	}
 	const std::string_view git_hash     = KYTY_GIT_HASH;
 	const std::string_view git_revision = KYTY_GIT_REVISION;
+	if (const auto* key = std::getenv("KYTY_DRIVER_CACHE_KEY"); key && *key) {
+		if (!IsBinaryDriverCacheKey(key)) {
+			PipelineCacheLog("Vulkan pipeline cache: disabled (invalid executable fingerprint)");
+			return;
+		}
+		m_driver_cache_key = key;
+	}
 	if (git_hash == "unknown" || git_revision == "unknown") {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
 		return;
 	}
-	if (git_hash.ends_with("-dirty")) {
+	if (git_hash.ends_with("-dirty") && m_driver_cache_key.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
 		return;
 	}
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	if (!m_driver_cache_key.empty()) {
+		m_driver_cache_path = std::filesystem::path("_PipelineCache") / "local" /
+		                      m_driver_cache_key / (title_id + ".bin");
+	}
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -544,7 +746,7 @@ void PipelineCache::InitializeDriverCache() {
 	if (cache_exists) {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_driver_cache_key);
 		if (file_size >= signature.size() + sizeof(uint64_t) &&
 		    file_size <= std::numeric_limits<uint32_t>::max()) {
 			std::string cached_signature(signature.size(), '\0');
@@ -598,10 +800,14 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
-void PipelineCache::Save() {
+bool PipelineCache::Save() {
 	Common::LockGuard lock(m_mutex);
+	const bool inputs_saved = m_program_cache->warmup.Save();
+	if (!inputs_saved) PipelineCacheLog("Shader warmup: cache save failed");
+	else if (m_program_cache->warmup.Enabled()) PipelineCacheLog("Shader warmup: saved {} inputs and {} pipelines",
+	    m_program_cache->warmup.records.size(), m_program_cache->warmup.pipelines.size());
 	if (m_driver_cache == nullptr) {
-		return;
+		return inputs_saved;
 	}
 
 	size_t               size = 0;
@@ -624,15 +830,15 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_driver_cache_key);
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -649,12 +855,13 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache = nullptr;
+	return inputs_saved;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -912,6 +1119,17 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	if (indexed) {
 		m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
 	}
+	LocalShaderWarmup::PipelineRecord recipe;
+	recipe.vertex = m_program_cache->RecordedIndex(vertex_program);
+	recipe.pixel =
+	    ps_active ? m_program_cache->RecordedIndex(pixel_program) : LocalShaderWarmup::NoShader;
+	recipe.rendering    = iter->first.rendering;
+	recipe.vertex_input = iter->first.vertex_input;
+	recipe.state        = iter->first.static_params;
+	if (recipe.vertex != LocalShaderWarmup::NoShader &&
+	    (!ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
+		m_program_cache->warmup.AddPipeline(recipe);
+	}
 
 	return *iter->second;
 }
@@ -942,6 +1160,11 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	LocalShaderWarmup::PipelineRecord recipe;
+	recipe.compute = m_program_cache->RecordedIndex(compute_program);
+	if (recipe.compute != LocalShaderWarmup::NoShader) {
+		m_program_cache->warmup.AddPipeline(recipe);
+	}
 
 	return *iter->second;
 }

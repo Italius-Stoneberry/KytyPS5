@@ -1,6 +1,7 @@
 #include "common/emulatorConfig.h"
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
 #include "native-resource-state.h"
+#include "shader-warmup-cache.h"
 #endif
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -11,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -147,6 +149,46 @@ TestCompileResult RecompileForTest(
         "test shader resources did not materialize");
   auto compiled = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization, push_data_start_dword);
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  // Exercise persisted compiler inputs on the existing compute, pixel, vertex
+  // and mesh fixtures, including their resource specializations and CFGs.
+  LocalShaderWarmup::Record saved;
+  saved.stage = options.stage; saved.hash = options.shader_hash;
+  saved.user_data_count = static_cast<uint32_t>(options.user_data.size());
+  saved.push_cursor = push_data_start_dword;
+  saved.code.assign(code.begin(), code.end());
+  saved.back_code.assign(options.back_code.begin(), options.back_code.end());
+  saved.specialization = specialization;
+  if (options.stage == ShaderType::Vertex || options.stage == ShaderType::Mesh) {
+    saved.vertex = *options.input_info.vertex;
+    BuildStageStaticKey(saved.vertex, saved.static_key);
+  } else if (options.stage == ShaderType::Pixel) {
+    saved.pixel = *options.input_info.pixel;
+    BuildStageStaticKey(saved.pixel, saved.static_key);
+  } else {
+    saved.compute = *options.input_info.compute;
+    BuildStageStaticKey(saved.compute, saved.static_key);
+  }
+  LocalShaderWarmup::Writer writer;
+  // Synthetic mesh tests may intentionally use a zero-size workgroup; those
+  // never enter the renderer's mesh program cache and are not recorded there.
+  if (LocalShaderWarmup::Visit(writer, saved)) {
+    LocalShaderWarmup::Record restored;
+    LocalShaderWarmup::Reader reader {writer.words};
+    Check(LocalShaderWarmup::Visit(reader, restored) && reader.cursor == writer.words.size() &&
+          LocalShaderWarmup::ValidKey(restored) && restored.specialization == specialization,
+          "shader warmup changed the compiler key or specialization");
+    auto replay = options;
+    replay.back_code = restored.back_code;
+    if (options.stage == ShaderType::Vertex || options.stage == ShaderType::Mesh)
+      replay.input_info.vertex = &restored.vertex;
+    else if (options.stage == ShaderType::Pixel) replay.input_info.pixel = &restored.pixel;
+    else replay.input_info.compute = &restored.compute;
+    auto ir = ShaderRecompiler::TranslateProgram(restored.code, replay);
+    auto actual = ShaderRecompiler::CompileProgram(std::move(ir), replay, restored.specialization, restored.push_cursor);
+    Check(actual.spirv == compiled.spirv, "persisted shader warmup input changed SPIR-V output");
+  }
+#endif
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
@@ -1177,6 +1219,13 @@ void TestNormalizedImageContracts() {
             ImageSubresources{2, 360}.Contains({2, 1}) &&
             ImageSubresources{2, 360}.Contains({2, 360}),
         "independent mip/layer capacity check failed");
+  using Libs::Graphics::IsBinaryDriverCacheKey;
+  Check(IsBinaryDriverCacheKey(std::string(64, 'a')) &&
+            !IsBinaryDriverCacheKey("") && !IsBinaryDriverCacheKey(std::string(63, 'a')) &&
+            !IsBinaryDriverCacheKey(std::string(65, 'a')) &&
+            !IsBinaryDriverCacheKey(std::string(64, 'G')) &&
+            !IsBinaryDriverCacheKey("../" + std::string(61, 'a')),
+        "local driver cache fingerprint validation failed");
   ImageInfo container{};
   container.data = {0x10000, 0x15000};
   container.pixel_format = vk::Format::eR8G8B8A8Unorm;
@@ -12848,6 +12897,95 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+void TestShaderWarmupCacheFiles() {
+  const auto directory = std::filesystem::temp_directory_path() /
+      ("kyty-warmup-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  Check(std::filesystem::create_directory(directory), "create isolated warmup test directory");
+  const auto path = directory / "cache.shaders";
+  LocalShaderWarmup::Record record;
+  record.stage = ShaderType::Compute; record.code = {0xbf810000u};
+  record.compute.threads_num[0] = 64; record.compute.threads_num[1] = record.compute.threads_num[2] = 1;
+  record.user_data_count = 16; record.push_cursor = 12;
+  BuildStageStaticKey(record.compute, record.static_key);
+  LocalShaderWarmup::Cache cache;
+  Check(cache.Open(path, "device-and-executable-A"), "empty warmup cache");
+  cache.Add(record);
+  Check(cache.Save(), "save warmup compiler input");
+  LocalShaderWarmup::Cache loaded;
+  Check(loaded.Open(path, "device-and-executable-A") && loaded.records.size() == 1,
+        "warmup compiler input not restored");
+  Check(loaded.Add(record) == 0 && loaded.records.size() == 1, "warmup duplicate input changed its index");
+  LocalShaderWarmup::PipelineRecord compute;
+  compute.compute = 0;
+  loaded.AddPipeline(compute);
+  loaded.AddPipeline(compute);
+  Check(loaded.pipelines.size() == 1, "warmup pipeline deduplication");
+  compute.compute = 99;
+  loaded.AddPipeline(compute);
+  Check(loaded.pipelines.size() == 1, "warmup accepted dangling shader index");
+  auto vertex = record;
+  vertex.stage = ShaderType::Vertex;
+  BuildStageStaticKey(vertex.vertex, vertex.static_key);
+  const auto vs = loaded.Add(vertex);
+  auto pixel = record;
+  pixel.stage = ShaderType::Pixel;
+  BuildStageStaticKey(pixel.pixel, pixel.static_key);
+  const auto ps = loaded.Add(pixel);
+  LocalShaderWarmup::PipelineRecord graphics;
+  graphics.vertex = vs; graphics.pixel = ps;
+  graphics.rendering.color_count = 1;
+  graphics.rendering.color_formats[0] = vk::Format::eR8G8B8A8Unorm;
+  graphics.state.color_mask[0] = 15;
+  graphics.state.blend_enable[0] = true;
+  graphics.state.color_srcblend[0] = 19;
+  graphics.state.topology = vk::PrimitiveTopology::eTriangleList;
+  graphics.state.stencil_front.passOp = vk::StencilOp::eReplace;
+  loaded.AddPipeline(graphics);
+  Check(loaded.pipelines.size() == 2, "warmup rejected graphics pipeline");
+  LocalShaderWarmup::PipelineRecord replay;
+  LocalShaderWarmup::Reader pipeline_reader {loaded.pipelines.back()};
+  Check(LocalShaderWarmup::VisitPipeline(pipeline_reader, replay) &&
+        replay.vertex == vs && replay.pixel == ps && replay.rendering == graphics.rendering &&
+        replay.vertex_input == graphics.vertex_input && replay.state == graphics.state,
+        "warmup changed pipeline state during serialization");
+  graphics.pixel = 0;
+  loaded.AddPipeline(graphics);
+  Check(loaded.pipelines.size() == 2, "warmup accepted compute as pixel shader");
+  loaded.StartWriter();
+  record.hash = 123;
+  loaded.Add(record);
+  bool checkpoint_before_close = false;
+  for (unsigned attempt = 0; attempt < 70 && !checkpoint_before_close; ++attempt) {
+    LocalShaderWarmup::Cache observed;
+    checkpoint_before_close = observed.Open(path, "device-and-executable-A") &&
+        observed.records.size() == 4 && observed.pipelines.size() == 2;
+    if (!checkpoint_before_close) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  Check(checkpoint_before_close, "shader inputs were not checkpointed before normal exit");
+  Check(loaded.Save(), "drain asynchronous shader writer");
+  LocalShaderWarmup::Cache checkpoint;
+  Check(checkpoint.Open(path, "device-and-executable-A") && checkpoint.records.size() == 4 &&
+        checkpoint.pipelines == loaded.pipelines, "async checkpoint lost shader/pipeline order");
+  // Fail a reopen of an already populated cache: nothing from the old identity
+  // may survive a rejected file.
+  Check(!checkpoint.Open(path, "wrong-device") && checkpoint.records.empty() && checkpoint.pipelines.empty(),
+        "failed reopen retained stale warmup entries");
+  LocalShaderWarmup::Cache incompatible;
+  Check(!incompatible.Open(path, "device-and-executable-B") && incompatible.records.empty(),
+        "warmup accepted another executable or device");
+  auto truncated = loaded.records.front(); truncated.pop_back();
+  LocalShaderWarmup::Reader reader {truncated}; LocalShaderWarmup::Record rejected;
+  Check(!LocalShaderWarmup::Visit(reader, rejected), "warmup accepted truncated specialization");
+  std::fstream corrupt(path, std::ios::binary | std::ios::in | std::ios::out);
+  corrupt.seekp(-1, std::ios::end); corrupt.put(char(0xff)); corrupt.close();
+  LocalShaderWarmup::Cache damaged;
+  Check(!damaged.Open(path, "device-and-executable-A") && damaged.records.empty(),
+        "warmup accepted a corrupted compiler input");
+  std::filesystem::remove_all(directory);
+}
+#endif
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -12855,6 +12993,9 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  TestShaderWarmupCacheFiles();
+#endif
   TestResourceDescriptorClassification();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();

@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 
@@ -112,7 +113,7 @@ public:
 	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
-	void Save();
+	bool Save();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -218,6 +219,7 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	std::string                   m_driver_cache_key;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	// Pipelines remain owned by m_graphics_pipelines until this cache is destroyed.
@@ -228,6 +230,7 @@ private:
 	Common::Mutex m_mutex;
 
 	void InitializeDriverCache();
+	void WarmPipelines();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
