@@ -35,6 +35,8 @@ public:
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
+	// The guest frame number, 0 without a guest GPU (offline tools).
+	[[nodiscard]] uint64_t                  FrameNumber() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }

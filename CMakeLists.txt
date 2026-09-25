@@ -404,6 +404,7 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_kyty_full_emulator_test(xpr_replay_tests "${KYTY_TESTS_DIR}/XprReplayTests.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -748,7 +749,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
 			"${recording_generated}"
 		DEPENDS "${recording_generator}" "${vulkan_registry}" "${vulkan_hpp}"
 		VERBATIM)
-	foreach(recording_target kyty_emulator shader_recompiler_compute_tests)
+	foreach(recording_target kyty_emulator shader_recompiler_compute_tests xpr_replay_tests)
 		target_sources(${recording_target} PRIVATE
 			"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
 		target_include_directories(${recording_target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

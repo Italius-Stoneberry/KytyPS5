@@ -21,6 +21,7 @@
 #include "libs/errno.h"
 
 #include "performance-switches.h"
+#include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -521,6 +522,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	InitializePerformanceSwitches();
+	XprCapture::Initialize();
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::ProducerScope recording;
 #endif
@@ -830,6 +832,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		if (XprCapture::Enabled()) {
+			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT) {
+				XprCapture::ObserveDraw(m_draw_indirect_args_base_addr + packet[1]);
+			} else if (opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO ||
+			           opcode == Pm4::IT_DRAW_INDEX_OFFSET_2) {
+				XprCapture::ObserveDraw(0);
+			}
+		}
 		if (opcode != Pm4::IT_DRAW_INDEX_INDIRECT) m_draw_run_skip = 0;
 		if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
 			const auto consumed = TryDrawIndirectRun({packet, remaining_dw});
@@ -1803,6 +1813,10 @@ void CommandProcessor::SynchronizeGpu() {
 
 bool GuestGpu::IsGpuThread() noexcept {
 	return g_gpu_thread;
+}
+
+void GuestGpu::SetOfflineGpuThread(bool gpu_thread) noexcept {
+	g_gpu_thread = gpu_thread;
 }
 
 } // namespace Libs::Graphics

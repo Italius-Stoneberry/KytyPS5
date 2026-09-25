@@ -1205,6 +1205,122 @@ void WindowContext::CreateVulkan() {
 	presenter = std::make_unique<Presenter>(*this);
 }
 
+// Offline tools (xpr_replay_tests): the device CreateVulkan builds - same
+// extensions, features and allocator - without a window, surface or swapchain.
+bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
+	EXIT_IF(graphic_ctx.instance != nullptr || graphic_ctx.device != nullptr);
+	static vk::detail::DynamicLoader loader;
+	const auto get_instance_proc_addr =
+	    loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+	if (get_instance_proc_addr == nullptr) return false;
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+	VulkanCheckInstanceVersion();
+
+	vk::ApplicationInfo app_info {};
+	app_info.sType            = vk::StructureType::eApplicationInfo;
+	app_info.pApplicationName = "Kyty offline";
+	app_info.pEngineName      = "Kyty";
+	app_info.apiVersion       = VULKAN_TARGET_API_VERSION; // NOLINT
+	vk::InstanceCreateInfo inst_info {};
+	inst_info.sType            = vk::StructureType::eInstanceCreateInfo;
+	inst_info.pApplicationInfo = &app_info;
+	if (vk::createInstance(&inst_info, nullptr, &graphic_ctx.instance) != vk::Result::eSuccess)
+		return false;
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.instance);
+
+	std::vector<const char*> device_extensions = {
+	    VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+	    "VK_KHR_maintenance1"};
+#if !defined(__APPLE__)
+	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
+	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
+	device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+#endif
+	// The first device with the target API and a graphics+compute queue, preferring discrete.
+	auto devices = EnumerateVulkan<vk::PhysicalDevice>(
+	    "vkEnumeratePhysicalDevices", [&](uint32_t* count, vk::PhysicalDevice* values) {
+		    return graphic_ctx.instance.enumeratePhysicalDevices(count, values);
+	    });
+	uint32_t queue_family = static_cast<uint32_t>(-1);
+	for (const bool discrete_only: {true, false}) {
+		for (const auto& device: devices) {
+			vk::PhysicalDeviceProperties properties {};
+			device.getProperties(&properties);
+			if (properties.apiVersion < VULKAN_TARGET_API_VERSION ||
+			    (discrete_only && properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu))
+				continue;
+			const auto families = device.getQueueFamilyProperties();
+			for (uint32_t i = 0; i < families.size(); ++i) {
+				if ((families[i].queueFlags & vk::QueueFlagBits::eGraphics) &&
+				    (families[i].queueFlags & vk::QueueFlagBits::eCompute)) {
+					graphic_ctx.physical_device = device;
+					queue_family                = i;
+					break;
+				}
+			}
+			if (graphic_ctx.physical_device) break;
+		}
+		if (graphic_ctx.physical_device) break;
+	}
+	if (!graphic_ctx.physical_device) return false;
+
+	vk::PhysicalDevicePushDescriptorProperties push_descriptor_properties {};
+	vk::PhysicalDeviceProperties2              physical_device_properties {};
+	push_descriptor_properties.sType = vk::StructureType::ePhysicalDevicePushDescriptorProperties;
+	physical_device_properties.sType = vk::StructureType::ePhysicalDeviceProperties2;
+	physical_device_properties.pNext = &push_descriptor_properties;
+	graphic_ctx.physical_device.getProperties2(&physical_device_properties);
+	graphic_ctx.physical_device_properties = physical_device_properties.properties;
+	graphic_ctx.max_push_descriptors       = push_descriptor_properties.maxPushDescriptors;
+	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
+	const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info {
+	    .format = vk::Format::eBc1RgbaUnormBlock,
+	    .type   = vk::ImageType::e2D,
+	    .tiling = vk::ImageTiling::eOptimal,
+	    .usage  = vk::ImageUsageFlagBits::eSampled,
+	    .flags  = vk::ImageCreateFlagBits::eBlockTexelViewCompatible,
+	};
+	graphic_ctx.supports_block_texel_view =
+	    graphic_ctx.physical_device.getImageFormatProperties2(block_texel_view_info).result ==
+	    vk::Result::eSuccess;
+	{
+		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
+		    "vkEnumerateDeviceExtensionProperties",
+		    [&](uint32_t* count, vk::ExtensionProperties* values) {
+			    return graphic_ctx.physical_device.enumerateDeviceExtensionProperties(nullptr, count,
+			                                                                          values);
+		    });
+		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+			if (HasExtension(available_extensions, extension)) device_extensions.push_back(extension);
+		}
+		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
+		    HasExtension(available_extensions,
+		                 VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+	}
+	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
+	const VulkanExtensions no_layers {};
+	graphic_ctx.device = VulkanCreateDevice(graphic_ctx.physical_device, no_layers, queue_family,
+	                                        device_extensions, graphic_ctx);
+	if (graphic_ctx.device == nullptr) return false;
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	LocalVulkanRecording::Install();
+#endif
+	graphic_ctx.queue_family = queue_family;
+	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
+	return graphic_ctx.queue != nullptr && graphic_ctx.CreateAllocator();
+}
+
 void WindowContext::RefreshSurfaceCapabilities() {
 	EXIT_IF(graphic_ctx.physical_device == nullptr || surface == nullptr);
 	GetSurfaceCapabilities(graphic_ctx.physical_device, surface, surface_capabilities);

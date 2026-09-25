@@ -25,6 +25,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "native-preparation-state.h"
+#include "xpr-capture.h"
 
 #include <algorithm>
 #include <array>
@@ -345,7 +346,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		input_info.dispatch_threads_num[2]    = thread_group_z;
 	}
 
-	const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+	const uint32_t frame_num = static_cast<uint32_t>(m_context.FrameNumber());
 	const bool     large_workgroup =
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
@@ -486,6 +487,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindBuffers(bindings);
 	RebindImages(bindings);
+	if (XprCapture::Enabled() && XprCapture::IsCullProgram(program.shader_hash)) {
+		for (size_t i = 0; i < program.info.buffers.size(); ++i) {
+			if (program.info.buffers[i].written) {
+				XprCapture::LearnCullOutput(bindings.buffer_sources[i].address,
+				                            bindings.buffer_sources[i].size);
+			}
+		}
+	}
 
 	vk::Buffer indirect_buffer = nullptr;
 	uint64_t   indirect_offset = 0;

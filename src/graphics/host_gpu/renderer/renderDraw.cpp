@@ -25,11 +25,13 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "native-preparation-state.h"
+#include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-draw-packet.h"
 #include "vulkan-recording.h"
@@ -256,7 +258,7 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	    " blend=%s src=%u dst=%u comb=%u ps_tex=%d sampled=%d storage=%d ps_kill=%s target_mode0=%u"
 	    " depth_test=%s depth_write=%s depth_func=%u depth_clear=%s viewport=(%.1f,%.1f %.1fx%.1f) "
 	    "scissor=(%d,%d)-(%d,%d)\n",
-	    log_id, buffer.GetContext().GetGpu().GetFrameNum(), draw_name, RenderColorTypeName(color),
+	    log_id, buffer.GetContext().FrameNumber(), draw_name, RenderColorTypeName(color),
 	    color.desc.info.data.address, extent.width, extent.height,
 	    static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags, ctx.GetRenderTargetMask(),
 	    cc.mode, cc.op,
@@ -284,7 +286,7 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	LOGF("DrawInputState[%u]: frame=%d target=%s addr=0x%010" PRIx64
 	     " index_type=%u index_count=%u index_addr=0x%016" PRIx64
 	     " vs_resources=%d vs_buffers=%d\n",
-	     log_id, buffer.GetContext().GetGpu().GetFrameNum(), RenderColorTypeName(color),
+	     log_id, buffer.GetContext().FrameNumber(), RenderColorTypeName(color),
 	     color.desc.info.data.address, index_type_and_size, index_count,
 	     reinterpret_cast<uint64_t>(index_addr), vs_input_info.resources_num,
 	     vs_input_info.buffers_num);
@@ -1254,6 +1256,9 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& bindings = binding_storage.Get();
 	PrepareGraphicsBindingsInto(state.vs_input_info.stage, state.ps_input_info.stage,
 	                            state.ps_active, bindings);
+	if (XprCapture::g_state.pending) {
+		CaptureXprTargets(state, bindings);
+	}
 	if (!emit.direct_run.empty()) {
 		const auto safe_images = [&](const PreparedBindings& prepared) {
 			for (size_t index = 0; index < prepared.images.size(); ++index) {
@@ -1646,8 +1651,157 @@ bool RenderExecutor::TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 	return issued;
 }
+
+// XPR capture for the offline replay tests (xpr-capture.h). Starts a pending
+// capture once RefreshShaders has set up the draw's shaders; CaptureXprTargets
+// completes and writes it when the bindings and render targets are resolved.
+void RenderExecutor::CaptureXprDraw(CommandBuffer& buffer, const DrawRenderState& state,
+                                    const DrawIndexArgs& args) {
+	auto& ctx    = buffer.GetRegisters();
+	auto& sh_ctx = buffer.GetShaders();
+	auto  pending = std::make_unique<XprCapture::PendingDraw>();
+	auto& d       = *pending;
+	d.draw = {args.index_count, args.instance_count, static_cast<uint32_t>(args.base_vertex),
+	          args.first_instance, args.index_type_and_size};
+	const auto stage_buffers = [](XprCapture::StageCapture& capture) {
+		for (const auto& value: capture.resources.buffers) {
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(value);
+			const auto address    = descriptor.Base48();
+			const auto stride     = descriptor.Stride();
+			const auto requested  = stride != 0 ? uint64_t(stride) * descriptor.NumRecords()
+			                                    : uint64_t(descriptor.NumRecords());
+			const auto size = address == 0 || requested == 0
+			                      ? 0
+			                      : Libs::LibKernel::Memory::ClampRangeSize(address, requested);
+			capture.buffers.emplace_back(address, size <= (64ull << 20u) ? size : 0);
+		}
+	};
+	{
+		ShaderVertexInputInfo info;
+		ResetNativeVertexInput(info);
+		const auto params = PrepareProgram(sh_ctx.GetVs(), ctx, buffer.GetUserConfig(), info);
+		auto& r = d.vertex.record;
+		r.stage = state.vs_input_info.stage.program->stage;
+		r.hash  = params.hash;
+		r.user_data_count = static_cast<uint32_t>(params.user_data.size());
+		r.code.assign(params.code.begin(), params.code.end());
+		r.back_code.assign(params.back_code.begin(), params.back_code.end());
+		r.vertex = info;
+		BuildStageStaticKey(info, r.static_key);
+		d.vertex.user_data    = params.user_data;
+		d.vertex.code_address = params.Base();
+		d.vertex.push_start   = state.vs_input_info.stage.program->bindings.push_data_start_dword;
+		d.vertex.resources    = state.vs_input_info.stage.resources;
+		stage_buffers(d.vertex);
+	}
+	d.has_pixel = state.ps_active && state.ps_input_info.stage.program != nullptr;
+	if (d.has_pixel) {
+		std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> mapping {};
+		for (uint32_t i = 0; i < state.color_count; i++)
+			mapping[state.color_info[i].target_slot] = state.color_info[i].export_mapping;
+		ShaderPixelInputInfo info;
+		ResetNativeStageInput(info);
+		const auto params = PrepareProgram(sh_ctx.GetPs(), ctx.GetShaderRegisters(), mapping, info);
+		auto& r = d.pixel.record;
+		r.stage = ShaderType::Pixel;
+		r.hash  = params.hash;
+		r.user_data_count = static_cast<uint32_t>(params.user_data.size());
+		r.code.assign(params.code.begin(), params.code.end());
+		r.pixel = info;
+		BuildStageStaticKey(info, r.static_key);
+		d.pixel.user_data    = params.user_data;
+		d.pixel.code_address = params.Base();
+		d.pixel.push_start   = state.ps_input_info.stage.program->bindings.push_data_start_dword;
+		d.pixel.resources    = state.ps_input_info.stage.resources;
+		stage_buffers(d.pixel);
+	}
+	const auto block = [](std::vector<uint32_t>& out, const auto& value) {
+		out.resize((sizeof(value) + 3) / 4);
+		std::memcpy(out.data(), &value, sizeof(value));
+	};
+	block(d.context, ctx);
+	block(d.shaders, sh_ctx);
+	block(d.user_config, buffer.GetUserConfig());
+	// Shader map entries and the guest memory they point to.
+	const auto& vs = sh_ctx.GetVs();
+	for (const auto address: {vs.es_regs.data_addr, vs.gs_regs.data_addr, sh_ctx.GetPs().ps_regs.data_addr}) {
+		ShaderMappedData data {};
+		if (address == 0 || !ShaderLookupMappedData(address, &data) ||
+		    std::ranges::any_of(d.entries, [&](const auto& e) { return e.address == address; }))
+			continue;
+		XprCapture::ShaderEntry entry;
+		entry.address         = address;
+		entry.type            = static_cast<uint32_t>(data.type);
+		entry.code_size       = data.code_size_bytes;
+		entry.scratch         = data.scratch_size_dwords;
+		entry.semantics_count = data.num_input_semantics;
+		entry.semantics       = reinterpret_cast<uint64_t>(data.input_semantics);
+		entry.user_data       = reinterpret_cast<uint64_t>(data.user_data);
+		d.entries.push_back(entry);
+		uint64_t window = data.code_size_bytes;
+		const auto* code = reinterpret_cast<const uint32_t*>(address);
+		if (code[0] == 0xBEEB03FFu) window = std::max<uint64_t>(window, (uint64_t(code[1]) + 1) * 8 + 32);
+		d.exact.emplace_back(address, window);
+		if (data.input_semantics != nullptr && data.num_input_semantics != 0)
+			d.exact.emplace_back(entry.semantics, uint64_t(data.num_input_semantics) * sizeof(ShaderSemantic));
+		if (data.user_data != nullptr) {
+			d.exact.emplace_back(entry.user_data, sizeof(ShaderUserData));
+			const auto& ud = *data.user_data;
+			if (ud.direct_resource_offset != nullptr && ud.direct_resource_count != 0)
+				d.exact.emplace_back(reinterpret_cast<uint64_t>(ud.direct_resource_offset),
+				                     uint64_t(ud.direct_resource_count) * sizeof(uint16_t));
+			for (uint32_t i = 0; i < 4; ++i)
+				if (ud.sharp_resource_offset[i] != nullptr && ud.sharp_resource_count[i] != 0)
+					d.exact.emplace_back(reinterpret_cast<uint64_t>(ud.sharp_resource_offset[i]),
+					                     uint64_t(ud.sharp_resource_count[i]) * sizeof(ShaderSharp));
+		}
+	}
+	d.reads = std::move(XprCapture::g_state.reads);
+	XprCapture::g_state.pending = std::move(pending);
+}
+
+void RenderExecutor::CaptureXprTargets(const DrawRenderState& state,
+                                       const GraphicsBindings& bindings) {
+	auto pending = std::move(XprCapture::g_state.pending);
+	if (!pending) return;
+	auto&      d   = *pending;
+	using Kind     = XprCapture::FillKind;
+	const auto add = [&](std::vector<XprCapture::Fill>& out, const GuestRange& range, Kind kind,
+	                     uint32_t value = 0) {
+		if (!range.Empty()) out.push_back({range.address, range.size, kind, value});
+	};
+	for (const auto* prepared: {&bindings.vertex, bindings.pixel ? &*bindings.pixel : nullptr}) {
+		if (prepared == nullptr) continue;
+		for (const auto& image: prepared->images) {
+			add(d.fills, image.desc.info.data, Kind::Texture);
+			add(d.fills, image.desc.info.stencil, Kind::Texture);
+			add(d.fills, image.desc.info.metadata.range, Kind::Metadata);
+		}
+	}
+	for (uint32_t i = 0; i < state.color_count; ++i) {
+		const auto& info = state.color_info[i].desc.info;
+		add(d.fills, info.data, Kind::ColorTarget);
+		add(d.fills, info.metadata.range, Kind::Metadata);
+		add(d.targets, info.data, Kind::ColorTarget);
+	}
+	if (state.depth_info.image_id) {
+		const auto& info = state.depth_info.desc.info;
+		const auto  op   = state.depth_info.depth_compare_op;
+		const bool  far_is_one = op == vk::CompareOp::eLess || op == vk::CompareOp::eLessOrEqual;
+		const bool  d16 = info.pixel_format == vk::Format::eD16Unorm || info.pixel_format == vk::Format::eD16UnormS8Uint;
+		const uint32_t far_word = !far_is_one ? 0u : d16 ? 0xffffffffu : 0x3f800000u;
+		add(d.fills, info.data, Kind::DepthTarget, far_word);
+		add(d.fills, info.stencil, Kind::Stencil);
+		add(d.fills, info.metadata.range, Kind::Metadata);
+		add(d.targets, info.data, Kind::DepthTarget, far_word);
+	}
+	XprCapture::WriteDraw(d);
+	XprCapture::Written();
+}
+
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
+	XprCapture::g_state.pending.reset(); // a capture never spans two draws
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1741,7 +1895,23 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	RefreshShaders(buffer, draw, true, state);
+	if (XprCapture::Enabled() && XprCapture::g_state.current_xpr &&
+	    XprCapture::g_state.capture_this) {
+		auto& reads = XprCapture::g_state.reads;
+		reads.clear();
+		auto observe = [&](uint64_t address, uint64_t size) { reads.emplace_back(address, size); };
+		{
+			ShaderReadObserver observer(
+			    [](void* userdata, uint64_t address, uint64_t size) {
+				    (*static_cast<decltype(observe)*>(userdata))(address, size);
+			    },
+			    &observe);
+			RefreshShaders(buffer, draw, true, state);
+		}
+		CaptureXprDraw(buffer, state, args);
+	} else {
+		RefreshShaders(buffer, draw, true, state);
+	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, args.index_type_and_size,
 	                     args.index_addr);

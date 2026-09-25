@@ -41,6 +41,9 @@ public:
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
+	// Offline tools (xpr_replay_tests) run the renderer on their own thread.
+	static void SetOfflineGpuThread(bool gpu_thread) noexcept;
+
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;

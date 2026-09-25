@@ -145,6 +145,9 @@ struct VulkanImage {
 
 
 
+// Offline tools: the emulator's device without a window (vulkanWindow.cpp).
+bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx);
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICCONTEXT_H_ */

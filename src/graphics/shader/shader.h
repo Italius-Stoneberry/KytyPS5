@@ -275,6 +275,8 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Offline capture: the registered data for a shader address, if any.
+bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
