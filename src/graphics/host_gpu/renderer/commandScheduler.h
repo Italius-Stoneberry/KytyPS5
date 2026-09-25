@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 
@@ -30,7 +31,7 @@ public:
 	void           FlushAndWait();
 	void           Finish();
 	// Finish a complete dispatch; may submit, but never waits for the GPU.
-	void CompleteDispatch();
+	void           CompleteDispatch();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
@@ -91,9 +92,12 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
-	uint32_t m_recorded_dispatches = 0;
+	uint32_t                     m_recorded_dispatches = 0;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
+	// Count of live entries in m_pending_operations, updated under
+	// m_operation_mutex and read lock-free as a "nothing to retire" hint.
+	std::atomic<uint32_t> m_pending_operation_count {0};
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;

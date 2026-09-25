@@ -5,8 +5,16 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <optional>
+
+extern "C" {
+// 0: refresh the master timeline before every drain attempt.
+// 1: prove the pending-operation queue empty before the timeline query and the
+//    operation lock. Draws and dispatches call this with nothing to retire.
+volatile std::atomic<uint32_t> kyty_local_pending_drain_mode {0};
+}
 
 namespace Libs::Graphics {
 
@@ -223,6 +231,14 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	// The pending queue is empty for the large majority of draws and dispatches.
+	// Refresh() issues a Vulkan timeline query and the drain takes the operation
+	// mutex, so let an atomic count prove there is nothing to retire first. The
+	// count is only a hint: the queue is still re-checked under the lock.
+	if (kyty_local_pending_drain_mode.load(std::memory_order_relaxed) != 0 &&
+	    m_pending_operation_count.load(std::memory_order_acquire) == 0) {
+		return;
+	}
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
@@ -234,6 +250,7 @@ void CommandScheduler::PopPendingOperations() {
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
+			m_pending_operation_count.fetch_sub(1, std::memory_order_relaxed);
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
@@ -246,6 +263,7 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		m_pending_operations.push({std::move(operation), CurrentTick()});
+		m_pending_operation_count.fetch_add(1, std::memory_order_release);
 		return;
 	}
 	if (g_deferred_callback_scheduler == this) {
