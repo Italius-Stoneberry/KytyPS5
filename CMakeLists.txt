@@ -738,6 +738,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
 	if(BUILD_TESTING)
 		add_test(NAME specialization_guard
 			COMMAND shader_recompiler_compute_tests --specialization-guard-only)
+		add_test(NAME native_pipeline_index
+			COMMAND shader_recompiler_compute_tests --native-pipeline-index-only)
 	endif()
 endif()
 

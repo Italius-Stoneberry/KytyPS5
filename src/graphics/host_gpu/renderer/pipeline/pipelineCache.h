@@ -187,7 +187,7 @@ private:
 	};
 
 	struct GraphicsPipelineKeyHash {
-		std::size_t operator()(const GraphicsPipelineKey& key) const {
+		static std::size_t Prefix(const GraphicsPipelineKey& key) {
 			std::size_t hash = 0;
 			PipelineKeyHash::MixRendering(hash, key.rendering);
 			PipelineKeyHash::Mix(hash, key.vs_shader_id);
@@ -202,9 +202,16 @@ private:
 				PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].offset);
 				PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].binding);
 			}
+			return hash;
+		}
+		std::size_t operator()(const GraphicsPipelineKey& key) const {
+			auto hash = Prefix(key);
 			PipelineKeyHash::MixStaticParams(hash, key.static_params);
 			return hash;
 		}
+	};
+	struct NativeGraphicsPipelineKeyHash {
+		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
 
 	GraphicContext&               m_graphics;
@@ -213,6 +220,10 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// Pipelines remain owned by m_graphics_pipelines until this cache is destroyed.
+	// Both indices use the complete GraphicsPipelineKey equality predicate.
+	std::unordered_map<GraphicsPipelineKey, Pipeline*, NativeGraphicsPipelineKeyHash>
+	    m_native_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 

@@ -12813,7 +12813,7 @@ OpFunctionEnd
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckRasterization(bool depth_feedback, bool lod_stats = false, uint32_t lod_extent = 8, bool packed_vertex_color = false, bool lod_subgroup = false) {
+  void CheckRasterization(bool depth_feedback, bool lod_stats = false, uint32_t lod_extent = 8, bool packed_vertex_color = false, bool lod_subgroup = false, bool native_index_test = false) {
     const char *name = packed_vertex_color ? "PackedFloatVertexColor" : lod_stats ? "GpuLodStatsFeedback" :
         (depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization");
     const uint32_t extent = lod_stats ? lod_extent : (depth_feedback ? 8 : 32);
@@ -12977,9 +12977,28 @@ OpFunctionEnd
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      return context.GetPipelineCache().CreateGraphicsPipeline(
+      const auto lookup = [&]() -> PipelineCache::Pipeline& {
+        return context.GetPipelineCache().CreateGraphicsPipeline(
           std::span{&color, 1u}, depth, vertex, scheduler.Current(), &pixel,
           vk::PrimitiveTopology::eTriangleList, false, vertex_shader, pixel_shader);
+      };
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+      if (native_index_test) {
+        const auto previous = kyty_local_pipeline_index_mode.load(std::memory_order_relaxed);
+        kyty_local_pipeline_index_mode.store(0, std::memory_order_relaxed);
+        auto& reference = lookup();
+        for (const auto mode: {1u, 0u, 1u}) {
+          kyty_local_pipeline_index_mode.store(mode, std::memory_order_relaxed);
+          Require(name, "native pipeline index identity", &lookup() == &reference,
+                  "switching the lookup index selected a different pipeline object");
+        }
+        kyty_local_pipeline_index_mode.store(previous, std::memory_order_relaxed);
+        return reference;
+      }
+#else
+      (void)native_index_test;
+#endif
+      return lookup();
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected) {
@@ -30585,6 +30604,17 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   CheckDrawRunArguments();
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  if (argc == 2 && std::strcmp(argv[1], "--native-pipeline-index-only") == 0) {
+    VulkanHarness vulkan;
+    // Every context starts empty, then switches indices across repeated keys,
+    // polygon/provoking-vertex changes, depth feedback and packed vertex formats.
+    vulkan.CheckRasterization(false, false, 8, false, false, true);
+    vulkan.CheckRasterization(true, false, 8, false, false, true);
+    vulkan.CheckRasterization(false, false, 8, true, false, true);
+    return 0;
+  }
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--texture-resolve-cache-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTextureResolutionCache();

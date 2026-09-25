@@ -19,6 +19,7 @@
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 #include "native-preparation-scratch.h"
+#include "native-resource-state.h"
 
 #include <algorithm>
 #include <array>
@@ -36,6 +37,11 @@
 #include <utility>
 #include <vector>
 #include <xxhash.h>
+
+extern "C" {
+// 1: find graphics pipelines through a block-hashed index of the full key.
+volatile std::atomic<uint32_t> kyty_local_pipeline_index_mode {0};
+}
 
 namespace Libs::Graphics {
 
@@ -720,6 +726,14 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+std::size_t PipelineCache::NativeGraphicsPipelineKeyHash::operator()(
+    const GraphicsPipelineKey& key) const {
+	// These exact 166 bytes already define static-state equality. Do not hash the
+	// other structures' padding: their equality compares members instead.
+	return XXH3_64bits_withSeed(&key.static_params, sizeof(key.static_params),
+	                           GraphicsPipelineKeyHash::Prefix(key));
+}
+
 PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
@@ -859,7 +873,17 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
+	const bool indexed = kyty_local_pipeline_index_mode.load(std::memory_order_relaxed) != 0;
+	if (indexed) {
+		if (auto found = m_native_graphics_pipelines.find(key);
+		    found != m_native_graphics_pipelines.end()) {
+			return *found->second;
+		}
+	}
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		if (indexed) {
+			m_native_graphics_pipelines.emplace(key, iter->second.get());
+		}
 		return *iter->second;
 	}
 
@@ -885,6 +909,9 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	if (indexed) {
+		m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+	}
 
 	return *iter->second;
 }
