@@ -718,7 +718,8 @@ endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
 
-# Linux x86_64 only: the native resource preparation tests.
+# Linux x86_64 only: the native resource preparation tests (the ahead-of-time
+# SRT library is loaded with dlopen).
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	foreach(native_resource_target kyty_emulator shader_recompiler_compute_tests shader_cfg_tests
 			resource_tracking_tests resource_materialization_tests)

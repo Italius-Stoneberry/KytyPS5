@@ -2,6 +2,7 @@
 #define KYTY_LINEAR_SRT_H
 
 #include "common/abi.h"
+#include "SrtAotAbi.h"
 #if defined(__x86_64__) || defined(_M_X64)
 #ifndef XBYAK_NO_EXCEPTION
 #define XBYAK_NO_EXCEPTION
@@ -45,6 +46,8 @@ struct LinearSrtPlan {
 	// Windows. C++ helpers bridge to the host ABI of reader callbacks.
 	using Function    = KYTY_SYSV_ABI bool (*)(const SrtRuntime*, uint64_t*);
 	Function function = nullptr;
+    KytySrtAot::Function aot_function = nullptr;
+    KytySrtAot::MaterializeFunction aot_materialize = nullptr;
 #if defined(__x86_64__) || defined(_M_X64)
 	std::unique_ptr<Xbyak::CodeGenerator> code;
 #endif
@@ -330,6 +333,31 @@ class LinearSrtCompiler {
 					node.args[0]   = arg(0);
 					break;
 				}
+                case ValueOpcode::BitFieldUExtract: {
+                    const auto offset = inst->Arg(1).Resolve();
+                    const auto width = inst->Arg(2).Resolve();
+                    if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
+                        !width.IsImmediate() || width.GetType() != Type::U32 ||
+                        offset.U32() > 32 || width.U32() > 32 - offset.U32()) return Invalid;
+                    const auto input = arg(0);
+                    if (input == Invalid) return Invalid;
+                    const auto mask = width.U32() == 32 ? UINT32_MAX :
+                                      width.U32() == 0 ? 0u : (1u << width.U32()) - 1;
+                    const auto shift_amount = Add(Value(offset.U32()), clean, depth + 1);
+                    const auto mask_value = Add(Value(mask), clean, depth + 1);
+                    if (shift_amount == Invalid || mask_value == Invalid) return Invalid;
+                    // Lower to existing integer nodes so both Xbyak and AOT use
+                    // the same semantics. Even width zero still evaluates input.
+                    Node shift;
+                    shift.kind = Kind::Binary; shift.op = ValueOpcode::ShiftRightLogical32;
+                    shift.clean = clean; shift.args[0] = input; shift.args[1] = shift_amount;
+                    const uint32_t shifted = result.nodes.size(); result.nodes.push_back(shift);
+                    Node bits;
+                    bits.kind = Kind::Binary; bits.op = ValueOpcode::BitwiseAnd32;
+                    bits.clean = clean; bits.args[0] = shifted; bits.args[1] = mask_value;
+                    const uint32_t extracted = result.nodes.size(); result.nodes.push_back(bits);
+                    return alias(extracted);
+                }
 				case ValueOpcode::BitwiseNot32:
 				case ValueOpcode::LogicalNot:
 					node.kind    = Kind::Unary;

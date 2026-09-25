@@ -1,4 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+#include "native-resource-state.h"
+#endif
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -3401,6 +3404,12 @@ void TestLinearSrtReads() {
 
 
 int main(int argc, char** argv) {
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  // The same cases through the compiled SRT paths.
+  if (const char* mode = std::getenv("KYTY_SRT_NATIVE")) {
+    kyty_local_srt_native_mode.store(std::strtoul(mode, nullptr, 10));
+  }
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--benchmark-srt") == 0) {
     Fixture fixture;
     const auto input = fixture.UserData(0);

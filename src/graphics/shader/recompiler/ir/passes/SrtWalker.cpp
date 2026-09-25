@@ -3,6 +3,8 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
+#include "native-resource-aot.h"
+#include "native-resource-runtime.h"
 
 #include <algorithm>
 #include <bit>
@@ -13,6 +15,7 @@
 #include <unordered_set>
 
 extern "C" {
+volatile std::atomic<uint32_t> kyty_local_srt_native_mode {0};
 volatile std::atomic<uint32_t> kyty_local_preparation_scratch_mode {0};
 }
 
@@ -1272,6 +1275,7 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
         if(std::ranges::any_of(root->control_variants,[&](const auto& variant){return variant->active_sources==active;}))continue;
         auto leaf=std::make_shared<LinearSrtPlan>();
         if(!LinearSrtCompiler(program,*leaf,active).Build())return {};
+        PrepareLinearSrtAot(*leaf);
         root->control_variants.push_back(std::move(leaf));
     }
     return root;
@@ -1282,7 +1286,10 @@ void BuildLinearSrtPlan(ResourcePlan& program) {
     program.linear_srt.reset();
 #if defined(__x86_64__) || defined(_M_X64)
     auto compiled=std::make_shared<LinearSrtPlan>();
-    if (LinearSrtCompiler(program,*compiled).Build()) program.linear_srt=std::move(compiled);
+    if (LinearSrtCompiler(program,*compiled).Build()) {
+        PrepareLinearSrtAot(*compiled);
+        program.linear_srt=std::move(compiled);
+    }
     else program.linear_srt=BuildControlledLinearSrt(program);
 #endif
 }
@@ -1293,7 +1300,7 @@ static bool LinearMaskMatches(std::span<const uint8_t> a,std::span<const uint8_t
     return true;
 }
 
-static bool EvaluateLinearSrt(const LinearSrtPlan& plan,const SrtRuntime& runtime,
+static bool EvaluateLinearSrtOriginal(const LinearSrtPlan& plan,const SrtRuntime& runtime,
                              std::vector<DescriptorValue>& results,std::vector<uint32_t>& flat,
                              std::vector<uint8_t>& active_sources) {
     // A separate lease for each invocation also protects against reader reentry.
@@ -1306,7 +1313,11 @@ static bool EvaluateLinearSrt(const LinearSrtPlan& plan,const SrtRuntime& runtim
     } recycle{pool,values};
     values.resize(plan.nodes.size());
     if(!plan.function(&runtime,values.data())) return false;
-    std::vector<DescriptorValue> evaluated(plan.descriptor_sizes.size());
+    NativePreparationScratch<LocalNativeResource::OutputWorkspace> output_storage;
+    auto& evaluated = output_storage.Get().evaluated;
+    auto& flattened = output_storage.Get().flattened;
+    evaluated.assign(plan.descriptor_sizes.size(), {});
+    flattened.assign(plan.flat_words.size(), 0u);
     size_t cursor=0;
     for(size_t i=0;i<evaluated.size();++i) {
         auto& output=evaluated[i];output.dword_count=plan.descriptor_sizes[i];
@@ -1315,13 +1326,19 @@ static bool EvaluateLinearSrt(const LinearSrtPlan& plan,const SrtRuntime& runtim
             output.dwords[j]=node==UINT32_MAX ? 0u : static_cast<uint32_t>(values[node]);
         }
     }
-    std::vector<uint32_t> flattened(plan.flat_words.size());
     for(size_t i=0;i<flattened.size();++i)
         if(plan.flat_words[i]!=UINT32_MAX)flattened[i]=static_cast<uint32_t>(values[plan.flat_words[i]]);
-    results=std::move(evaluated);flat=std::move(flattened);
+    results.swap(evaluated);flat.swap(flattened);
     if(plan.active_sources.empty())active_sources.assign(plan.active_count,1u);
     else active_sources=plan.active_sources;
     return true;
+}
+
+static bool EvaluateLinearSrt(const LinearSrtPlan& plan,const SrtRuntime& runtime,
+                             std::vector<DescriptorValue>& results,std::vector<uint32_t>& flat,
+                             std::vector<uint8_t>& active_sources) {
+    if (const auto native = LocalNativeResource::Try(plan, runtime, results, flat, active_sources)) return *native;
+    return EvaluateLinearSrtOriginal(plan, runtime, results, flat, active_sources);
 }
 
 

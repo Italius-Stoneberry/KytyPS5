@@ -23,6 +23,7 @@ inline void InitializePerformanceSwitches() {
 	};
 	const std::array switches {
 	    // Shader resource preparation.
+	    Switch {"KYTY_SRT_NATIVE", &kyty_local_srt_native_mode},
 	    Switch {"KYTY_PREPARATION_SCRATCH", &kyty_local_preparation_scratch_mode},
 	};
 	std::string enabled;
