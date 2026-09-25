@@ -262,6 +262,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (image.registered || image.info.data.Empty()) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
+	m_resolution_epoch.fetch_add(1, std::memory_order_release);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
@@ -279,6 +280,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
+	m_resolution_epoch.fetch_add(1, std::memory_order_release);
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
@@ -1431,6 +1433,30 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		TouchImage(image);
 	}
 	return result;
+}
+
+bool TextureCache::TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t epoch) {
+	std::scoped_lock lock {m_lock};
+	if (m_scheduler.Current().IsInvalid() || epoch == 0 ||
+	    epoch != m_resolution_epoch.load(std::memory_order_relaxed) ||
+	    desc.type != BindingType::Texture || desc.info.data.Empty() || desc.info.IsDepth() ||
+	    desc.info.HasMetadata() || desc.info.HasStencil() ||
+	    desc.info.tile_mode == Prospero::TileMode::kDepth) {
+		return false;
+	}
+	auto* image = m_slot_images.try_get(id);
+	if (image == nullptr || !image->registered || image->depth_id ||
+	    image->binding.needs_rebind || image->info.IsDepth() || image->info.HasMetadata() ||
+	    image->info.HasStencil() || !SameBacking(image->info, desc.info, true) ||
+	    !(image->info.resources == desc.info.resources)) {
+		return false;
+	}
+	// The caller recorded this owner after an ordinary lookup, without an intervening
+	// registration change. A new compatible alias also changes the epoch, so it cannot
+	// silently take precedence over the cached owner. Subresource/format remaps fall back.
+	image->tick_accessed_last = m_scheduler.CurrentTick();
+	TouchImage(*image);
+	return true;
 }
 
 void TextureCache::UpdateImage(ImageId id) {

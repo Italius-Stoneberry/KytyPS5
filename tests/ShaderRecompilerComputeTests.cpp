@@ -401,6 +401,13 @@ struct RenderExecutorTestAccess {
     return executor.ResolveTexture(resource, value);
   }
 
+  static TextureBinding
+  ResolveTextureUncached(RenderExecutor &executor,
+                         const ShaderRecompiler::IR::ImageResource &resource,
+                         const ShaderRecompiler::IR::DescriptorValue &value) {
+    return executor.ResolveTextureUncached(resource, value);
+  }
+
   static auto PrepareGraphicsBindings(RenderExecutor &executor,
                                       const ShaderStageRuntime &vertex,
                                       const ShaderStageRuntime &pixel,
@@ -8731,8 +8738,10 @@ public:
                                  vk::Extent3D extent = {1, 1, 1}) {
     auto &scheduler = context.GetCommandScheduler();
     auto &image = context.GetTextureCache().GetImage(id);
-    const auto bytes = image.info.bytes_per_block * extent.width *
-                       extent.height * extent.depth;
+    const auto block_side = image.info.IsBlock() ? 4u : 1u;
+    const auto bytes = image.info.bytes_per_block *
+                       ((extent.width + block_side - 1) / block_side) *
+                       ((extent.height + block_side - 1) / block_side) * extent.depth;
     auto probe = CreateHostBuffer(name, bytes,
                                  vk::BufferUsageFlagBits::eTransferDst, {});
     scheduler.Current().EndRendering();
@@ -9520,6 +9529,184 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "depth-tiled color allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckTextureResolutionCache(bool use_cache = true) {
+    constexpr const char *name = "TextureResolutionCache";
+    constexpr uintptr_t base = 0x0000000203600000ull;
+    constexpr uint64_t allocation_size = 0x180000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "descriptor discovery direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "descriptor discovery fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &resources = context.GetGpuResources();
+      auto &texture_cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+
+      // The virtual-texture atlas is written as raw BC3 blocks, then sampled as BC3.
+      constexpr uint64_t block_alias_address = base + 0xf0000;
+      constexpr std::array<uint32_t, 4> block_alias_data{
+          0x01234567u, 0x89abcdefu, 0xfedcba98u, 0x76543210u};
+      const auto resolve_block_alias = [&](bool compressed) {
+        const uint32_t side = compressed ? 256 : 64;
+        const auto format = compressed ? Prospero::BufferFormat::kBc3UNorm
+                                       : Prospero::BufferFormat::k32_32_32_32UInt;
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        value.dwords = {static_cast<uint32_t>(block_alias_address >> 8u),
+                        (static_cast<uint32_t>(format) << 20u) | (3u << 30u),
+                        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+                        0x90900facu, 0, 0x00700000u, 0, 0};
+        ShaderRecompiler::IR::ImageResource resource{};
+        resource.resource_class = compressed
+            ? ShaderRecompiler::IR::ImageResourceClass::Sampled
+            : ShaderRecompiler::IR::ImageResourceClass::Storage;
+        resource.numeric_class = compressed ? Prospero::TextureNumericClass::Float
+                                            : Prospero::TextureNumericClass::Uint;
+        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        resource.read = compressed;
+        resource.written = !compressed;
+        return use_cache ? RenderExecutorTestAccess::ResolveTexture(executor, resource, value)
+                         : RenderExecutorTestAccess::ResolveTextureUncached(executor, resource, value);
+      };
+      auto raw_blocks = resolve_block_alias(false);
+      (void)texture_cache.FindTexture(raw_blocks.image_id, raw_blocks.desc);
+      auto &raw_blocks_native = texture_cache.GetImage(raw_blocks.image_id);
+      raw_blocks_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                vk::AccessFlagBits2::eTransferWrite, {},
+                                scheduler.Current().Handle());
+      vk::ClearColorValue block_clear{};
+      std::copy(block_alias_data.begin(), block_alias_data.end(),
+                block_clear.uint32.begin());
+      const vk::ImageSubresourceRange block_range{
+          vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+      scheduler.Current().Handle().clearColorImage(
+          raw_blocks_native.backing.image, vk::ImageLayout::eTransferDstOptimal,
+          &block_clear, 1, &block_range);
+      texture_cache.MarkGpuWritten(raw_blocks.image_id);
+      auto compressed_blocks = resolve_block_alias(true);
+      (void)texture_cache.FindTexture(compressed_blocks.image_id,
+                                      compressed_blocks.desc);
+      auto raw_blocks_again = resolve_block_alias(false);
+      Require(name, "compressed atlas storage reuse",
+              compressed_blocks.image_id != raw_blocks.image_id &&
+                  raw_blocks_again.image_id == compressed_blocks.image_id &&
+                  texture_cache.FindTexture(raw_blocks_again.image_id,
+                                            raw_blocks_again.desc) != nullptr,
+              "BC3 sampling replaced the GPU atlas on its next raw-block write");
+      Require(name, "compressed atlas download",
+              TextureCacheTestAccess::TryDownload(texture_cache,
+                                                  raw_blocks_again.image_id),
+              "the retained BC3 atlas could not publish its native contents");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      const auto *block_words = reinterpret_cast<const uint32_t *>(block_alias_address);
+      Require(name, "compressed atlas GPU contents",
+              std::equal(block_alias_data.begin(), block_alias_data.end(), block_words) &&
+                  std::equal(block_alias_data.begin(), block_alias_data.end(),
+                             block_words + 0x10000 / sizeof(uint32_t) - 4),
+              "compressed atlas aliases reloaded stale CPU bytes over GPU-written blocks");
+
+      // Repeated T# resolution may cache identity, but must still refresh CPU
+      // contents and rediscover an owner after any registration mutation.
+      auto cached_blocks = resolve_block_alias(true);
+      cached_blocks = resolve_block_alias(true);
+      cached_blocks = resolve_block_alias(true);
+      Require(name, "sampled identity proof",
+              texture_cache.TryReuseSampledImage(cached_blocks.image_id, cached_blocks.desc,
+                                                texture_cache.ResolutionEpoch()),
+              "ordinary sampled-color identity could not be reused");
+      auto rejected_desc = cached_blocks.desc;
+      rejected_desc.type = TextureCache::BindingType::Storage;
+      Require(name, "storage excluded",
+              !texture_cache.TryReuseSampledImage(cached_blocks.image_id, rejected_desc,
+                                                 texture_cache.ResolutionEpoch()),
+              "sampled identity proof accepted a storage binding");
+      rejected_desc = cached_blocks.desc;
+      rejected_desc.info.metadata.kind = ImageMetadataKind::Dcc;
+      Require(name, "metadata excluded",
+              !texture_cache.TryReuseSampledImage(cached_blocks.image_id, rejected_desc,
+                                                 texture_cache.ResolutionEpoch()),
+              "sampled identity proof accepted metadata");
+      rejected_desc = cached_blocks.desc;
+      ++rejected_desc.info.resources.levels;
+      Require(name, "subresource shape excluded",
+              !texture_cache.TryReuseSampledImage(cached_blocks.image_id, rejected_desc,
+                                                 texture_cache.ResolutionEpoch()),
+              "sampled identity proof accepted a changed resource shape");
+      texture_cache.GetImage(cached_blocks.image_id).binding.needs_rebind = true;
+      Require(name, "pending rebind excluded",
+              !texture_cache.TryReuseSampledImage(cached_blocks.image_id, cached_blocks.desc,
+                                                 texture_cache.ResolutionEpoch()),
+              "sampled identity proof ignored pending rediscovery");
+      texture_cache.GetImage(cached_blocks.image_id).binding.needs_rebind = false;
+      (void)resources.InvalidateMemory(block_alias_address, 0x10000);
+      std::fill_n(reinterpret_cast<uint32_t *>(block_alias_address),
+                  0x10000 / sizeof(uint32_t), 0x11111111u);
+      cached_blocks = resolve_block_alias(true);
+      (void)texture_cache.FindTexture(cached_blocks.image_id, cached_blocks.desc);
+      Require(name, "cached sampled CPU update",
+              ReadCachedTexel(name, context, cached_blocks.image_id, {}, {4, 4, 1}) ==
+                  std::vector<u32>(4, 0x11111111u),
+              "cached sampled identity skipped fresh CPU contents");
+
+      const auto before_alias_epoch = texture_cache.ResolutionEpoch();
+      const auto alias_info = texture_cache.GetImage(cached_blocks.image_id).info;
+      const auto alias = TextureCacheTestAccess::InsertImage(texture_cache, alias_info);
+      Require(name, "new compatible owner invalidates prior identity",
+              !texture_cache.TryReuseSampledImage(cached_blocks.image_id, cached_blocks.desc,
+                                                 before_alias_epoch),
+              "new compatible owner did not revoke a prior resolution");
+      cached_blocks = resolve_block_alias(true);
+      Require(name, "new compatible owner takes lookup precedence",
+              cached_blocks.image_id == alias,
+              "cached resolution masked a newly registered compatible owner");
+      (void)texture_cache.FindTexture(cached_blocks.image_id, cached_blocks.desc);
+      Require(name, "replacement contents",
+              ReadCachedTexel(name, context, cached_blocks.image_id, {}, {4, 4, 1}) ==
+                  std::vector<u32>(4, 0x11111111u),
+              "new compatible owner lost current CPU contents");
+
+      const auto previous_epoch = texture_cache.ResolutionEpoch();
+      const auto replacement_info = texture_cache.GetImage(cached_blocks.image_id).info;
+      texture_cache.UnmapMemory(block_alias_address, 0x10000);
+      const auto replacement = TextureCacheTestAccess::InsertImage(texture_cache, replacement_info);
+      const auto rediscovered = resolve_block_alias(true);
+      Require(name, "cached sampled owner replacement",
+              texture_cache.ResolutionEpoch() != previous_epoch &&
+                  rediscovered.image_id == replacement,
+              "cached sampled identity retained a retired owner");
+
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "cache test mapping release failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0, "cache test allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -30394,6 +30581,16 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   CheckDrawRunArguments();
+  if (argc == 2 && std::strcmp(argv[1], "--texture-resolve-cache-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureResolutionCache();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-resolve-uncached-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureResolutionCache(false);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--native-dispatch-indirect-only") == 0) {
 	  VulkanHarness vulkan;
 	  vulkan.CheckNativeDispatchIndirect();

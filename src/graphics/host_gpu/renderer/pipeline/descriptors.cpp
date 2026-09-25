@@ -571,8 +571,50 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
+// Sampled-texture resolutions, keyed by resource and descriptor words and valid
+// while the texture cache's resolution epoch is unchanged.
+struct RenderExecutor::TextureResolveCache {
+	struct Entry {
+		ShaderRecompiler::IR::DescriptorValue value;
+		ShaderRecompiler::IR::ImageResource   resource;
+		TextureBinding                        binding;
+		uint64_t                              epoch = 0;
+	};
+	std::array<Entry, 4096> entries;
+};
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	if (resource.written || resource.atomic || resource.depth_compare ||
+	    resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+		return ResolveTextureUncached(resource, value);
+	}
+	if (!m_texture_resolve_cache) {
+		m_texture_resolve_cache = std::make_shared<TextureResolveCache>();
+	}
+	uint64_t hash = resource.source ^ (uint64_t {resource.first_use_pc} << 32u);
+	for (const auto word: value.dwords) {
+		hash = (hash ^ word) * 0x9e3779b97f4a7c15ull;
+	}
+	auto&      entry       = m_texture_resolve_cache->entries[(hash ^ (hash >> 32u)) & 4095u];
+	auto&      cache       = m_context.GetTextureCache();
+	const bool key_matches = entry.epoch && entry.value == value && entry.resource == resource;
+	if (key_matches &&
+	    cache.TryReuseSampledImage(entry.binding.image_id, entry.binding.desc, entry.epoch)) {
+		return entry.binding;
+	}
+	const auto epoch  = cache.ResolutionEpoch();
+	auto       result = ResolveTextureUncached(resource, value);
+	// Discovery may insert/merge an owner. Publish only after a lookup with stable identity.
+	if (cache.TryReuseSampledImage(result.image_id, result.desc, epoch)) {
+		entry = {value, resource, result, epoch};
+	}
+	return result;
+}
+
+TextureBinding RenderExecutor::ResolveTextureUncached(
+    const ShaderRecompiler::IR::ImageResource& resource,
+    const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {

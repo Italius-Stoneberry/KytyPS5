@@ -608,6 +608,8 @@ if(BUILD_TESTING)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
 
+	add_test(NAME texture_resolution_cache
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-resolve-cache-only)
 	add_test(NAME texture_cache_layered_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
 	add_test(NAME host_image_allocation

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <unordered_set>
@@ -177,6 +178,9 @@ public:
 	                    std::span<PreparedBindings* const> bindings, bool compute_chain = false);
 
 private:
+	struct TextureResolveCache;
+	std::shared_ptr<TextureResolveCache> m_texture_resolve_cache;
+
 	bool TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer, std::span<const DrawIndexArgs> draws,
 	                     std::span<const uint64_t> argument_addresses);
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
@@ -189,6 +193,9 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] TextureBinding ResolveTextureUncached(
+	    const ShaderRecompiler::IR::ImageResource& resource,
+	    const ShaderRecompiler::IR::DescriptorValue& value);
 	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	                                                       const ShaderStageRuntime& pixel,
 	                                                       bool                      pixel_active);
