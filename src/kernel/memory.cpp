@@ -926,6 +926,17 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 }
 
+	if (!data || size < 8 || size > 64 || !g_gpu_resources || !Graphics::GuestGpu::IsGpuThread() ||
+	    !IsGpuAddressRange(vaddr, size))
+		return false;
+	if (!clean && !g_gpu_resources->HasReadWatchers(vaddr, size)) {
+		std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+		return true;
+	}
+	return TryReadGpuCleanBackingToHost(vaddr, data, size);
+	return TryReadGpuCleanBacking(vaddr, data, size);
+}
+
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;

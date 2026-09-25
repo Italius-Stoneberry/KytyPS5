@@ -118,6 +118,11 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return true;
 }
 
+bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
+	return count >= 2 && count <= 16 &&
+	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
+}
+
 void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
                            const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
 	if (!ok) {
@@ -339,6 +344,7 @@ struct PipelineCache::ProgramCache {
 		    .read_memory                = ReadShaderRawGuestMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .sync_memory                = SyncShaderGuestMemory,
+		    .try_read_memory_span       = ReadShaderMemorySpan,
 		};
 		ShaderReadObserver::Runtime observed_runtime(input_runtime);
 		const auto& runtime = observed_runtime.Get();
