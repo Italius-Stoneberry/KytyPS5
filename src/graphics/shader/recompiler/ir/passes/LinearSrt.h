@@ -48,6 +48,8 @@ struct LinearSrtPlan {
 	Function function = nullptr;
     KytySrtAot::Function aot_function = nullptr;
     KytySrtAot::MaterializeFunction aot_materialize = nullptr;
+    std::shared_ptr<const LinearSrtPlan> single_condition;
+    std::array<uint32_t, 3> single_condition_variants{};
 #if defined(__x86_64__) || defined(_M_X64)
 	std::unique_ptr<Xbyak::CodeGenerator> code;
 #endif
@@ -443,7 +445,17 @@ public:
 			result.flat_words[read.flat_offset] = index;
 		}
 		if (result.nodes.empty() && active_sources.empty()) return false;
-		GroupReads();
+		return Generate(true);
+	}
+    bool BuildPredicate(Value condition) {
+        const auto value = Add(condition, true);
+        if (value == Invalid || result.nodes.size() > 128) return false;
+        result.flat_words = {value};
+        // The predicate interpreter issues scalar clean reads, never spans.
+        return Generate(false);
+    }
+	bool Generate(bool group_reads) {
+		if (group_reads) GroupReads();
 		Xbyak::ClearError();
 		result.code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 		if (Xbyak::GetError() != 0 || !result.code->getCode()) {

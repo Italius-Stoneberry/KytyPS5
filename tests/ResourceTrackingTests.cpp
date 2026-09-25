@@ -2897,6 +2897,80 @@ void TestFunctionLdsLayout() {
 
 } // namespace
 
+void TestNativePredicateBitfields() {
+#if defined(KYTY_LOCAL_NATIVE_RESOURCES) && defined(__x86_64__)
+  struct Memory {
+    uint32_t bits;
+    unsigned fail;
+    std::vector<std::pair<uint64_t, bool>> calls;
+    bool Read(uint64_t address, uint32_t* value, bool clean) {
+      calls.emplace_back(address, clean);
+      if (calls.size() == fail) return false;
+      if (address == 0x1000) *value = 0x2000;
+      else if (address == 0x1004) *value = 0;
+      else if (address == 0x200c) *value = bits;
+      else if (address == 0x3000 || address == 0x3004) *value = uint32_t(address) ^ 0x83f051a7u;
+      else throw std::runtime_error("native predicate followed an invalid pointer");
+      return true;
+    }
+  };
+  const auto raw = +[](void* p, uint64_t a, uint32_t* v) { return static_cast<Memory*>(p)->Read(a, v, false); };
+  const auto clean = +[](void* p, uint64_t a, uint32_t* v) { return static_cast<Memory*>(p)->Read(a, v, true); };
+  const std::array<std::pair<uint32_t, uint32_t>, 9> ranges = {{{10, 1}, {0, 32}, {31, 1}, {0, 0},
+                            {32, 0}, {16, 16}, {31, 2}, {33, 0}, {0, 33}}};
+  for (const auto [offset, width] : ranges) {
+    Fixture fixture;
+    auto& plan = fixture.program;
+    const auto load = [&](Value low, Value high, uint32_t offset) {
+      const MemoryInfo info{.kind = ResourceKind::ScalarAddress, .offset = offset};
+      return fixture.Emit(ValueOpcode::LoadAddressU32,
+          {fixture.Address(low, high), Value(0u), Value(0u), Value(true)}, fixture.AddMemory(info, 0));
+    };
+    const auto table = fixture.Emit(ValueOpcode::GetSrtResource);
+    const auto flat = [&](uint32_t index) { return fixture.Emit(ValueOpcode::ReadConst, {table, Value(index)}); };
+    plan.srt_reads = {{load(Value(0x1000u), Value(0u), 0), 0},
+                      {load(Value(0x1000u), Value(0u), 4), 1},
+                      {load(flat(0), flat(1), 12), 2}};
+    const auto bit = fixture.Emit(ValueOpcode::BitFieldUExtract, {flat(2), Value(offset), Value(width)});
+    const auto condition = fixture.Emit(ValueOpcode::LogicalNot,
+        {fixture.Emit(ValueOpcode::IEqual32, {bit, Value(1u)})});
+    plan.descriptor_sources.resize(2);
+    for (uint32_t i = 0; i < 2; ++i) {
+      plan.descriptor_sources[i].dword_count = 1;
+      plan.descriptor_sources[i].dwords[0] = load(Value(0x3000u + i * 4), Value(0u), 0);
+    }
+    plan.materialization_sources = {0, 1};
+    plan.control_flow = {{condition, {1, 2}, {}}, {{}, {}, {0}}, {{}, {}, {1}}};
+    plan.srt_plan_complete = true;
+    BuildLinearSrtPlan(plan);
+    Check(bool(plan.linear_srt), "bitfield predicate lost the conservative leaf fallback");
+    const bool valid = offset <= 32 && width <= 32 - offset;
+    Check(bool(plan.linear_srt->single_condition) == valid, "bitfield predicate range eligibility differs");
+    const auto compiled = plan.linear_srt;
+    for (const uint32_t bits : {0u, 1u, 0x400u, 0x80000000u, 0xdeadbeefu, UINT32_MAX})
+      for (unsigned failure = 0; failure < 10; ++failure) for (bool can_clean : {false, true}) {
+        Memory old_memory{bits, failure}, new_memory{bits, failure};
+        SrtRuntime runtime{.read_memory = raw, .userdata = &old_memory,
+                           .read_specialization_memory = can_clean ? clean : nullptr};
+        std::vector<DescriptorValue> expected, actual;
+        std::vector<uint32_t> expected_flat, actual_flat;
+        std::vector<uint8_t> expected_active, actual_active;
+        plan.linear_srt.reset();
+        const bool old_ok = EvaluateRuntimeSources(plan, plan.materialization_sources, runtime,
+            expected, expected_flat, {}, expected_active);
+        plan.linear_srt = compiled;
+        runtime.userdata = &new_memory;
+        const bool new_ok = EvaluateRuntimeSources(plan, plan.materialization_sources, runtime,
+            actual, actual_flat, {}, actual_active);
+        Check(old_ok == new_ok && old_memory.calls == new_memory.calls,
+              "bitfield predicate changed pointer reads, order, or failure behavior");
+        Check(!old_ok || (expected == actual && expected_flat == actual_flat && expected_active == actual_active),
+              "bitfield predicate changed the selected resource transaction");
+      }
+  }
+#endif
+}
+
 void TestControlledLinearSrt() {
 #if defined(__x86_64__) || defined(_M_X64)
   struct Memory {
@@ -2914,7 +2988,7 @@ void TestControlledLinearSrt() {
     if(flag<0 || int(memory.calls.size())==memory.fail)return false;
     *word=uint32_t(flag);return true;
   };
-  for(const bool loop:{false,true}) {
+  for(const bool loop:{false,true}) for(uint32_t shape=0;shape<4;++shape) {
     Fixture fixture;
     auto& plan=fixture.program;
     const auto read=[&](uint32_t address) {
@@ -2937,11 +3011,26 @@ void TestControlledLinearSrt() {
                     {plan.descriptor_sources[3].dwords[0],1}};
     plan.control_flow={{a,{1,2},{0}},{b,{3,2},{1}},{{},{},{2}},
                        {{},{loop?0u:2u},{3}}};
+    if(shape==1 || shape==3) plan.control_flow[1].condition={};
+    if(shape==2) { plan.control_flow[0].condition={}; plan.control_flow[0].successors={2}; }
+    if(shape==3) {
+      auto body=std::move(plan.control_flow);
+      plan.control_flow.resize(70);
+      for(uint32_t i=0;i<70;++i) plan.control_flow[i].successors={i+1};
+      for(auto& block:body) {
+        for(auto& next:block.successors) next+=70;
+        plan.control_flow.push_back(std::move(block));
+      }
+    }
     plan.srt_plan_complete=true;
     BuildLinearSrtPlan(plan);
     Check(plan.linear_srt && !plan.linear_srt->control_variants.empty() &&
       plan.linear_srt->control_variants.size()<=9,"conditional source combinations did not compile");
     const auto compiled=plan.linear_srt;
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+    Check(bool(compiled->single_condition)==(shape==1 || shape==3),
+      "native predicate did not respect unique reachable condition eligibility");
+#endif
     for(const int first:{0,1,-1})for(const int second:{0,1,-1})
       for(const int fail:{0,1,2,3,4,5,6,7,8})for(const bool clean_reader:{false,true}) {
         Memory original{first,second,fail},native=original;
@@ -2964,6 +3053,7 @@ void TestControlledLinearSrt() {
     plan.clean_flat_slots={1,0};BuildLinearSrtPlan(plan);
     Check(!plan.linear_srt,"conditional graph with shared clean-flat memo was accepted");
     plan.clean_flat_slots.clear();plan.control_flow.push_back({a,{0,1},{}});
+    plan.control_flow.push_back({a,{0,1},{}});
     BuildLinearSrtPlan(plan);
     Check(!plan.linear_srt,"unbounded conditional variant enumeration was accepted");
   }
@@ -3409,6 +3499,9 @@ int main(int argc, char** argv) {
   if (const char* mode = std::getenv("KYTY_SRT_NATIVE")) {
     kyty_local_srt_native_mode.store(std::strtoul(mode, nullptr, 10));
   }
+  if (const char* mode = std::getenv("KYTY_SRT_PREDICATES")) {
+    kyty_local_srt_predicate_mode.store(std::strtoul(mode, nullptr, 10));
+  }
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--benchmark-srt") == 0) {
     Fixture fixture;
@@ -3442,6 +3535,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    Run("native predicate bitfields", TestNativePredicateBitfields);
     Run("controlled linear SRT", TestControlledLinearSrt);
     Run("linear SRT arithmetic", TestLinearSrtDifferential);
     Run("linear SRT reads", TestLinearSrtReads);

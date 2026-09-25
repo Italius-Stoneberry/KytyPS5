@@ -16,6 +16,7 @@
 
 extern "C" {
 volatile std::atomic<uint32_t> kyty_local_srt_native_mode {0};
+volatile std::atomic<uint32_t> kyty_local_srt_predicate_mode {0};
 volatile std::atomic<uint32_t> kyty_local_preparation_scratch_mode {0};
 }
 
@@ -1232,6 +1233,51 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 } // namespace
 
 #if defined(__x86_64__) || defined(_M_X64)
+static void BuildNativePredicate(const ResourcePlan& program, LinearSrtPlan& root,
+                                  std::span<const uint32_t> conditional) {
+    // A single reachable predicate is evaluated at most once. Its memo is not
+    // shared with raw descriptor reads, so a separate compiled transaction is
+    // equivalent, including a failed clean read's conservative two-way choice.
+    if (conditional.size() != 1) return;
+    const uint32_t condition = conditional.front();
+    bool reached = false;
+    for (uint32_t choice = 0; choice < 3; ++choice) {
+        std::vector<uint8_t> active(program.descriptor_sources.size(), 1);
+        std::vector<uint8_t> visited(program.control_flow.size());
+        for (const auto& block : program.control_flow)
+            for (const auto source : block.sources) active[source] = 0;
+        std::vector<uint32_t> pending{0};
+        while (!pending.empty()) {
+            const auto index = pending.back(); pending.pop_back();
+            if (visited[index]) continue;
+            visited[index] = 1;
+            const auto& block = program.control_flow[index];
+            for (const auto source : block.sources) active[source] = 1;
+            reached |= index == condition;
+            if (index == condition && choice != 2) pending.push_back(block.successors[choice]);
+            else pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+        }
+        const auto leaf = std::ranges::find_if(root.control_variants,
+            [&](const auto& candidate) { return candidate->active_sources == active; });
+        EXIT_IF(leaf == root.control_variants.end());
+        root.single_condition_variants[choice] = static_cast<uint32_t>(leaf - root.control_variants.begin());
+    }
+    if (!reached) return; // Never introduce a read from an unreachable block.
+    auto compiled = std::make_shared<LinearSrtPlan>();
+    if (!LinearSrtCompiler(program, *compiled).BuildPredicate(program.control_flow[condition].condition)) return;
+    root.single_condition = std::move(compiled);
+}
+
+static std::optional<uint32_t> SelectNativePredicate(const LinearSrtPlan& root, const SrtRuntime& runtime) {
+    if (kyty_local_srt_predicate_mode.load(std::memory_order_relaxed) == 0 || !root.single_condition) return {};
+    const auto& predicate = *root.single_condition;
+    EXIT_IF(predicate.nodes.size() > 128 || predicate.flat_words.size() != 1);
+    std::array<uint64_t, 128> values; // Native code writes every dependency before use.
+    const bool known = runtime.read_specialization_memory && predicate.function(&runtime, values.data());
+    const auto choice = known ? (uint32_t(values[predicate.flat_words[0]]) != 0 ? 0u : 1u) : 2u;
+    return root.single_condition_variants[choice];
+}
+
 static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePlan& program) {
     if(!program.srt_plan_complete || program.control_flow.empty() || program.control_flow.size()>256 ||
         program.descriptor_sources.empty() ||
@@ -1278,6 +1324,7 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
         PrepareLinearSrtAot(*leaf);
         root->control_variants.push_back(std::move(leaf));
     }
+    BuildNativePredicate(program, *root, conditional);
     return root;
 }
 #endif
@@ -1409,6 +1456,9 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
             if(!program.srt_plan_complete || (runtime.read_specialization_memory==nullptr &&
                 std::ranges::any_of(clean_flat_slots,[](uint8_t v){return v!=0;})))return false;
             if(!linear->control_variants.empty()) {
+                if (const auto variant = SelectNativePredicate(*linear, runtime)) {
+                    return EvaluateLinearSrt(*linear->control_variants[*variant], runtime, results, flat, active_sources);
+                }
                 auto clean=runtime;clean.read_memory=runtime.read_specialization_memory;
                 Evaluator predicate_evaluator(program,clean);
                 std::vector<uint8_t> active;
