@@ -26,6 +26,9 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -1107,6 +1110,9 @@ void RenderExecutor::PrepareBdaBindings(const PreparedBindings& first, const Pre
 	m_context.GetGpuResources().PrepareBda();
 }
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-descriptor-packet.inc"
+#endif
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
@@ -1224,6 +1230,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			binding.layout = image.backing.state.layout;
 		}
+
+	}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (RecordLocalDescriptors(m_context, vk_buffer, pipeline_bind_point, pipeline,
+	                           prepared_bindings, m_descriptor_buffers, m_descriptor_images)) return;
+#endif
+
+	for (auto* prepared: prepared_bindings) {
+		const auto& program = *prepared->runtime->program;
+		auto& descriptors = *prepared;
 
 		m_image_occurrences.assign(descriptors.images.size(), 0);
 		for (const auto& binding: program.bindings.descriptors) {

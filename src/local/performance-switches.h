@@ -25,6 +25,9 @@ extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
 extern volatile std::atomic_uint32_t kyty_local_pending_drain_mode;
 extern volatile std::atomic_uint32_t kyty_local_dispatch_batch;
 extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+extern volatile std::atomic_uint32_t kyty_local_vulkan_recording_mode;
+#endif
 }
 
 inline void InitializePerformanceSwitches() {
@@ -58,6 +61,9 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
 	    // Dispatches recorded per submission.
 	    Switch {"KYTY_DISPATCH_BATCH", &kyty_local_dispatch_batch, 1, 65536},
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+	    Switch {"KYTY_VULKAN_RECORDING", &kyty_local_vulkan_recording_mode},
+#endif
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {

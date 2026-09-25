@@ -734,9 +734,32 @@ endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
 
-# Linux x86_64 only: the native resource preparation tests (the ahead-of-time
-# SRT library is loaded with dlopen).
+# Linux x86_64 only: the Vulkan recording worker (KYTY_VULKAN_RECORDING, with the
+# native XPR draws built on it) and the native resource preparation tests (the
+# ahead-of-time SRT library is loaded with dlopen).
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+	find_package(Python3 REQUIRED COMPONENTS Interpreter)
+	set(recording_generated "${CMAKE_CURRENT_BINARY_DIR}/local-vulkan-recording.inc")
+	set(recording_generator "${KYTY_SOURCE_DIR}/local/generate-vulkan-recording.py")
+	set(vulkan_registry "${KYTY_THIRD_PARTY_DIR}/Vulkan-Headers/registry/vk.xml")
+	set(vulkan_hpp "${KYTY_THIRD_PARTY_DIR}/Vulkan-Headers/include/vulkan/vulkan.hpp")
+	add_custom_command(OUTPUT "${recording_generated}"
+		COMMAND "${Python3_EXECUTABLE}" "${recording_generator}" "${vulkan_registry}" "${vulkan_hpp}"
+			"${recording_generated}"
+		DEPENDS "${recording_generator}" "${vulkan_registry}" "${vulkan_hpp}"
+		VERBATIM)
+	foreach(recording_target kyty_emulator shader_recompiler_compute_tests)
+		target_sources(${recording_target} PRIVATE
+			"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
+		target_include_directories(${recording_target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+		target_compile_definitions(${recording_target} PRIVATE KYTY_LOCAL_VULKAN_RECORDING=1)
+	endforeach()
+	add_executable(vulkan_recording_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/VulkanRecordingTests.cpp"
+		"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
+	target_include_directories(vulkan_recording_tests PRIVATE ${inc_headers} "${CMAKE_CURRENT_BINARY_DIR}")
+	target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers)
+
 	foreach(native_resource_target kyty_emulator shader_recompiler_compute_tests shader_cfg_tests
 			resource_tracking_tests resource_materialization_tests)
 		target_sources(${native_resource_target} PRIVATE "${lod_stats_pack_header}")
@@ -753,6 +776,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
 	endif()
 
 	if(BUILD_TESTING)
+		add_dependencies(kyty_tests vulkan_recording_tests)
+		add_test(NAME vulkan_recording COMMAND vulkan_recording_tests)
 		add_test(NAME specialization_guard
 			COMMAND shader_recompiler_compute_tests --specialization-guard-only)
 		add_test(NAME native_pipeline_index

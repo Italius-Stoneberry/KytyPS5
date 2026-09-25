@@ -21,6 +21,9 @@
 #include "libs/errno.h"
 
 #include "performance-switches.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -129,6 +132,12 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	// A caller may hand its current command buffer to the GPU thread (for example,
+	// fault-driven readback). The receiver can drain only its own recording stream.
+	// Finish recording the caller's commands before publishing that handoff.
+	LocalVulkanRecording::Drain();
+#endif
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
@@ -147,6 +156,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		// Fault, readback and mapping callbacks cannot overtake a queued draw.
 		command();
 	}
 }
@@ -511,6 +521,9 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	InitializePerformanceSwitches();
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	LocalVulkanRecording::ProducerScope recording;
+#endif
 
 	for (;;) {
 		Submission                   submission;

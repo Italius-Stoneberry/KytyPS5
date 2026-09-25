@@ -30,6 +30,10 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "native-preparation-state.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-draw-packet.h"
+#include "vulkan-recording.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -347,10 +351,11 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
-static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
-                                     const ShaderVertexInputInfo& vs_input_info,
-                                     const RenderColorInfo* colors, uint32_t color_count,
-                                     const RenderDepthInfo& depth) {
+template<typename Buffer, typename Color, typename Depth, typename Dispatch>
+static void SetGraphicsDynamicParamsImpl(const Buffer& buffer, vk::CommandBuffer vk_buffer,
+                                         bool indexed_viewports, const Color* colors,
+                                         uint32_t color_count, const Depth& depth,
+                                         const Dispatch& dispatch) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(colors == nullptr);
@@ -367,11 +372,6 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
 	}
 
-	const auto& outputs = vs_input_info.stage.program->info.outputs;
-	const bool  indexed_viewports =
-	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
-		    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
-	    });
 	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
 	std::array<vk::Viewport, viewport_slots> viewports {};
 	std::array<vk::Rect2D, viewport_slots>   scissors {};
@@ -405,8 +405,8 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			scissor.extent = {0, 0};
 		}
 	}
-	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
-	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	vk_buffer.setViewportWithCount(viewport_count, viewports.data(), dispatch);
+	vk_buffer.setScissorWithCount(viewport_count, scissors.data(), dispatch);
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -419,20 +419,20 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 		line_width = 1.0f;
 	}
-	vk_buffer.setLineWidth(line_width);
+	vk_buffer.setLineWidth(line_width, dispatch);
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	vk_buffer.setBlendConstants(blend_constants.data());
-	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	vk_buffer.setBlendConstants(blend_constants.data(), dispatch);
+	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE, dispatch);
+	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE, dispatch);
+	vk_buffer.setDepthCompareOp(depth.depth_compare_op, dispatch);
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE, dispatch);
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
@@ -441,22 +441,22 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor, dispatch);
 	}
 
 	if (depth.stencil_test_enable) {
 		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
-		                                depth.stencil_dynamic_front.compareMask);
+		                                depth.stencil_dynamic_front.compareMask, dispatch);
 		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eBack,
-		                                depth.stencil_dynamic_back.compareMask);
+		                                depth.stencil_dynamic_back.compareMask, dispatch);
 		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eFront,
-		                              depth.stencil_dynamic_front.writeMask);
+		                              depth.stencil_dynamic_front.writeMask, dispatch);
 		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eBack,
-		                              depth.stencil_dynamic_back.writeMask);
+		                              depth.stencil_dynamic_back.writeMask, dispatch);
 		vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eFront,
-		                              depth.stencil_dynamic_front.reference);
+		                              depth.stencil_dynamic_front.reference, dispatch);
 		vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eBack,
-		                              depth.stencil_dynamic_back.reference);
+		                              depth.stencil_dynamic_back.reference, dispatch);
 	}
 
 #if defined(__APPLE__)
@@ -472,10 +472,124 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		                : VK_FALSE;
 	}
 	if (color_count != 0) {
-		vk_buffer.setColorWriteEnableEXT(color_count, enable);
+		vk_buffer.setColorWriteEnableEXT(color_count, enable, dispatch);
 	}
 #endif
 }
+
+static bool UsesIndexedViewports(const ShaderVertexInputInfo& input) {
+	const auto& outputs = input.stage.program->info.outputs;
+	return std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+		return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+	});
+}
+
+void RenderExecutor::CommitGraphicsState(CommandBuffer& buffer, const ShaderVertexInputInfo& input,
+                                         const RenderColorInfo* colors, uint32_t color_count,
+                                         const RenderDepthInfo& depth, vk::Pipeline pipeline,
+                                         vk::ImageAspectFlags feedback_aspects) {
+	const auto vk_buffer = buffer.Handle();
+	SetGraphicsDynamicParamsImpl(buffer, vk_buffer, UsesIndexedViewports(input), colors,
+	                             color_count, depth, VULKAN_HPP_DEFAULT_DISPATCHER);
+	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
+		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+	}
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+}
+
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+namespace LocalDrawRecording {
+static void Replay(std::span<const LocalVulkanRecording::Segment> segments,
+                   const vk::detail::DispatchLoaderDynamic& dispatch) {
+    const auto& draw = *static_cast<const Draw*>(segments[0].data);
+    const auto command = draw.command;
+    const auto vertex_count = static_cast<uint32_t>(segments[1].size / sizeof(vk::Buffer));
+    if (vertex_count)
+        command.bindVertexBuffers(0, vertex_count,
+            static_cast<const vk::Buffer*>(segments[1].data),
+            static_cast<const vk::DeviceSize*>(segments[2].data), dispatch);
+    if (draw.index_buffer)
+        command.bindIndexBuffer(draw.index_buffer, draw.index_offset, draw.index_type, dispatch);
+
+    // Reuse is valid only within the same recording generation and pipeline.
+    // The queue invalidates the generation on command-buffer lifetime APIs and
+    // raw dynamic-state/pipeline commands. Padding differences only cause a miss.
+    struct Cache {
+        uint64_t epoch = UINT64_MAX;
+        vk::CommandBuffer command;
+        vk::Pipeline pipeline;
+        DynamicState state;
+    };
+    static thread_local Cache cache;
+    const auto epoch = LocalVulkanRecording::StateEpoch();
+    const bool reuse = epoch != UINT64_MAX && cache.epoch == epoch &&
+        cache.command == command && cache.pipeline == draw.pipeline &&
+        std::memcmp(&cache.state, &draw.state, sizeof(DynamicState)) == 0;
+    if (!reuse) {
+        const auto& state = draw.state;
+        SetGraphicsDynamicParamsImpl(state.buffer, command, state.indexed_viewports,
+                                      state.colors, state.color_count, state.depth, dispatch);
+        if (state.feedback_enabled)
+            command.setAttachmentFeedbackLoopEnableEXT(state.feedback_aspects, dispatch);
+        command.bindPipeline(vk::PipelineBindPoint::eGraphics, draw.pipeline, dispatch);
+        cache = {epoch, command, draw.pipeline, state};
+    }
+
+    const auto* commands = static_cast<const vk::DrawIndexedIndirectCommand*>(segments[3].data);
+    for (size_t i = 0; i < segments[3].size / sizeof(*commands); ++i) {
+        const auto& item = commands[i];
+        if (draw.indexed)
+            command.drawIndexed(item.indexCount, item.instanceCount, item.firstIndex,
+                                item.vertexOffset, item.firstInstance, dispatch);
+        else command.draw(item.indexCount, item.instanceCount, item.firstIndex,
+                          item.firstInstance, dispatch);
+    }
+}
+void Record(const Draw& draw, std::span<const vk::Buffer> vertex_buffers,
+            std::span<const vk::DeviceSize> vertex_offsets,
+            std::span<const vk::DrawIndexedIndirectCommand> commands) {
+    static_assert(std::is_trivially_copyable_v<Draw>);
+    EXIT_IF(vertex_buffers.size() != vertex_offsets.size());
+    for (auto buffer : vertex_buffers) EXIT_IF(!buffer);
+    const LocalVulkanRecording::Segment segments[] {
+        {&draw, sizeof(draw)}, {vertex_buffers.data(), vertex_buffers.size_bytes()},
+        {vertex_offsets.data(), vertex_offsets.size_bytes()},
+        {commands.data(), commands.size_bytes()}
+    };
+    if (!LocalVulkanRecording::EnqueuePacket(Replay, segments))
+        LocalVulkanRecording::ReplayInline(Replay, segments);
+}
+static DynamicState Capture(const CommandBuffer& buffer, const ShaderVertexInputInfo& input,
+                            const RenderColorInfo* colors, uint32_t color_count,
+                            const RenderDepthInfo& depth, bool feedback,
+                            vk::ImageAspectFlags aspects) {
+    DynamicState state {};
+    const auto& ctx = buffer.GetRegisters();
+    state.buffer.registers = {ctx.GetScreenViewport(), ctx.GetClipControl(),
+        ctx.GetScanModeControl(), ctx.GetModeControl(), ctx.GetPolyOffset(),
+        ctx.GetBlendColor(), ctx.GetLineWidth(), ctx.GetRenderTargetMask()};
+    const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
+    state.buffer.graphics.properties.limits = {limits.maxFramebufferWidth, limits.maxFramebufferHeight,
+        {limits.maxViewportDimensions[0], limits.maxViewportDimensions[1]}};
+    state.color_count = color_count;
+    for (uint32_t i = 0; i < color_count; ++i)
+        state.colors[i] = {colors[i].Extent(), colors[i].target_slot, bool(colors[i].image_id)};
+    state.depth.desc.info.extent = {depth.desc.info.extent.width, depth.desc.info.extent.height};
+    state.depth.desc.view_info.format = depth.desc.view_info.format;
+    state.depth.stencil_dynamic_front = depth.stencil_dynamic_front;
+    state.depth.stencil_dynamic_back = depth.stencil_dynamic_back;
+    state.depth.depth_compare_op = depth.depth_compare_op;
+    state.depth.image_id = bool(depth.image_id);
+    state.depth.depth_test_enable = depth.depth_test_enable;
+    state.depth.depth_write_enable = depth.depth_write_enable;
+    state.depth.stencil_test_enable = depth.stencil_test_enable;
+    state.indexed_viewports = UsesIndexedViewports(input);
+    state.feedback_enabled = feedback;
+    state.feedback_aspects = aspects;
+    return state;
+}
+} // namespace LocalDrawRecording
+#endif
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
@@ -1197,6 +1311,19 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
+	bool record_draw = false;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	const auto primitive = ucfg.GetPrimType();
+	record_draw = LocalVulkanRecording::PacketsEnabled() && !mesh_active &&
+	    !set_bind_debug && !set_auto_debug &&
+	    (primitive == Prospero::PrimitiveType::kPointList ||
+	     primitive == Prospero::PrimitiveType::kLineList ||
+	     primitive == Prospero::PrimitiveType::kLineStrip ||
+	     primitive == Prospero::PrimitiveType::kTriList ||
+	     primitive == Prospero::PrimitiveType::kTriFan ||
+	     primitive == Prospero::PrimitiveType::kTriStrip ||
+	     primitive == Prospero::PrimitiveType::kRectList);
+#endif
 	auto vk_buffer = buffer.Handle();
 	if (set_bind_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x100u);
@@ -1204,7 +1331,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x200u);
 	}
-	if (!mesh_active) {
+	if (!mesh_active && !record_draw) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
 	if (bindings.pixel.has_value()) {
@@ -1231,18 +1358,17 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        vk::ShaderStageFlagBits::eMeshEXT |
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
-	} else {
+	} else if (!record_draw) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, state.vs_input_info, state.color_info,
-	                         state.color_count, state.depth_info);
-	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
-		vk_buffer.setAttachmentFeedbackLoopEnableEXT(
-		    rendering.depth_stencil_attachment.image_layout ==
-		            vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-		        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
-		        : vk::ImageAspectFlags {});
+	const auto feedback_aspects = rendering.depth_stencil_attachment.image_layout ==
+	                                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+	                                  ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
+	                                  : vk::ImageAspectFlags {};
+	if (!record_draw) {
+		CommitGraphicsState(buffer, state.vs_input_info, state.color_info, state.color_count,
+		                    state.depth_info, pipeline.pipeline, feedback_aspects);
 	}
 
 	LogDrawPhase(draw.name, "BeginRendering");
@@ -1250,19 +1376,40 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
-	if (set_auto_debug) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
-	}
-	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-	} else {
-		if (!emit.direct_run.empty()) {
-			for (const auto& item : emit.direct_run)
+	if (!record_draw) {
+		if (set_auto_debug) {
+			SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
+		}
+		if (mesh_active) {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		} else if (!emit.direct_run.empty()) {
+			for (const auto& item: emit.direct_run) {
 				vk_buffer.drawIndexed(item.indexCount, item.instanceCount, item.firstIndex,
 				                      item.vertexOffset, item.firstInstance);
-		} else EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+			}
+		} else {
+			EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+		}
 	}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	else {
+		LocalDrawRecording::Draw packet {};
+		packet.state = LocalDrawRecording::Capture(
+		    buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
+		    m_context.GetGraphics().attachment_feedback_loop_enabled, feedback_aspects);
+		packet.command = vk_buffer;
+		packet.pipeline = pipeline.pipeline;
+		packet.index_buffer = index_binding.buffer;
+		packet.index_offset = index_binding.offset;
+		packet.index_type = index_binding.type;
+		packet.indexed = emit.indexed;
+		const vk::DrawIndexedIndirectCommand command {draw.index_count, draw.instance_count,
+		    emit.indexed ? 0u : emit.first_vertex, emit.vertex_offset, emit.first_instance};
+		LocalDrawRecording::Record(packet, {vertex_bindings.buffers.data(), vertex_bindings.count},
+		    {vertex_bindings.offsets.data(), vertex_bindings.count},
+		    emit.direct_run.empty() ? std::span {&command, 1} : emit.direct_run);
+	}
+#endif
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

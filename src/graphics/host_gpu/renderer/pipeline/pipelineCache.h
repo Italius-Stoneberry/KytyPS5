@@ -22,6 +22,9 @@ namespace Libs::Graphics {
 struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+struct LocalDescriptorPlan;
+#endif
 class CommandBuffer;
 
 namespace HW {
@@ -120,6 +123,10 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		// Immutable encoding plan; queued packets keep their own shared ownership.
+		mutable std::shared_ptr<const LocalDescriptorPlan> local_descriptor_plan;
+#endif
 	};
 
 	struct GraphicsPrograms {

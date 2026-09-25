@@ -8,6 +8,12 @@ extern "C" volatile std::atomic_uint32_t kyty_local_backing_read_mode;
 extern "C" volatile std::atomic_uint32_t kyty_local_stream_upload_mode;
 extern "C" volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode;
 #endif
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#include "vulkan-draw-packet.h"
+#include <atomic>
+extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
+#endif
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
@@ -14273,6 +14279,26 @@ OpFunctionEnd
     pipeline_info.pMultisampleState = &multisample;
     pipeline_info.pColorBlendState = &color_blend;
     pipeline_info.layout = pipeline_layout;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+    const vk::DynamicState dynamic_states[] {
+        vk::DynamicState::eViewportWithCount, vk::DynamicState::eScissorWithCount,
+        vk::DynamicState::eLineWidth, vk::DynamicState::eBlendConstants,
+        vk::DynamicState::eDepthTestEnable, vk::DynamicState::eDepthWriteEnable,
+        vk::DynamicState::eDepthCompareOp, vk::DynamicState::eDepthBiasEnable,
+        vk::DynamicState::eDepthBias, vk::DynamicState::eStencilCompareMask,
+        vk::DynamicState::eStencilWriteMask, vk::DynamicState::eStencilReference,
+        vk::DynamicState::eColorWriteEnableEXT
+    };
+    vk::PipelineDynamicStateCreateInfo dynamic_info {};
+    dynamic_info.dynamicStateCount = std::size(dynamic_states);
+    dynamic_info.pDynamicStates = dynamic_states;
+    pipeline_info.pDynamicState = &dynamic_info;
+    vk::PipelineDepthStencilStateCreateInfo depth_stencil {};
+    pipeline_info.pDepthStencilState = &depth_stencil;
+    viewport_state.viewportCount = viewport_state.scissorCount = 0;
+    viewport_state.pViewports = nullptr;
+    viewport_state.pScissors = nullptr;
+#endif
     vk::Pipeline pipeline = nullptr;
     RequireVk(test.name, "graphics",
               m_device.createGraphicsPipelines(nullptr, 1, &pipeline_info,
@@ -14307,8 +14333,37 @@ OpFunctionEnd
                         sizeof(push_data), push_data.dwords.data());
     }
     vk::DeviceSize offset = 0;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+    LocalDrawRecording::Draw packet {};
+    packet.command = cmd;
+    packet.pipeline = pipeline;
+    packet.state.color_count = 1;
+    packet.state.colors[0] = {{1, 1}, 0, true};
+    auto& registers = packet.state.buffer.registers;
+    registers.target_mask = 0xf;
+    registers.clip.dx_clip_space = true;
+    registers.viewport.viewports[0].xscale = registers.viewport.viewports[0].yscale = 0.5f;
+    registers.viewport.viewports[0].xoffset = registers.viewport.viewports[0].yoffset = 0.5f;
+    registers.viewport.viewports[0].zscale = 1.0f;
+    registers.viewport.viewports[0].zoffset = 0.0f;
+    const vk::DrawIndexedIndirectCommand draw {3, test.layers, 0, 0, 0};
+    const auto record = [&] {
+      LocalDrawRecording::Record(packet, {&vertex_buffer.buffer, 1}, {&offset, 1}, {&draw, 1});
+    };
+    record();
+    record(); // Identical state may be reused within this command buffer.
+    const vk::Rect2D empty_scissor {{0, 0}, {0, 0}};
+    cmd.setScissorWithCount(1, &empty_scissor);
+    vk::ClearAttachment clear {};
+    clear.aspectMask = vk::ImageAspectFlagBits::eColor;
+    const vk::ClearRect clear_rect {{{0, 0}, {1, 1}}, 0, test.layers};
+    cmd.clearAttachments(1, &clear, 1, &clear_rect);
+    record(); // Must invalidate the cached state and restore the nonempty scissor.
+    registers.viewport.viewports[0].xscale = 0.0f; // Queued input is already owned.
+#else
     cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
     cmd.draw(3, test.layers, 0, 0);
+#endif
     cmd.endRendering();
     EndSubmitAndFree(test.name, "graphics", cmd);
     target.layout = vk::ImageLayout::eGeneral;
@@ -15668,6 +15723,11 @@ private:
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+    LocalVulkanRecording::Install();
+    m_recording = std::make_unique<LocalVulkanRecording::ProducerScope>();
+    kyty_local_vulkan_recording_mode.store(4);
+#endif
     m_device.getQueue(m_queue_family, 0, &m_queue);
 
     vk::CommandPoolCreateInfo pool_info{};
@@ -15692,6 +15752,9 @@ private:
       if (m_command_pool != nullptr) {
         m_device.destroyCommandPool(m_command_pool, nullptr);
       }
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+      m_recording.reset();
+#endif
       m_device.destroy(nullptr);
     }
     if (m_instance != nullptr) {
@@ -15979,6 +16042,9 @@ private:
   }
 
   vk::Instance m_instance = nullptr;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+  std::unique_ptr<LocalVulkanRecording::ProducerScope> m_recording;
+#endif
   vk::PhysicalDevice m_physical_device = nullptr;
   vk::Device m_device = nullptr;
   vk::Queue m_queue = nullptr;
