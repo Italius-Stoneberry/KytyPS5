@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/FunctionLdsLayout.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -2848,6 +2849,48 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+void TestFunctionLdsLayout() {
+  Fixture fixture(ShaderType::Pixel);
+  const auto lane_address = [&]() {
+    return fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                        {fixture.Emit(ValueOpcode::LaneId), Value(2u)});
+  };
+  const auto add_access = [&](uint32_t offset, bool write) {
+    const auto flags = fixture.AddMemory(
+        MemoryInfo{.kind = ResourceKind::Lds, .offset = offset}, 0);
+    return write ? fixture.Emit(ValueOpcode::WriteSharedU32,
+                               {lane_address(), Value(offset), Value(true)}, flags)
+                 : fixture.Emit(ValueOpcode::LoadSharedU32,
+                                {lane_address(), Value(true)}, flags);
+  };
+  const auto high_write = add_access(1280, true);
+  const auto low_write = add_access(0, true);
+  const auto high_read = add_access(1280, false);
+  auto layout = PlanFunctionLdsLayout(fixture.program);
+  Check(layout.dwords == 2 && layout.slots.size() == 3,
+        "private lane-relative LDS must use only the distinct scalar slots");
+  Check(layout.slots.at(high_write.TryInstruction()) == layout.slots.at(high_read.TryInstruction()) &&
+            layout.slots.at(high_write.TryInstruction()) != layout.slots.at(low_write.TryInstruction()),
+        "LDS slot compression must preserve aliases and separate distinct offsets");
+  fixture.program.stage = ShaderType::Compute;
+  Check(PlanFunctionLdsLayout(fixture.program).slots.empty(),
+        "workgroup-shared compute LDS must never be made private");
+  fixture.program.stage = ShaderType::Pixel;
+  fixture.program.memory_info[0].offset = 1281;
+  Check(PlanFunctionLdsLayout(fixture.program).slots.empty(),
+        "unaligned access must reject the whole private LDS layout");
+  fixture.program.memory_info[0].offset = 1280;
+  auto address = high_read.TryInstruction()->Arg(0).TryInstruction();
+  address->SetArg(1, Value(3u));
+  Check(PlanFunctionLdsLayout(fixture.program).slots.empty(),
+        "different lane scale must reject all slots, not partially compact LDS");
+  address->SetArg(1, Value(2u));
+  const auto extra = fixture.AddMemory(MemoryInfo{.kind = ResourceKind::Lds}, 0);
+  fixture.Emit(ValueOpcode::LoadSharedU16, {lane_address(), Value(true)}, extra);
+  Check(PlanFunctionLdsLayout(fixture.program).slots.empty(),
+        "mixed subword accesses must retain the original LDS representation");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2883,6 +2926,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+	Run("private LDS scalar slots", TestFunctionLdsLayout);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);

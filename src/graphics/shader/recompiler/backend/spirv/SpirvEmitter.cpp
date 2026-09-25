@@ -4,6 +4,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include "graphics/shader/recompiler/ir/passes/FunctionLdsLayout.h"
+
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -336,6 +338,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
+	const auto function_lds = IR::PlanFunctionLdsLayout(program);
+	state.function_lds_slots = function_lds.slots;
+	state.compact_lds_dwords = function_lds.dwords;
 	state.inputs.reserve(program.info.inputs.size());
 	state.outputs.reserve(program.info.outputs.size());
 	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());
