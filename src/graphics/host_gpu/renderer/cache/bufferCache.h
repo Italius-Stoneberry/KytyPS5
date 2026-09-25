@@ -79,8 +79,10 @@ public:
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// GPU thread: retire a pending guest read before touching overlapping backing.
 	// With no range, drain before mapping changes, unknown BDA access, or shutdown.
+	// `gpu_write`: the range is about to be written by the GPU again; a read whose
+	// copy has not started may be detached instead of awaited (KYTY_READBACK_DETACH).
 	void DrainGuestReadback(uint64_t address = 0, uint64_t size = UINT64_MAX,
-	                        bool gpu_read_only = false);
+	                        bool gpu_read_only = false, bool gpu_write = false);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -172,7 +174,7 @@ private:
 	std::shared_ptr<GuestReadback> BeginGuestReadback(uint64_t address, uint64_t size,
 	                                                  bool* completed = nullptr);
 	void CopyGuestReadback(const std::shared_ptr<GuestReadback>& request);
-	void FinishGuestReadback(size_t slot);
+	void FinishGuestReadback(size_t slot, bool detach = false);
 	static constexpr size_t GuestReadbackSlots = 8;
 	std::array<std::shared_ptr<GuestReadback>, GuestReadbackSlots> m_guest_readbacks {};
 	std::array<std::unique_ptr<Buffer>, GuestReadbackSlots> m_guest_downloads {};

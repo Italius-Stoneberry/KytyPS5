@@ -9,6 +9,7 @@
 extern "C" {
 volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
 volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_detach_mode {0};
 // 1: pack the LOD report on the GPU instead of a CPU wait and copy.
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // 1: shader constants stream through a host-visible upload ring.
@@ -84,6 +85,12 @@ struct BufferCache::GuestReadback {
 	Buffer* download = nullptr;
 	std::atomic<bool> copying {false};
 	std::atomic<bool> copied {false};
+	// Detach protocol: the reader claims the copy (Pending -> Copying) after the GPU
+	// finished; the GPU thread may detach a request whose copy has not started
+	// (Pending -> Detached). A detached copy never writes the backing: its pages stay
+	// GPU-owned, so the reader faults again and reads the newer GPU state.
+	enum State : uint32_t { Pending, Copying, Detached };
+	std::atomic<uint32_t> state {Pending};
 };
 
 // With the frame pipeline, guest reads of GPU-written memory are copied out
@@ -198,15 +205,18 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 	}
 	m_scheduler.GetMasterSemaphore().Wait(request->tick);
 	m_scheduler.WaitPriorityOperations(request->tick);
-	request->download->Invalidate(0, request->packed_size);
-	for (const auto& part: request->parts)
-		LibKernel::Memory::WriteBacking(part.address,
-		    request->download->Mapped().data() + part.offset, part.size);
+	uint32_t pending = GuestReadback::Pending;
+	if (request->state.compare_exchange_strong(pending, GuestReadback::Copying, std::memory_order_acq_rel)) {
+		request->download->Invalidate(0, request->packed_size);
+		for (const auto& part: request->parts)
+			LibKernel::Memory::WriteBacking(part.address,
+			    request->download->Mapped().data() + part.offset, part.size);
+	}
 	request->copied.store(true, std::memory_order_release);
 	request->copied.notify_all();
 }
 
-void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_read_only) {
+void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_read_only, bool gpu_write) {
 	// Read-only bindings use device bytes. Pending copies retain GPU ownership
 	// and CPU-clean pages, so synchronization cannot upload over those bytes.
 	if (!m_active_guest_readbacks || gpu_read_only) return;
@@ -218,13 +228,23 @@ void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_r
 		if (address != 0 && std::ranges::none_of(request->pages, [&](const GuestRange& page) {
 			return address < page.End() && (address >= page.address || size > page.address - address);
 		})) continue;
-		FinishGuestReadback(slot);
+		FinishGuestReadback(slot, gpu_write && kyty_local_readback_detach_mode.load(std::memory_order_relaxed) != 0);
 	}
 }
 
-void BufferCache::FinishGuestReadback(size_t slot) {
+void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 	auto request = m_guest_readbacks[slot];
 	if (!request) return;
+	uint32_t pending = GuestReadback::Pending;
+	if (detach && !request->copied.load(std::memory_order_acquire) &&
+	    request->state.compare_exchange_strong(pending, GuestReadback::Detached, std::memory_order_acq_rel)) {
+		// The pages stay GPU-owned (ranges and page marks untouched): the next GPU
+		// write keeps them so, and a reader faults again for the newer bytes.
+		LiveCounters::Add(LiveCounters::ReadbackDetaches);
+		m_guest_readbacks[slot].reset();
+		m_active_guest_readbacks &= ~(1u << slot);
+		return;
+	}
 	if (!request->copied.load(std::memory_order_acquire)) {
 		LiveCensus::Scope census(LiveCensus::ReadbackWait, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
 		                         reinterpret_cast<uint64_t>(__builtin_return_address(1)));
@@ -988,7 +1008,7 @@ StreamBuffer& BufferCache::GetShaderUploadBuffer() noexcept {
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
-	DrainGuestReadback(vaddr, size, !is_written && !is_texel_buffer);
+	DrainGuestReadback(vaddr, size, !is_written && !is_texel_buffer, is_written);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");

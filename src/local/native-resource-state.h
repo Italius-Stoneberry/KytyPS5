@@ -26,4 +26,7 @@ extern volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode;
 // 1: a CPU write-window fault hands the image lock over once it holds the region lock,
 // so the page protection change runs outside the image lock.
 extern volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode;
+// 1: a GPU write over a guest readback whose copy has not started detaches it
+// instead of waiting for the reader (the reader faults again for newer bytes).
+extern volatile std::atomic<uint32_t> kyty_local_readback_detach_mode;
 }

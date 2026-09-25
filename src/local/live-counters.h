@@ -22,13 +22,14 @@ enum Id : uint32_t {
 	UploadBytes,        // buffer upload bytes
 	SyncDownloads,      // synchronous GPU downloads for guest access
 	AsyncReadbacks,     // asynchronous guest readbacks started
+	ReadbackDetaches,   // pending guest readbacks detached by a GPU write
 	Count
 };
 
 inline constexpr const char* Names[Count] = {
     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks"};
+    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches"};
 
 inline std::atomic<uint64_t> g_values[Count];
 

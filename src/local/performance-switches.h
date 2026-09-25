@@ -58,6 +58,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_STREAM_UPLOAD", &kyty_local_stream_upload_mode},
 	    Switch {"KYTY_FRAME_PIPELINE", &kyty_local_frame_pipeline_mode},
 	    Switch {"KYTY_WRITE_WINDOW_HANDOFF", &kyty_local_write_window_handoff_mode},
+	    Switch {"KYTY_READBACK_DETACH", &kyty_local_readback_detach_mode},
 	    // Images and command submission.
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},
