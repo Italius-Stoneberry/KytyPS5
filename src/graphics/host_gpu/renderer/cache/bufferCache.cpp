@@ -4,6 +4,7 @@
 #include "live-census.h"
 #include "live-counters.h"
 #include "native-resource-state.h"
+#include "async-upload.h"
 #include "gpu_tiler_shaders/lod_stats_pack_spv.h"
 
 extern "C" {
@@ -12,6 +13,7 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_detach_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_write_readback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_slots_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_upload_mode {0};
 // 1: pack the LOD report on the GPU instead of a CPU wait and copy.
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // 1: shader constants stream through a host-visible upload ring.
@@ -997,11 +999,20 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
+		// KYTY_ASYNC_UPLOAD: the worker fills coherent staging memory from the backing view
+		// before the submission that carries these copies; ranges without one copy here.
+		const bool async = AsyncUpload::Enabled() && m_staging_buffer.IsCoherent();
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			const auto* source = async ? LibKernel::Memory::TryGetBackingPointer(address, copy.size) : nullptr;
+			if (source != nullptr) {
+				AsyncUpload::Get().Push(mapped + copy.srcOffset, source, copy.size);
+			} else {
+				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			}
 			copy.srcOffset += base_offset;
 		}
+		if (async) AsyncUpload::Get().Kick();
 		m_staging_buffer.Commit();
 		return m_staging_buffer.Handle();
 	}

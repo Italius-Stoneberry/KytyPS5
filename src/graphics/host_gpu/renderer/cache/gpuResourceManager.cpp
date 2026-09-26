@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "async-upload.h"
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -123,6 +124,8 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	}
 	const auto unmap = [this, vaddr, size] {
 		m_buffer_cache.DrainGuestReadback();
+		// Pending upload copies read the backing of ranges that are about to change owner.
+		AsyncUpload::Drain();
 		if (m_scheduler.Active()) {
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Finish();

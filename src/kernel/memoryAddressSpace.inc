@@ -225,6 +225,35 @@ public:
 		return TryReadBacking(vaddr, data, size);
 	}
 
+	// The backing bytes of [vaddr, vaddr + size) when one mapping covers the range, else null.
+	// The backing view lives as long as the store; unmapping only detaches the guest range.
+	const uint8_t* BackingPointer(uint64_t vaddr, uint64_t size) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		MapEntry entry {};
+		{
+			BackingReadTransaction read(*this);
+			if (read.Acquired()) {
+				auto& cached = m_host_read_translations[(vaddr >> 22) % m_host_read_translations.size()];
+				if (cached.epoch == m_mapping_epoch &&
+				    GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
+					entry = cached.entry;
+				} else if (FindContainingUnlocked(vaddr, size, &entry)) {
+					cached = {entry, m_mapping_epoch};
+				}
+			}
+		}
+		if (entry.size == 0) {
+			std::lock_guard lock(m_mutex);
+			if (!FindContainingUnlocked(vaddr, size, &entry)) {
+				return nullptr;
+			}
+		}
+		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -914,6 +943,8 @@ public:
 	bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBackingToHost(vaddr, data, size);
 	}
+
+	const uint8_t* BackingPointer(uint64_t vaddr, uint64_t size) { return m_backing->BackingPointer(vaddr, size); }
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadSparseBacking(vaddr, data, size);

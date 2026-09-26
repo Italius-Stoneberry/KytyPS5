@@ -112,6 +112,9 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 // Destination must be ordinary host storage: copying must not enter guest fault
 // handling. Used by uploads; guest destinations keep TryReadBacking's lock path.
 bool                   TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size);
+// The backing bytes of a guest range inside one mapping (readable regardless of the guest
+// range's protection), or null.
+const uint8_t*         TryGetBackingPointer(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size);
 // Avoid false-sharing read faults only when exact ownership proves clean.

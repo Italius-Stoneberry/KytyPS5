@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "async-upload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -403,10 +404,12 @@ struct DeferredSubmit {
 	VkSemaphore          signal_semaphores[SubmitInfo::MaxSemaphores];
 	uint64_t             signal_ticks[SubmitInfo::MaxSemaphores];
 	uint64_t             tick;
+	uint64_t             upload_sequence; // KYTY_ASYNC_UPLOAD copies this buffer reads
 };
 void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
                   const vk::detail::DispatchLoaderDynamic& dispatch) {
 	const auto& submit = *static_cast<const DeferredSubmit*>(segments[0].data);
+	AsyncUpload::Wait(submit.upload_sequence);
 	if (dispatch.vkEndCommandBuffer(submit.command) != VK_SUCCESS) {
 		EXIT("deferred vkEndCommandBuffer failed, tick=%" PRIu64 "\n", submit.tick);
 	}
@@ -453,8 +456,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 			deferred.tick = m_master.NextTick();
 			submit.AddSignal(m_master.Handle(), deferred.tick);
 		}
-		deferred.command     = m_command.m_buffer;
-		deferred.queue       = m_graphics.queue;
+		deferred.command         = m_command.m_buffer;
+		deferred.upload_sequence = AsyncUpload::SubmitSequence();
+		deferred.queue           = m_graphics.queue;
 		deferred.queue_mutex = &m_graphics.queue_mutex;
 		deferred.waits       = submit.num_wait_semaphores;
 		deferred.signals     = submit.num_signal_semaphores;
@@ -482,6 +486,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
+	AsyncUpload::Drain();
 
 	vk::Result result;
 	uint64_t   tick;
