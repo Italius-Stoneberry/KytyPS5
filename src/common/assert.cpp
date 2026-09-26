@@ -9,7 +9,23 @@
 #include <fmt/format.h>
 #include <string>
 
+#if defined(__linux__)
+#include <execinfo.h>
+#include <unistd.h>
+#endif
+
 namespace Common {
+
+// The raw return addresses of a fatal error (resolve with addr2line against the executable).
+static void WriteFatalBacktrace() {
+#if defined(__linux__)
+	void*     frames[48];
+	const int count = backtrace(frames, 48);
+	std::fflush(nullptr);
+	(void)!write(STDOUT_FILENO, "--- Backtrace ---\n", 18);
+	backtrace_symbols_fd(frames, count, STDOUT_FILENO);
+#endif
+}
 
 static std::string BuildFatalReport(const char* title, std::string_view text, const char* file,
                                     int line) {
@@ -19,6 +35,7 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
 	Log::WriteFatal(BuildFatalReport(title, text, file, line));
+	WriteFatalBacktrace();
 	Subsystems::EmergencyShutdownActive();
 	return 1;
 }
@@ -34,11 +51,13 @@ int DbgNotImplementedHandler(const char* expr, const char* file, int line) {
 
 int DbgExitHandler(const char* file, int line, std::string_view text) {
 	Log::WriteFatal(BuildFatalReport("--- Error ---", text, file, line));
+	WriteFatalBacktrace();
 	return 1;
 }
 
 int DbgExitHandler(const char* file, int line, fmt::text_style style, std::string_view text) {
 	Log::WriteFatal(style, BuildFatalReport("--- Error ---", text, file, line));
+	WriteFatalBacktrace();
 	return 1;
 }
 
