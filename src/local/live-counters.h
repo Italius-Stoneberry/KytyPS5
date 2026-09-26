@@ -41,13 +41,23 @@ enum Id : uint32_t {
 	BdaRanges,             // ... their ranges
 	BdaRangeMiB,           // ... their total size in MiB
 	ProtectCallsGfx,       // protection changes by the render thread inside the graphics queue
+	SyncReadsGuest,        // synchronous GPU reads for guest accesses (no asynchronous readback)
+	SyncReadsRender,       // ... for the render thread's own reads (indirect arguments, SRT words)
+	RbRejectSize,          // guest readbacks refused: larger than a window
+	RbRejectBacking,       // ... unmapped or aliased backing
+	RbRejectImage,         // ... an image overlaps the window
+	RbRejectCapacity,      // ... more than the download capacity
+	SyncWriterCurrent,     // synchronous downloads whose last GPU writer is in the unsubmitted buffer
+	SyncWriterPending,     // ... submitted, not complete
+	SyncWriterDone,        // ... already complete
+	SyncWriterUnknown,     // ... not seen by the writer table
 	Count
 };
 
 inline constexpr const char* Names[Count] = {
     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx"};
+    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "sync_writer_current", "sync_writer_pending", "sync_writer_done", "sync_writer_unknown"};
 
 inline std::atomic<uint64_t> g_values[Count];
 // Render thread: the last draw (0) or dispatch shader address.

@@ -8,6 +8,10 @@
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "gpu_tiler_shaders/lod_stats_pack_spv.h"
 
+namespace {
+std::array<std::pair<uint64_t, uint64_t>, 4096> g_writer_ticks {}; // render thread only (diagnostic)
+} // namespace
+
 extern "C" {
 volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
 volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
@@ -112,7 +116,10 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	if (completed) *completed = false;
 	constexpr uint64_t WindowSize = 512 * 1024;
 	constexpr uint64_t Capacity = 2 * WindowSize;
-	if (!m_resources || !GuestRange {address, size}.Valid() || size > WindowSize) return {};
+	if (!m_resources || !GuestRange {address, size}.Valid() || size > WindowSize) {
+		LiveCounters::Add(LiveCounters::RbRejectSize);
+		return {};
+	}
 	if (!GuestReadbacksEnabled()) return {};
 	for (size_t slot = 0; slot < GuestReadbackSlots; ++slot) {
 		const auto& pending = m_guest_readbacks[slot];
@@ -134,8 +141,14 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	const auto end = std::min(std::max(begin + WindowSize, address + size),
 	                          buffer.CpuAddress() + buffer.Size());
 	if (!m_resources->IsMapped(begin, end - begin) ||
-	    !LibKernel::Memory::IsUniqueGuestBackingRange(begin, end - begin) ||
-	    m_texture_cache.HasTrackedDataOverlap(begin, end - begin)) return {};
+	    !LibKernel::Memory::IsUniqueGuestBackingRange(begin, end - begin)) {
+		LiveCounters::Add(LiveCounters::RbRejectBacking);
+		return {};
+	}
+	if (m_texture_cache.HasTrackedDataOverlap(begin, end - begin)) {
+		LiveCounters::Add(LiveCounters::RbRejectImage);
+		return {};
+	}
 	RangeSet available_pages;
 	m_memory_tracker.ForEachDownloadRange<false>(begin, end - begin,
 	    [&](uint64_t a, uint64_t bytes) noexcept {
@@ -165,7 +178,10 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	uint64_t packed_size = 0;
 	for (const auto& copy: copies) {
 		packed_size += AlignDownload(DownloadEnvelope(copy).second);
-		if (packed_size > Capacity) return {};
+		if (packed_size > Capacity) {
+			LiveCounters::Add(LiveCounters::RbRejectCapacity);
+			return {};
+		}
 	}
 	// KYTY_READBACK_SLOTS: when every slot is pending, the render thread waits for the
 	// oldest copy (a GPU tick). Bursts from many guest threads fill the original eight.
@@ -755,7 +771,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		gpu.SendCommandSync([&] {
 			bool completed = false;
 			request = BeginGuestReadback(vaddr, size, &completed);
-			if (!request && (is_write || !completed)) ReadMemoryOnGpu(vaddr, size, is_write);
+			if (!request && (is_write || !completed)) {
+				LiveCounters::Add(LiveCounters::SyncReadsGuest);
+				ReadMemoryOnGpu(vaddr, size, is_write);
+			}
 		});
 		if (request) {
 			CopyGuestReadback(request);
@@ -767,6 +786,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		return;
 	}
+	LiveCounters::Add(GuestGpu::IsGpuThread() ? LiveCounters::SyncReadsRender : LiveCounters::SyncReadsGuest);
 	m_scheduler.Context().GetGpu().SendCommandSync(
 	    [this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
 }
@@ -817,6 +837,20 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	    });
 	if (!copies.empty()) {
 		LiveCounters::Add(LiveCounters::SyncDownloads);
+		uint64_t writer = 0;
+		bool     known  = false;
+		for (const auto& copy: copies)
+			for (auto granule = copy.address >> 16u; granule <= (copy.address + copy.size - 1) >> 16u; ++granule) {
+				const auto& entry = g_writer_ticks[granule % g_writer_ticks.size()];
+				if (entry.first == granule) {
+					known  = true;
+					writer = std::max(writer, entry.second);
+				}
+			}
+		LiveCounters::Add(!known                                  ? LiveCounters::SyncWriterUnknown
+		                  : writer >= m_scheduler.CurrentTick()   ? LiveCounters::SyncWriterCurrent
+		                  : m_scheduler.IsFree(writer)            ? LiveCounters::SyncWriterDone
+		                                                          : LiveCounters::SyncWriterPending);
 		DownloadBufferMemory(copies);
 		// The enumeration covered whole dirty pages and every exact interval on them.
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
@@ -1098,6 +1132,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(*buffer);
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		// Diagnostic: the last GPU writer's tick per 64 KiB granule (sync_writer_* counters).
+		for (auto granule = vaddr >> 16u; granule <= (vaddr + size - 1) >> 16u; ++granule)
+			g_writer_ticks[granule % g_writer_ticks.size()] = {granule, m_scheduler.CurrentTick()};
 		InvalidateCopyFeedback(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
