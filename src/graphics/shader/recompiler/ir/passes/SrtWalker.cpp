@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
+#include "live-census.h"
 #include "native-resource-aot.h"
 #include "native-resource-runtime.h"
 
@@ -1622,6 +1623,9 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
             return EvaluateLinearSrt(*linear,runtime,results,flat,active_sources);
         }
     }
+	const auto& linear = program.linear_srt;
+	LiveCensus::Scope census(LiveCensus::SrtInterpreter, program.shader_hash,
+	                         !linear ? 1 : !std::ranges::equal(sources, linear->sources) ? 2 : 3);
 	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, flat, true,
 	                                  clean_flat_slots, active_sources);
 }

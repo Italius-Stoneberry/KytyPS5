@@ -20,7 +20,8 @@ enum Kind : uint32_t {
 	GraphicsPrograms = 7, // program lookup and SRT evaluation of a draw
 	NativeGather  = 8, // native XPR record word gather
 	QueueRun      = 9, // a: queue (interrupt event id; 0 graphics), whole PM4 run
-	Kinds         = 10
+	SrtInterpreter = 10, // a: shader hash, b: 1 no linear plan, 2 other sources, 3 other clean slots
+	Kinds         = 11
 };
 
 struct Entry {
