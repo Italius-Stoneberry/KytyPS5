@@ -7448,6 +7448,10 @@ public:
                   texture_cache.GetImage(fault_b_image).IsGpuModified() &&
                   texture_cache.GetImage(fault_b_image).IsDefinitelyCpuDirty(),
               "the surviving image was not protected after its alias retired");
+      Require(name, "CPU-written image releases CPU-side reads",
+              !texture_cache.IsRegionGpuModified(base + 0x8010, sizeof(fault_b)) &&
+                  texture_cache.IsRegionGpuModified(base + 0x8000, sizeof(fault_a)),
+              "an image the CPU wrote into still refused CPU-side reads");
       constexpr uint32_t fault_b_cpu = 0xa5a6a7a8u;
       std::memcpy(memory + 0x8010, &fault_b_cpu, sizeof(fault_b_cpu));
       const auto refreshed_b = texture_cache.FindImage(fault_b_desc);

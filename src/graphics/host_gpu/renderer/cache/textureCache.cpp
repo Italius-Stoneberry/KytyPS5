@@ -1239,8 +1239,6 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
-		// Re-initialized from guest memory: the GPU contents are gone.
-		image.ClearGpuModified();
 	}
 }
 
@@ -2114,7 +2112,10 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
-		if (!image.depth_id && image.IsGpuModified()) {
+		// Guest memory holds the CPU's write into the image, and the image can no longer
+		// be downloaded: it would only refuse the read. A dead image in reused memory
+		// otherwise failed every CPU-side read of the new data until eviction.
+		if (!image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty()) {
 			return true;
 		}
 	}
@@ -2131,10 +2132,6 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 		}
 		if (owner->Overlaps(address, size)) {
 			owner->InvalidateCpuWrite(address, size);
-			// The CPU wrote into the image: its next use re-initializes it from guest
-			// memory, so it no longer owns the range. Keeping the GPU mark let a dead image
-			// in reused memory refuse CPU-side reads of the new data until eviction.
-			owner->ClearGpuModified();
 			UntrackImage(id);
 			continue;
 		}
