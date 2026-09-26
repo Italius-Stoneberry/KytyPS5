@@ -40,6 +40,9 @@ extern "C" {
 // Negative controls for the offline replay only: bit 0 zeroes the vertex
 // stage's flattened SRT in the upload, bit 1 skips the draw call.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_debug {0};
+// 1: objects are drawn in last frame's order, so the record that followed this
+// one last frame is prefetched while this draw runs.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_predict_mode {0};
 }
 namespace {
 // word_patch value of a logged word whose change reaches nothing the evaluation produces.
@@ -223,6 +226,7 @@ struct RenderExecutor::NativeXprRecord {
 	uint64_t retire_tick        = 0;
 	uint64_t used_frame         = 0; // last frame a draw used the record
 	uint64_t uses               = 0;
+	uint64_t next_hash          = 0; // key hash of the record the next native draw used
 	// The payload the set was written with; an identical rebind keeps the set.
 	std::vector<vk::DescriptorBufferInfo> set_buffers;
 	std::vector<vk::DescriptorImageInfo>  set_images;
@@ -449,6 +453,7 @@ struct RenderExecutor::NativeXprCache {
 	// Draw-state key of the latest draw (native or normal), for clean draws.
 	uint64_t state_key       = 0;
 	bool     state_key_valid = false;
+	uint64_t last_hash       = 0; // key hash of the previous native draw's record
 	uint64_t collected_frame = UINT64_MAX;
 	~NativeXprCache() {
 		for (auto pool: pools) device.destroyDescriptorPool(pool);
@@ -2240,6 +2245,15 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	auto& record      = *found;
 	record.used_frame = m_context.FrameNumber();
 	++record.uses;
+	if (kyty_local_native_xpr_predict_mode.load(std::memory_order_relaxed) != 0) {
+		// Learn the order, then fetch the fields of the predicted next record while
+		// this draw runs. Records are found through the index only (never a stale pointer).
+		if (cache.last_hash != 0 && cache.last_hash != hash)
+			if (auto* previous = cache.IndexFind(cache.last_hash)) previous->next_hash = hash;
+		cache.last_hash = hash;
+		if (record.next_hash != 0)
+			if (auto* next = cache.IndexFind(record.next_hash)) NativeXprPrefetchFields(*next);
+	}
 	const auto state_it = cache.states.find(cache.state_key);
 	if (state_it == cache.states.end()) {
 		m_native_xpr_store = true;
