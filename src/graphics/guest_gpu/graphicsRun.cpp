@@ -21,6 +21,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#include "debug-delay.h"
 #include "draw-state-observer.h"
 #include "live-control.h"
 #include "performance-switches.h"
@@ -51,6 +52,9 @@ extern "C" {
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode {0};
 // 1: a full barrier with no recorded work since the previous one is skipped.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_global_barrier_dedupe {0};
+// Causal probe (debug-delay.h): ns spun per call at the sites in the mask. 0 = off.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_debug_delay_ns {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_debug_delay_site {0};
 }
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
@@ -1030,6 +1034,7 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 
 uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, bool clean) {
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 0);
+	DebugDelay::At(DebugDelay::NativeXpr);
 	LiveCounters::g_last_dispatch_shader = 0;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	auto& executor = m_renderer.GetRenderExecutor();
@@ -1336,6 +1341,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
                                       uint32_t thread_group_z, uint32_t mode,
                                       uint64_t indirect_args) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	DebugDelay::At(IsAsyncComputeQueue() ? DebugDelay::ComputeDispatch : DebugDelay::GraphicsDispatch);
 
 	uint32_t frame_num = 0;
 	// uint32_t local_x   = 1;
