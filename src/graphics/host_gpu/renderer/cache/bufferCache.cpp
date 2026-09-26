@@ -11,6 +11,7 @@ volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
 volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_detach_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_write_readback_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_slots_mode {0};
 // 1: pack the LOD report on the GPU instead of a CPU wait and copy.
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // 1: shader constants stream through a host-visible upload ring.
@@ -160,12 +161,18 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		packed_size += AlignDownload(DownloadEnvelope(copy).second);
 		if (packed_size > Capacity) return {};
 	}
+	// KYTY_READBACK_SLOTS: when every slot is pending, the render thread waits for the
+	// oldest copy (a GPU tick). Bursts from many guest threads fill the original eight.
+	const size_t slots = kyty_local_readback_slots_mode.load(std::memory_order_relaxed) != 0
+	                         ? GuestReadbackSlots
+	                         : 8;
 	size_t slot = 0;
-	while (slot < GuestReadbackSlots && m_guest_readbacks[slot]) ++slot;
-	if (slot == GuestReadbackSlots) {
+	while (slot < slots && m_guest_readbacks[slot]) ++slot;
+	if (slot == slots) {
 		slot = 0;
-		for (size_t i = 1; i < GuestReadbackSlots; ++i)
+		for (size_t i = 1; i < slots; ++i)
 			if (m_guest_readbacks[i]->tick < m_guest_readbacks[slot]->tick) slot = i;
+		LiveCounters::Add(LiveCounters::ReadbackEvictions);
 		FinishGuestReadback(slot);
 	}
 	auto& download = m_guest_downloads[slot];

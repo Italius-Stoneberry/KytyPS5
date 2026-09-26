@@ -23,6 +23,7 @@ enum Id : uint32_t {
 	SyncDownloads,      // synchronous GPU downloads for guest access
 	AsyncReadbacks,     // asynchronous guest readbacks started
 	ReadbackDetaches,   // pending guest readbacks detached by a GPU write
+	ReadbackEvictions,  // readbacks that waited for the oldest pending slot
 	DispatchAfterDispatch, // dispatches whose previous draw/dispatch was a dispatch
 	DispatchSameShader,    // ... of the same compute shader
 	Pm4Suspends,           // PM4 executions suspended (WAIT_REG_MEM and similar)
@@ -37,7 +38,7 @@ enum Id : uint32_t {
 inline constexpr const char* Names[Count] = {
     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices"};
+    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices"};
 
 inline std::atomic<uint64_t> g_values[Count];
 // Render thread: the last draw (0) or dispatch shader address.

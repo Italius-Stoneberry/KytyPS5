@@ -176,7 +176,7 @@ private:
 	                                                  bool* completed = nullptr);
 	void CopyGuestReadback(const std::shared_ptr<GuestReadback>& request);
 	void FinishGuestReadback(size_t slot, bool detach = false);
-	static constexpr size_t GuestReadbackSlots = 8;
+	static constexpr size_t GuestReadbackSlots = 32;
 	std::array<std::shared_ptr<GuestReadback>, GuestReadbackSlots> m_guest_readbacks {};
 	std::array<std::unique_ptr<Buffer>, GuestReadbackSlots> m_guest_downloads {};
 	uint32_t m_active_guest_readbacks = 0;

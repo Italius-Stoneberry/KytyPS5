@@ -32,4 +32,7 @@ extern volatile std::atomic<uint32_t> kyty_local_readback_detach_mode;
 // 1: a guest write to GPU-owned memory takes the asynchronous readback (the writer
 // waits for the copy) instead of a GPU-thread download that drains the GPU.
 extern volatile std::atomic<uint32_t> kyty_local_async_write_readback_mode;
+// 1: 32 guest readback slots instead of 8, so a burst of readbacks does not make the
+// render thread wait for the oldest pending copy.
+extern volatile std::atomic<uint32_t> kyty_local_readback_slots_mode;
 }
