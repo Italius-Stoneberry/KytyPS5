@@ -495,6 +495,9 @@ void RenderExecutor::CommitGraphicsState(CommandBuffer& buffer, const ShaderVert
                                          const RenderDepthInfo& depth, vk::Pipeline pipeline,
                                          vk::ImageAspectFlags feedback_aspects) {
 	const auto vk_buffer = buffer.Handle();
+	// The direct path binds the pipeline, the dynamic state and (just before, in
+	// CommitIndexBuffer) the index buffer: a native XPR draw after it must bind its own again.
+	buffer.InvalidateGraphicsState();
 	SetGraphicsDynamicParamsImpl(buffer, vk_buffer, UsesIndexedViewports(input), colors,
 	                             color_count, depth, VULKAN_HPP_DEFAULT_DISPATCHER);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
