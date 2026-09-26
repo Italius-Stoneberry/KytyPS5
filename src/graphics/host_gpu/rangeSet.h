@@ -4,14 +4,24 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <vector>
+
+extern "C" {
+// 1: Add returns early for a range already covered, and lookups first try the
+// interval the previous lookup found (valid until the set changes).
+extern volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode;
+}
 
 namespace Libs::Graphics {
 
 class RangeSet final {
 public:
+	// The owner reads this set from one thread only (lookups then update the hint).
+	void AllowFastPath() { m_fast_eligible = true; }
+
 	struct Range {
 		uint64_t address = 0;
 		uint64_t size    = 0;
@@ -19,6 +29,8 @@ public:
 
 	void Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
+		if (Fast() && Covered(address, end)) return;
+		++m_version;
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
 			it = std::prev(it);
@@ -35,6 +47,7 @@ public:
 
 	void Subtract(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
+		++m_version;
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
 			it = std::prev(it);
@@ -53,7 +66,10 @@ public:
 		}
 	}
 
-	void Clear() { m_ranges.clear(); }
+	void Clear() {
+		++m_version;
+		m_ranges.clear();
+	}
 
 	template <typename Func>
 	void ForEach(Func&& func) const {
@@ -79,6 +95,7 @@ public:
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
+		if (Fast()) return Covered(address, end);
 		auto       it  = m_ranges.upper_bound(address);
 		if (it == m_ranges.begin()) {
 			return false;
@@ -106,6 +123,23 @@ public:
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 
 private:
+	[[nodiscard]] bool Fast() const {
+		return m_fast_eligible && kyty_local_range_set_fast_mode.load(std::memory_order_relaxed) != 0;
+	}
+
+	// [address, end) lies inside one interval; remembers that interval.
+	bool Covered(uint64_t address, uint64_t end) const {
+		if (m_hint_version == m_version && m_hint_begin <= address && end <= m_hint_end) return true;
+		auto it = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) return false;
+		--it;
+		if (it->first > address || it->second < end) return false;
+		m_hint_version = m_version;
+		m_hint_begin   = it->first;
+		m_hint_end     = it->second;
+		return true;
+	}
+
 	static uint64_t End(uint64_t address, uint64_t size) {
 		if (size == 0 || size > UINT64_MAX - address) {
 			EXIT("invalid range-set address or size\n");
@@ -114,6 +148,9 @@ private:
 	}
 
 	std::map<uint64_t, uint64_t> m_ranges;
+	bool                         m_fast_eligible = false;
+	uint64_t                     m_version = 1;
+	mutable uint64_t             m_hint_version = 0, m_hint_begin = 0, m_hint_end = 0;
 };
 
 } // namespace Libs::Graphics

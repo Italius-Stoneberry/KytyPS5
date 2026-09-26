@@ -64,6 +64,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_ASYNC_UPLOAD", &kyty_local_async_upload_mode},
 	    Switch {"KYTY_BDA_DIRTY_REGIONS", &kyty_local_bda_dirty_regions_mode},
 	    Switch {"KYTY_GLOBAL_BARRIER_DEDUPE", &kyty_local_global_barrier_dedupe},
+	    Switch {"KYTY_RANGE_SET_FAST", &kyty_local_range_set_fast_mode},
 	    // Images and command submission.
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},
