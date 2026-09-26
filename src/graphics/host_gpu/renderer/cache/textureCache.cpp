@@ -29,6 +29,7 @@
 
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_image_granules_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_texture_resolve_pages_mode {0};
 
 namespace Libs::Graphics {
 
@@ -261,12 +262,28 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+void TextureCache::StampRegistrationPages(const Image& image, uint64_t epoch) {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) return;
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) m_registration_pages[page] = epoch;
+}
+
+bool TextureCache::RegistrationsSince(uint64_t address, uint64_t size, uint64_t epoch) const {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) return true;
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		const auto* stamp = m_registration_pages.Find(page);
+		if (stamp != nullptr && *stamp > epoch) return true;
+	}
+	return false;
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
-	m_resolution_epoch.fetch_add(1, std::memory_order_release);
+	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
@@ -292,7 +309,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
-	m_resolution_epoch.fetch_add(1, std::memory_order_release);
+	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1);
 	++m_image_granule_releases;
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
@@ -1534,8 +1551,11 @@ bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
 
 bool TextureCache::TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t epoch) {
 	std::scoped_lock lock {m_lock};
-	if (m_scheduler.Current().IsInvalid() || epoch == 0 ||
-	    epoch != m_resolution_epoch.load(std::memory_order_relaxed) ||
+	const bool epoch_holds =
+	    epoch == m_resolution_epoch.load(std::memory_order_relaxed) ||
+	    (kyty_local_texture_resolve_pages_mode.load(std::memory_order_relaxed) != 0 && epoch != 0 &&
+	     !RegistrationsSince(desc.info.data.address, desc.info.data.size, epoch));
+	if (m_scheduler.Current().IsInvalid() || epoch == 0 || !epoch_holds ||
 	    desc.type != BindingType::Texture || desc.info.data.Empty() || desc.info.IsDepth() ||
 	    desc.info.HasMetadata() || desc.info.HasStencil() ||
 	    desc.info.tile_mode == Prospero::TileMode::kDepth) {
