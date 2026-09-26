@@ -1581,6 +1581,9 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		return {};
 	}
 	std::scoped_lock lock {m_lock};
+	if (kyty_local_image_granules_mode.load(std::memory_order_relaxed) == 2 && !MayHaveImages(address, 1)) {
+		return {};
+	}
 	// Only registered images starting at `address` qualify.
 	if (!m_image_starts.contains(address)) {
 		return {};

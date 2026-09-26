@@ -42,6 +42,7 @@ extern volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode;
 extern volatile std::atomic<uint32_t> kyty_local_global_barrier_dedupe;
 // 1: RangeSet fast paths for the GPU-modified range set (rangeSet.h).
 extern volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode;
-// 1: region image queries first test a 64 KiB granule bitmap (textureCache.cpp).
+// 1: region image queries first test a 64 KiB granule bitmap (textureCache.cpp);
+// 2: image-start queries as well.
 extern volatile std::atomic<uint32_t> kyty_local_image_granules_mode;
 }
