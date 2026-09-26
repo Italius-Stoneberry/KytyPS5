@@ -1239,6 +1239,8 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
+		// Re-initialized from guest memory: the GPU contents are gone.
+		image.ClearGpuModified();
 	}
 }
 
@@ -2129,6 +2131,10 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 		}
 		if (owner->Overlaps(address, size)) {
 			owner->InvalidateCpuWrite(address, size);
+			// The CPU wrote into the image: its next use re-initializes it from guest
+			// memory, so it no longer owns the range. Keeping the GPU mark let a dead image
+			// in reused memory refuse CPU-side reads of the new data until eviction.
+			owner->ClearGpuModified();
 			UntrackImage(id);
 			continue;
 		}
