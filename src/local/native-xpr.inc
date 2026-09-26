@@ -43,6 +43,8 @@ extern "C" {
 // 1: objects are drawn in last frame's order, so the record that followed this
 // one last frame is prefetched while this draw runs.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_predict_mode {0};
+// 1: native image proofs check the image's own registration (see NativeXprValidateResources).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_image_proof_mode {0};
 }
 namespace {
 // word_patch value of a logged word whose change reaches nothing the evaluation produces.
@@ -183,6 +185,7 @@ struct RenderExecutor::NativeXprRecord {
 		// The image object the set's views belong to: a deleted image's slot can
 		// hold another image with the same backing, which IsSampledImageCurrent accepts.
 		uint64_t              serial = 0;
+		uint32_t              registration = 0; // the image's registration the proof saw
 	};
 	std::vector<uint32_t> key;
 	// The first key words again, inline: a lookup compares most keys without
@@ -792,7 +795,8 @@ const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
 				const auto& view = image.desc.view_info;
 				image_deps.push_back({image.image_id, image.desc, image.layout,
 				                      {view.base_level, view.level_count, view.base_layer, view.layer_count},
-				                      textures.m_slot_images[image.image_id].serial});
+				                      textures.m_slot_images[image.image_id].serial,
+				                      textures.m_slot_images[image.image_id].registrations});
 			}
 		}
 	}
@@ -1126,7 +1130,8 @@ bool RenderExecutor::NativeXprRebindSlots(NativeXprRecord& record,
 				const auto& view = image.desc.view_info;
 				record.images.push_back({image.image_id, image.desc, image.layout,
 				                         {view.base_level, view.level_count, view.base_layer, view.layer_count},
-				                         textures.m_slot_images[image.image_id].serial});
+				                         textures.m_slot_images[image.image_id].serial,
+				                         textures.m_slot_images[image.image_id].registrations});
 			}
 		record.resolution_epoch = textures.ResolutionEpoch();
 	}
@@ -2030,11 +2035,19 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 	// Images: the same objects (views alive), registered with the same backing,
 	// contents current.
 	const bool registrations_moved = textures.ResolutionEpoch() != record.resolution_epoch;
+	// KYTY_NATIVE_IMAGE_PROOF: other images' registrations move the global epoch every
+	// frame; an image still in the registration the proof saw passes the same checks.
+	const bool per_image = kyty_local_native_image_proof_mode.load(std::memory_order_relaxed) != 0;
 	for (const auto& dep: record.images) {
-		const auto* image = textures.m_slot_images.try_get(dep.id);
-		if (image == nullptr || image->serial != dep.serial || image->IsCpuDirty() ||
-		    (registrations_moved && !textures.IsSampledImageCurrent(dep.id, dep.desc))) {
-			return false;
+		auto* image = textures.m_slot_images.try_get(dep.id);
+		if (image == nullptr || image->serial != dep.serial || image->IsCpuDirty()) return false;
+		if (registrations_moved) {
+			if (per_image && image->registered && image->registrations == dep.registration &&
+			    !image->depth_id && !image->binding.needs_rebind) {
+				image->tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
+			} else if (!textures.IsSampledImageCurrent(dep.id, dep.desc)) {
+				return false;
+			}
 		}
 		(void)textures.GetImage(dep.id); // LRU, as FindTexture does
 	}

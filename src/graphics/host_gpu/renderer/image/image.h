@@ -174,6 +174,8 @@ public:
 	uint64_t         transit_group      = 0;
 	// Unique per image object: a deleted image's slot id goes to later images.
 	uint64_t         serial             = 0;
+	// RegisterImage calls on this object: a proof names one registration.
+	uint32_t         registrations      = 0;
 
 private:
 	friend struct ImageTestAccess;

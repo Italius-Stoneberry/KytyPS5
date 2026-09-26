@@ -282,6 +282,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_start_epoch.store(epoch, std::memory_order_release);
 	}
 	image.registered = true;
+	++image.registrations;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
 }
