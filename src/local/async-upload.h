@@ -43,7 +43,18 @@ public:
 			Kick();
 			_mm_pause();
 		}
-		m_jobs[head % Capacity] = {destination, source, size};
+		m_jobs[head % Capacity] = {destination, source, size, nullptr, nullptr};
+		m_head.store(head + 1, std::memory_order_seq_cst);
+		return head + 1;
+	}
+	// Render thread only: runs call(context, a, b) on the worker in queue order.
+	uint64_t PushCall(void (*call)(void*, uint64_t, uint64_t), void* context, uint64_t a, uint64_t b) {
+		const uint64_t head = m_head.load(std::memory_order_relaxed);
+		while (head - m_done.load(std::memory_order_acquire) >= Capacity) {
+			Kick();
+			_mm_pause();
+		}
+		m_jobs[head % Capacity] = {reinterpret_cast<uint8_t*>(a), nullptr, b, call, context};
 		m_head.store(head + 1, std::memory_order_seq_cst);
 		return head + 1;
 	}
@@ -72,6 +83,8 @@ private:
 		uint8_t*       destination;
 		const uint8_t* source;
 		uint64_t       size;
+		void (*call)(void*, uint64_t, uint64_t); // with destination as `a`, size as `b`
+		void* context;
 	};
 
 	void Run() {
@@ -108,7 +121,8 @@ private:
 			}
 			for (; done < head; ++done) {
 				const Job& job = m_jobs[done % Capacity];
-				std::memcpy(job.destination, job.source, job.size);
+				if (job.call != nullptr) job.call(job.context, reinterpret_cast<uint64_t>(job.destination), job.size);
+				else std::memcpy(job.destination, job.source, job.size);
 			}
 			m_done.store(done, std::memory_order_seq_cst);
 			if (m_waiters.load(std::memory_order_seq_cst) != 0) m_done.notify_all();

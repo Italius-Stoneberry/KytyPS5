@@ -26,6 +26,7 @@
 
 namespace Libs::Graphics {
 namespace {
+thread_local std::vector<PageManager::DeferredRange>* g_deferred_write_protect = nullptr;
 
 constexpr uint64_t PAGE_SIZE    = TRACKER_PAGE_SIZE;
 constexpr uint64_t REGION_SIZE  = TRACKER_REGION_SIZE;
@@ -241,7 +242,11 @@ struct PageManager::Impl {
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				if (track && !is_read && g_deferred_write_protect != nullptr) {
+					g_deferred_write_protect->push_back({base_addr + range_begin * PAGE_SIZE, range_bytes});
+				} else {
+					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				}
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}
@@ -351,6 +356,10 @@ bool PageManager::HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept 
 			return true;
 		if (page == end) return false;
 	}
+}
+
+void PageManager::SetDeferredWriteProtectSink(std::vector<DeferredRange>* sink) noexcept {
+	g_deferred_write_protect = sink;
 }
 
 void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size) {

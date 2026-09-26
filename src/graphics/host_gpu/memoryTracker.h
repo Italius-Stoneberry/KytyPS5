@@ -14,6 +14,12 @@
 #include <utility>
 #include <vector>
 
+extern "C" {
+// 1: write protection of pages an upload marks clean runs on the upload worker, queued ahead
+// of their copies (needs KYTY_ASYNC_UPLOAD; otherwise it applies before the copies as before).
+extern volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode;
+}
+
 namespace Libs::Graphics {
 
 class MemoryTracker final {
@@ -121,15 +127,32 @@ public:
 		CheckNotInUploadCallback();
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		// KYTY_ASYNC_REPROTECT: the pages this upload marks clean get their write protection
+		// from the upload worker, queued ahead of their copies (see TakeDeferredProtects).
+		const bool defer = !is_written && kyty_local_async_reprotect_mode.load(std::memory_order_relaxed) != 0;
+		std::vector<PageManager::DeferredRange> ranges;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
+			if (defer) PageManager::SetDeferredWriteProtectSink(&ranges);
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
+			if (defer) {
+				PageManager::SetDeferredWriteProtectSink(nullptr);
+				for (const auto& range: ranges) {
+					manager->BeginDeferredProtection();
+					s_deferred.push_back({manager, range.address, range.size});
+				}
+				ranges.clear();
+			}
 			if (!is_written) {
 				manager->lock.unlock();
 			}
 		});
 		upload_func();
+		// Protections the upload did not hand to the worker apply here, still before
+		// anything else can observe the pages as clean.
+		for (const auto& deferred: s_deferred) deferred.manager->ApplyDeferredProtection(deferred.address, deferred.size);
+		s_deferred.clear();
 		if (is_written) {
 			Iterate<false>(vaddr, size,
 			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -141,9 +164,17 @@ public:
 		s_upload_owner = previous_upload_owner;
 	}
 
+	struct DeferredProtect {
+		RegionManager* manager = nullptr;
+		uint64_t       address = 0, size = 0;
+	};
+	// The upload callback takes the protections to queue ahead of its copies.
+	[[nodiscard]] static std::vector<DeferredProtect> TakeDeferredProtects() { return std::exchange(s_deferred, {}); }
+
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+	inline static thread_local std::vector<DeferredProtect> s_deferred;
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {

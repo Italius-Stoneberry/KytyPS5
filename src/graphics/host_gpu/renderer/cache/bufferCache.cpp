@@ -17,6 +17,7 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_upload_mode {0};
 // 1: RangeSet fast paths (rangeSet.h) for the GPU-modified range set.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode {0};
 // 1: pack the LOD report on the GPU instead of a CPU wait and copy.
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // 1: shader constants stream through a host-visible upload ring.
@@ -1005,6 +1006,25 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	}
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+	// KYTY_ASYNC_REPROTECT: the pages being copied were marked clean with their write
+	// protection deferred. It precedes every copy: queued ahead of them when all go to the
+	// worker, applied here otherwise.
+	if (auto deferred = MemoryTracker::TakeDeferredProtects(); !deferred.empty()) {
+		bool queued = mapped != nullptr && AsyncUpload::Enabled() && m_staging_buffer.IsCoherent();
+		for (const auto& copy: copies)
+			queued = queued && LibKernel::Memory::TryGetBackingPointer(buffer.CpuAddress() + copy.dstOffset, copy.size);
+		for (const auto& item: deferred) {
+			if (queued) {
+				AsyncUpload::Get().PushCall(
+				    [](void* manager, uint64_t address, uint64_t size) {
+					    static_cast<RegionManager*>(manager)->ApplyDeferredProtection(address, size);
+				    },
+				    item.manager, item.address, item.size);
+			} else {
+				item.manager->ApplyDeferredProtection(item.address, item.size);
+			}
+		}
+	}
 	if (mapped != nullptr) {
 		// KYTY_ASYNC_UPLOAD: the worker fills coherent staging memory from the backing view
 		// before the submission that carries these copies; ranges without one copy here.

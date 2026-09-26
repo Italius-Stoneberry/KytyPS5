@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <memory>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -26,6 +27,14 @@ public:
 	// Restores the watchers' protection after the host protection of watched pages was
 	// changed behind the tracker's back (a guest mprotect). Unwatched pages keep theirs.
 	void ReapplyProtection(uint64_t vaddr, uint64_t size);
+
+	// KYTY_ASYNC_REPROTECT: while a sink is set on this thread, adding write watchers
+	// updates the page state but records the address ranges instead of changing the host
+	// protection; ReapplyProtection of those ranges applies the current state later.
+	struct DeferredRange {
+		uint64_t address = 0, size = 0;
+	};
+	static void SetDeferredWriteProtectSink(std::vector<DeferredRange>* sink) noexcept;
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);

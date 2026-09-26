@@ -87,7 +87,18 @@ public:
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
 	[[nodiscard]] uint64_t CpuModificationEpoch() const {
+		// Pages marked clean whose write protection is still queued can change unseen:
+		// nothing is provable until the worker applied it (and moved the epoch).
+		if (m_deferred_protects.load(std::memory_order_acquire) != 0) return 0;
 		return m_cpu_epoch.load(std::memory_order_acquire);
+	}
+	// KYTY_ASYNC_REPROTECT: a write protection of pages in this region is queued.
+	void BeginDeferredProtection() noexcept { m_deferred_protects.fetch_add(1, std::memory_order_acq_rel); }
+	// The upload worker (or the render thread as a fallback) applies it.
+	void ApplyDeferredProtection(uint64_t vaddr, uint64_t size) {
+		m_page_manager.ReapplyProtection(vaddr, size);
+		m_cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
+		m_deferred_protects.fetch_sub(1, std::memory_order_acq_rel);
 	}
 
 	template <DirtySource source, bool all = false>
@@ -222,6 +233,7 @@ private:
 	PageManager&          m_page_manager;
 	uint64_t              m_cpu_addr = 0;
 	std::atomic<uint64_t> m_cpu_epoch {1};
+	std::atomic<uint32_t> m_deferred_protects {0};
 	RegionBits            m_cpu_dirty;
 	RegionBits            m_gpu_dirty;
 	RegionBits            m_writable;
