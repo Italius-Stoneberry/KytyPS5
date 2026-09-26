@@ -22,6 +22,7 @@
 #include "libs/errno.h"
 
 #include "debug-delay.h"
+#include "live-census.h"
 #include "draw-state-observer.h"
 #include "live-control.h"
 #include "performance-switches.h"
@@ -757,6 +758,12 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
+	struct QueueScope {
+		explicit QueueScope(uint64_t queue): previous(LiveCensus::g_queue) { LiveCensus::g_queue = queue; }
+		~QueueScope() { LiveCensus::g_queue = previous; }
+		uint64_t previous;
+	} queue_scope(IsAsyncComputeQueue() ? LiveCensus::QueueAsync : 0);
+	LiveCensus::Scope census(LiveCensus::QueueRun, static_cast<uint64_t>(m_interrupt_event_id));
 	ProcessPm4(execution, 0);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;

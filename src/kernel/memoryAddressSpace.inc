@@ -968,7 +968,10 @@ public:
 			return false;
 		}
 		LiveCounters::Add(LiveCounters::ProtectCalls);
-		if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::ProtectCallsRender);
+		if (LiveCensus::g_render) {
+			LiveCounters::Add(LiveCounters::ProtectCallsRender);
+			if (LiveCensus::g_queue == 0) LiveCounters::Add(LiveCounters::ProtectCallsGfx);
+		}
 
 		std::lock_guard lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);

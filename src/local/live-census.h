@@ -19,7 +19,8 @@ enum Kind : uint32_t {
 	SyncDownload  = 6, // a: 1 MiB granule, b: write access
 	GraphicsPrograms = 7, // program lookup and SRT evaluation of a draw
 	NativeGather  = 8, // native XPR record word gather
-	Kinds         = 9
+	QueueRun      = 9, // a: queue (interrupt event id; 0 graphics), whole PM4 run
+	Kinds         = 10
 };
 
 struct Entry {
@@ -32,6 +33,10 @@ constexpr size_t      TableSize = 8192;
 inline std::atomic_bool g_on {false};
 // Set on the render thread: other threads never touch the table.
 inline thread_local bool g_render = false;
+// The queue the render thread is running, ORed into every entry's b: 0 inside the
+// graphics queue, QueueAsync inside an async compute queue, QueueNone outside both.
+constexpr uint64_t      QueueAsync = 1ull << 63, QueueNone = 1ull << 62;
+inline thread_local uint64_t g_queue = QueueNone;
 inline Entry            g_table[TableSize];
 
 inline void Add(uint32_t kind, uint64_t a, uint64_t b, uint64_t cycles) {
@@ -55,7 +60,7 @@ public:
 		if (m_on) {
 			m_kind  = kind;
 			m_a     = a;
-			m_b     = b;
+			m_b     = b | g_queue;
 			m_start = __rdtsc();
 		}
 	}
