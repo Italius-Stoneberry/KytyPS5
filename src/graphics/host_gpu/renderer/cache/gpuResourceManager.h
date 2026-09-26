@@ -50,6 +50,7 @@ public:
 
 private:
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);
+	void                      SynchronizeDirtyBdaRegions(GuestRange range);
 	void RefreshBdaRanges();
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;

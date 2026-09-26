@@ -2,11 +2,18 @@
 #include "live-census.h"
 #include "live-counters.h"
 #include "async-upload.h"
+#include "graphics/host_gpu/bdaDirtyRegions.h"
+
+#include <bit>
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "kernel/memory.h"
+
+extern "C" {
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode {0};
+}
 
 namespace Libs::Graphics {
 
@@ -147,6 +154,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 void GpuResourceManager::RefreshBdaRanges() {
 	const auto registered = m_buffer_cache.RegistrationEpoch();
 	if (m_bda_mapping_epoch == m_mapping_epoch && m_bda_registration_epoch == registered) return;
+	LiveCounters::Add(LiveCounters::BdaRebuilds);
 	std::vector<RangeSet::Range> ranges;
 	m_buffer_cache.CollectMappedRegisteredRanges(m_mapped_ranges, ranges);
 	m_bda_region_requests.clear();
@@ -160,6 +168,8 @@ void GpuResourceManager::RefreshBdaRanges() {
 	}
 	m_bda_mapping_epoch = m_mapping_epoch;
 	m_bda_registration_epoch = registered;
+	// Every request starts unproven.
+	BdaDirtyRegions::MarkAll();
 }
 
 bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges) {
@@ -167,6 +177,15 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 	    std::ranges::any_of(ranges, [](const auto& range) { return !range.Valid(); })) return false;
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	RefreshBdaRanges();
+	LiveCounters::Add(LiveCounters::BdaRangeCalls);
+	LiveCounters::Add(LiveCounters::BdaRanges, ranges.size());
+	for (const auto range : ranges) LiveCounters::Add(LiveCounters::BdaRangeMiB, range.size >> 20u);
+	if (kyty_local_bda_dirty_regions_mode.load(std::memory_order_relaxed) != 0) {
+		// KYTY_BDA_DIRTY_REGIONS: only regions whose bit is set can hold a stale request.
+		for (const auto range : ranges) SynchronizeDirtyBdaRegions(range);
+		m_fault_process_pending = true;
+		return true;
+	}
 	for (const auto range : ranges) {
 		auto it = std::lower_bound(m_bda_region_requests.begin(), m_bda_region_requests.end(), range.address,
 		    [](const auto& request, uint64_t begin) { return request.address + request.size <= begin; });
@@ -177,8 +196,35 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 	return true;
 }
 
+void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {
+	const auto first = range.address / TRACKER_REGION_SIZE;
+	if (first >= BdaDirtyRegions::Regions) return;
+	const auto last = std::min((range.End() - 1) / TRACKER_REGION_SIZE, BdaDirtyRegions::Regions - 1);
+	for (auto word = first / 64; word <= last / 64; ++word) {
+		auto mask = ~uint64_t {0};
+		if (word == first / 64) mask &= ~uint64_t {0} << (first % 64);
+		if (word == last / 64) mask &= ~uint64_t {0} >> (63 - last % 64);
+		auto& bits = BdaDirtyRegions::g_bits[word];
+		for (auto pending = bits.load(std::memory_order_acquire) & mask; pending != 0; pending &= pending - 1) {
+			const auto bit = uint64_t {1} << std::countr_zero(pending);
+			// Clear before synchronizing: a CPU write after the epoch read sets it again.
+			if ((bits.fetch_and(~bit, std::memory_order_acq_rel) & bit) == 0) continue;
+			const auto region_begin = (word * 64 + static_cast<uint64_t>(std::countr_zero(pending))) * TRACKER_REGION_SIZE;
+			auto it = std::lower_bound(m_bda_region_requests.begin(), m_bda_region_requests.end(), region_begin,
+			    [](const auto& request, uint64_t begin) { return request.address + request.size <= begin; });
+			bool unproven = false;
+			for (; it != m_bda_region_requests.end() && it->address < region_begin + TRACKER_REGION_SIZE; ++it) {
+				m_buffer_cache.SynchronizeRegionRequest(*it);
+				unproven |= it->cpu_epoch == 0;
+			}
+			if (unproven) BdaDirtyRegions::Mark(region_begin / TRACKER_REGION_SIZE);
+		}
+	}
+}
+
 void GpuResourceManager::PrepareBda() {
 	// Unknown shader addresses cannot prove disjointness from an in-flight readback.
+	LiveCounters::Add(LiveCounters::BdaFullSyncs);
 	m_buffer_cache.DrainGuestReadback();
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	RefreshBdaRanges();

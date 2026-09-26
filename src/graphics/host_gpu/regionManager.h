@@ -5,6 +5,7 @@
 #include "live-counters.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/bdaDirtyRegions.h"
 
 #include <atomic>
 #include <mutex>
@@ -121,6 +122,7 @@ public:
 				// Invalidate cached clean proofs before another CPU thread can write
 				// through the relaxed host protection. A cache miss takes this lock.
 				m_cpu_epoch.fetch_add(1, std::memory_order_release);
+				BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
 			}
 			UpdateCpuProtection<!enable>();
 		} else {

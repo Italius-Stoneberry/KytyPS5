@@ -32,13 +32,21 @@ enum Id : uint32_t {
 	RenderReadFaults,      // read faults taken by the render thread itself
 	SrtWatchedReads,       // SRT word reads on watched (GPU-owned neighbour) pages
 	Submissions,           // submissions processed (slices)
+	BufferRegistrations,   // buffer cache registrations and unregistrations
+	BdaRebuilds,           // BDA region list rebuilds (mapping or registration changed)
+	RegionSyncs,           // BDA region requests that re-synchronized their buffers
+	RegionSkips,           // ... proven unchanged by their epochs
+	BdaFullSyncs,          // unbounded BDA preparations (every region)
+	BdaRangeCalls,         // bounded BDA preparations
+	BdaRanges,             // ... their ranges
+	BdaRangeMiB,           // ... their total size in MiB
 	Count
 };
 
 inline constexpr const char* Names[Count] = {
     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices"};
+    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib"};
 
 inline std::atomic<uint64_t> g_values[Count];
 // Render thread: the last draw (0) or dispatch shader address.

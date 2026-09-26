@@ -5,6 +5,7 @@
 #include "live-counters.h"
 #include "native-resource-state.h"
 #include "async-upload.h"
+#include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "gpu_tiler_shaders/lod_stats_pack_spv.h"
 
 extern "C" {
@@ -431,6 +432,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 	DrainGuestReadback(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size());
 	m_sync_buffers_valid = false;
 	++m_registration_epoch;
+	// Region requests prove their state against the global registration epoch.
+	BdaDirtyRegions::MarkAll();
+	LiveCounters::Add(LiveCounters::BufferRegistrations);
 	auto& buffer = m_slot_buffers[id];
 	if constexpr (!insert) InvalidateCopyFeedback(buffer.CpuAddress(), buffer.Size());
 	PageTable::PageRange pages {};
@@ -1293,8 +1297,11 @@ void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
 	DrainGuestReadback(request.address, request.size, true);
 	const auto epoch = m_memory_tracker.CpuModificationEpoch(request.address, request.size);
 	const auto registered = m_registration_epoch;
-	if (epoch != 0 && request.cpu_epoch == epoch && request.registration_epoch == registered)
+	if (epoch != 0 && request.cpu_epoch == epoch && request.registration_epoch == registered) {
+		LiveCounters::Add(LiveCounters::RegionSkips);
 		return;
+	}
+	LiveCounters::Add(LiveCounters::RegionSyncs);
 	SynchronizeBuffersInRange(request.address, request.size);
 	request.cpu_epoch = 0;
 	if (epoch != 0 && m_registration_epoch == registered &&
