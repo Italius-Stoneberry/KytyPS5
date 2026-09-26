@@ -211,6 +211,12 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+	// KYTY_IMAGE_GRANULES: a bit per 64 KiB granule that a registered image covered
+	// since the last rebuild (a superset); region queries skip the page walk on a miss.
+	mutable std::vector<uint64_t> m_image_granules;
+	mutable uint32_t              m_image_granule_releases = 0;
+	void                          MarkImageGranules(uint64_t address, uint64_t size) const;
+	[[nodiscard]] bool            MayHaveImages(uint64_t address, uint64_t size) const;
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;

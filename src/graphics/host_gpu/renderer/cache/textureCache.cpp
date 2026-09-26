@@ -28,6 +28,7 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_image_granules_mode {0};
 
 namespace Libs::Graphics {
 
@@ -273,6 +274,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		m_image_page_table[page].push_back(id);
 	}
+	MarkImageGranules(image.info.data.address, image.info.data.size);
 	if (m_image_starts[image.info.data.address]++ == 0) {
 		const auto epoch = m_start_epoch.load(std::memory_order_relaxed) + 1;
 		if (m_start_log.size() >= 8192) m_start_log.erase(m_start_log.begin(), m_start_log.begin() + 4096);
@@ -290,6 +292,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		return;
 	}
 	m_resolution_epoch.fetch_add(1, std::memory_order_release);
+	++m_image_granule_releases;
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
@@ -498,10 +501,48 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	}
 }
 
+namespace {
+constexpr uint32_t ImageGranuleBits  = 16;
+constexpr uint64_t ImageGranuleSpace = uint64_t {1} << 40; // the image page table's address space
+} // namespace
+
+void TextureCache::MarkImageGranules(uint64_t address, uint64_t size) const {
+	if (size == 0 || address >= ImageGranuleSpace) return;
+	if (m_image_granules.empty()) m_image_granules.assign((ImageGranuleSpace >> ImageGranuleBits) / 64, 0);
+	const uint64_t last = (std::min(address + size, ImageGranuleSpace) - 1) >> ImageGranuleBits;
+	for (uint64_t g = address >> ImageGranuleBits; g <= last; ++g) m_image_granules[g >> 6] |= uint64_t {1} << (g & 63);
+}
+
+bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const {
+	if (kyty_local_image_granules_mode.load(std::memory_order_relaxed) == 0 || m_image_granules.empty() ||
+	    size == 0 || address >= ImageGranuleSpace || size > ImageGranuleSpace - address)
+		return true;
+	if (m_image_granule_releases > 4096) {
+		// Released images leave their bits; rebuild from the registered ones.
+		std::fill(m_image_granules.begin(), m_image_granules.end(), 0);
+		m_slot_images.ForEach([&](ImageId, const Image& image) {
+			if (image.registered) MarkImageGranules(image.info.data.address, image.info.data.size);
+		});
+		m_image_granule_releases = 0;
+	}
+	const uint64_t last = (address + size - 1) >> ImageGranuleBits;
+	for (uint64_t g = address >> ImageGranuleBits; g <= last;) {
+		const uint64_t bit  = g & 63;
+		const uint64_t span = std::min<uint64_t>(64 - bit, last - g + 1);
+		const uint64_t mask = (span == 64 ? ~uint64_t {0} : (uint64_t {1} << span) - 1) << bit;
+		if ((m_image_granules[g >> 6] & mask) != 0) return true;
+		g += span;
+	}
+	return false;
+}
+
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
                                                         bool page_overlap) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return {};
+	}
+	if (!MayHaveImages(address, size)) {
 		return {};
 	}
 
