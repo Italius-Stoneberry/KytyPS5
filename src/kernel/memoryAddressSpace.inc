@@ -381,6 +381,39 @@ public:
 		}
 #endif
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+		// Only the unmapped pages get a placeholder, under the lock. Mapping the
+		// neighbours again would reset their protection (GPU page tracking, guest
+		// mprotect) and leave a window in which their still-mapped pages have no entry.
+		std::lock_guard lock(m_mutex);
+		const auto      next = m_maps.upper_bound(vaddr);
+		if (next == m_maps.begin()) {
+			return false;
+		}
+		const auto entry = std::prev(next);
+		const auto old   = entry->second;
+		if (vaddr + size > old.vaddr + old.size) {
+			return false;
+		}
+		BackingWriteFence fence(*this);
+		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size)) {
+			return false;
+		}
+		InvalidateMappingLookup();
+		m_maps.erase(entry);
+		if (vaddr != old.vaddr) {
+			m_maps.emplace(old.vaddr,
+			               MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode});
+		}
+		if (const auto right = vaddr + size; right != old.vaddr + old.size) {
+			m_maps.emplace(right, MapEntry {right, old.vaddr + old.size - right,
+			                                old.backing_offset + (right - old.vaddr), old.mode});
+		}
+		if (placeholder_preserved != nullptr) {
+			*placeholder_preserved = true;
+		}
+		return true;
+#else
 		MapEntry old {};
 		{
 			std::lock_guard lock(m_mutex);
@@ -422,7 +455,6 @@ public:
 		const uint64_t old_end    = old.vaddr + old.size;
 		const uint64_t right_size = old_end - right_addr;
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;
 			if (left_size != 0 && left_size != old.size) {
@@ -466,42 +498,6 @@ public:
 		InvalidateMappingLookup();
 		m_maps.emplace(old.vaddr, old);
 		return false;
-#else
-		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
-			std::lock_guard lock(m_mutex);
-			BackingWriteFence fence(*this);
-			InvalidateMappingLookup();
-			m_maps.emplace(old.vaddr, old);
-			return false;
-		}
-
-		bool ok = true;
-		if (left_size != 0) {
-			ok = MapExistingPlaceholderFixed(old.vaddr, left_size, old.backing_offset, old.mode) &&
-			     ok;
-		}
-		if (right_size != 0) {
-			ok = MapExistingPlaceholderFixed(right_addr, right_size,
-			                                 old.backing_offset + (right_addr - old.vaddr),
-			                                 old.mode) &&
-			     ok;
-		}
-		if (!ok) {
-			if (left_size != 0 && Contains(old.vaddr, left_size)) {
-				EXIT_IF(!UnmapOne(old.vaddr, left_size));
-			}
-			if (right_size != 0 && Contains(right_addr, right_size)) {
-				EXIT_IF(!UnmapOne(right_addr, right_size));
-			}
-			EXIT_IF(
-			    !MapExistingPlaceholderFixed(old.vaddr, old.size, old.backing_offset, old.mode));
-			return false;
-		}
-
-		if (placeholder_preserved != nullptr) {
-			*placeholder_preserved = true;
-		}
-		return ok;
 #endif
 	}
 

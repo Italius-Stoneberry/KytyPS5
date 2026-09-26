@@ -683,6 +683,58 @@ void TestFlexibleMemoryUsesSharedBacking() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// The host protection of one page as "rw", "r-" or "--", from /proc/self/maps.
+std::string HostProtection(uint64_t addr) {
+	std::string result;
+	if (std::FILE* maps = std::fopen("/proc/self/maps", "r"); maps != nullptr) {
+		char line[512];
+		while (result.empty() && std::fgets(line, sizeof(line), maps) != nullptr) {
+			unsigned long start = 0, end = 0;
+			char          perms[8] {};
+			if (std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) == 3 && addr >= start &&
+			    addr < end) {
+				result.assign(perms, 2);
+			}
+		}
+		std::fclose(maps);
+	}
+	return result;
+}
+
+void TestPartialUnmapKeepsNeighbourViews() {
+	const char* test = "PartialUnmapKeepsNeighbourViews";
+	const auto  base = MapNamedFlexible(test, SceKernelPageSize * 3, SceKernelProtCpuRw, "partial");
+	const auto  last = base + SceKernelPageSize * 2;
+	// The GPU tracker write-protects the pages it uploaded.
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize,
+	                                                      Common::VirtualMemory::Mode::Read),
+	      "tracker protection failed");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle)");
+	Check(test, HostProtection(base) == "r-" && HostProtection(last) == "rw",
+	      "a partial unmap reset the protection of the pages around it");
+	constexpr uint64_t value = 0x5352554f42484749ull;
+	Check(test,
+	      Libs::LibKernel::Memory::TryWriteBacking(base, &value, sizeof(value)) &&
+	          Libs::LibKernel::Memory::TryWriteBacking(last, &value, sizeof(value)),
+	      "the pages around a partial unmap lost their backing entries");
+	Check(test,
+	      !Libs::LibKernel::Memory::TryWriteBacking(base + SceKernelPageSize, &value,
+	                                                sizeof(value)),
+	      "the unmapped page kept its backing entry");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize,
+	                                                      Common::VirtualMemory::Mode::ReadWrite),
+	      "tracker unprotection failed");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize), "KernelMunmap(first)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(last, SceKernelPageSize), "KernelMunmap(last)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
 void TestFlexibleDmemCompatAndAlignmentFlags() {
 	const char* test     = "FlexibleDmemCompatAndAlignmentFlags";
 	const auto  baseline = AvailableFlexibleMemory(test);
@@ -2711,6 +2763,9 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
 	RunTest(TestFlexibleMemoryUsesSharedBacking);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	RunTest(TestPartialUnmapKeepsNeighbourViews);
+#endif
 	RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
 	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);

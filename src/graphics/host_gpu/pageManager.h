@@ -23,6 +23,10 @@ public:
 	// a backing alias. A missing hint retains the normal faulting guest load.
 	[[nodiscard]] bool HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept;
 
+	// Restores the watchers' protection after the host protection of watched pages was
+	// changed behind the tracker's back (a guest mprotect). Unwatched pages keep theirs.
+	void ReapplyProtection(uint64_t vaddr, uint64_t size);
+
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>

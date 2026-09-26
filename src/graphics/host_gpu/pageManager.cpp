@@ -284,6 +284,30 @@ struct PageManager::Impl {
 		release_pending();
 	}
 
+	void ReapplyProtection(uint64_t vaddr, uint64_t size) {
+		const auto begin = PageStart(vaddr);
+		const auto end   = PageEnd(vaddr, size);
+		for (auto chunk_begin = begin; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, (chunk_begin / REGION_SIZE + 1) * REGION_SIZE);
+			const auto region_base = chunk_begin / REGION_SIZE * REGION_SIZE;
+			if (auto* region = FindRegion(chunk_begin); region != nullptr) {
+				SpinGuard lock(region->lock);
+				const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+				for (auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+				     first < last;) {
+					const auto perms = region->pages[first].Perms();
+					auto       next  = first + 1;
+					while (next < last && region->pages[next].Perms() == perms) next++;
+					if (perms != READ_WRITE_PROTECTION) {
+						Protect(region_base + first * PAGE_SIZE, (next - first) * PAGE_SIZE, perms);
+					}
+					first = next;
+				}
+			}
+			chunk_begin = chunk_end;
+		}
+	}
+
 	template <bool track, bool is_read>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 		const auto begin = PageStart(vaddr);
@@ -327,6 +351,10 @@ bool PageManager::HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept 
 			return true;
 		if (page == end) return false;
 	}
+}
+
+void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size) {
+	m_impl->ReapplyProtection(vaddr, size);
 }
 
 template <bool track>
