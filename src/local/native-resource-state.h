@@ -39,4 +39,5 @@ extern volatile std::atomic<uint32_t> kyty_local_readback_slots_mode;
 extern volatile std::atomic<uint32_t> kyty_local_async_upload_mode;
 // 1: a bounded BDA preparation visits only regions whose CPU state may have changed.
 extern volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode;
+extern volatile std::atomic<uint32_t> kyty_local_global_barrier_dedupe;
 }

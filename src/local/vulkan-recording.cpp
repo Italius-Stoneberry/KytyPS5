@@ -272,10 +272,12 @@ void BeforeDirect() {
     if (producer) producer->BeforeDirect();
 }
 
+std::atomic<uint64_t> g_work_calls {0};
 #include "local-vulkan-recording.inc"
 } // namespace
 
 void Install() { InstallDispatch(); }
+uint64_t WorkCalls() { return g_work_calls.load(std::memory_order_relaxed); }
 void Drain() { if (producer) producer->Drain(); }
 bool PacketsEnabled() {
     return producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0;

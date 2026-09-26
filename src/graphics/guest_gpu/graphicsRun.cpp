@@ -49,6 +49,8 @@ extern "C" {
 // while the renderer consumes the previous one; guest reads of GPU-written
 // memory are then served by asynchronous readbacks (BufferCache).
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode {0};
+// 1: a full barrier with no recorded work since the previous one is skipped.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_global_barrier_dedupe {0};
 }
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
@@ -1712,6 +1714,16 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 void CommandProcessor::EmitGlobalBarrier() {
 	CheckBuffer();
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	{
+		// KYTY_GLOBAL_BARRIER_DEDUPE: a barrier orders all earlier work in submission order, so
+		// one with nothing recorded since the previous barrier orders nothing new.
+		static uint64_t last_work = UINT64_MAX;
+		const auto      work      = LocalVulkanRecording::WorkCalls();
+		if (work == last_work && kyty_local_global_barrier_dedupe.load(std::memory_order_relaxed) != 0) return;
+		last_work = work + 1; // this barrier's own recorded call
+	}
+#endif
 
 	Common::LockGuard lock(m_renderer.GetMutex());
 

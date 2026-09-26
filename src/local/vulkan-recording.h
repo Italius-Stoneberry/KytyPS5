@@ -35,6 +35,9 @@ void ReplayInline(ReplayPacket replay, std::span<const Segment> segments);
 bool DeferredSubmitEnabled();
 bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, bool publish);
 uint64_t StateEpoch();
+// Recorded commands that do GPU work or synchronize (draws, dispatches, copies, clears,
+// rendering scopes, barriers): unchanged between two barriers = no work in between.
+uint64_t WorkCalls();
 class ProducerScope {
 public:
     ProducerScope();
