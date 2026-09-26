@@ -36,9 +36,12 @@
 #include <deque>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -300,6 +303,15 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
+		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+		                                               specialization, push_data_start_dword);
+		return FinishPermutation(params, options, std::move(result), std::move(specialization));
+	}
+
+	// The device half of CompilePermutation; the SPIR-V may come from a warmup worker.
+	Permutation FinishPermutation(const ShaderParams& params, const ShaderRecompiler::CompileOptions& options,
+	                              ShaderRecompiler::CompileResult              result,
+	                              ShaderRecompiler::IR::ResourceSpecialization specialization) {
 		const char* stage_name = nullptr;
 		switch (options.stage) {
 			case ShaderType::Vertex: stage_name = "vs"; break;
@@ -308,8 +320,6 @@ struct PipelineCache::ProgramCache {
 			case ShaderType::Compute: stage_name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
-		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                               specialization, push_data_start_dword);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
@@ -522,6 +532,91 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	// Warmup recompiles on KYTY_SHADER_WARMUP_THREADS workers (default 1: this thread
+	// only). Recompiling a record is pure, so workers translate a chunk to SPIR-V and
+	// Warm registers the results in the serial order: the same entries, permutations
+	// and handle ids; a worker's result for a record Warm then skips is dropped.
+	struct WarmJob {
+		LocalShaderWarmup::Record          record;
+		std::vector<uint32_t>              user_data;
+		ShaderRecompiler::IR::ResourcePlan plan;
+		ShaderRecompiler::CompileResult    result;
+	};
+
+	static uint32_t WarmupThreads() {
+		uint32_t threads = 1;
+		if (const char* value = std::getenv("KYTY_SHADER_WARMUP_THREADS"); value && *value) {
+			const auto end    = value + std::strlen(value);
+			const auto parsed = std::from_chars(value, end, threads);
+			if (parsed.ec != std::errc {} || parsed.ptr != end || threads == 0 || threads > 64) threads = 1;
+		}
+		return threads;
+	}
+
+	static std::unique_ptr<WarmJob> PrepareWarmJob(std::span<const uint32_t> saved) {
+		auto                      job = std::make_unique<WarmJob>();
+		LocalShaderWarmup::Reader reader {saved};
+		if (!LocalShaderWarmup::Visit(reader, job->record) || !LocalShaderWarmup::ValidKey(job->record)) return nullptr;
+		job->user_data.resize(job->record.user_data_count);
+		const auto options = LocalShaderWarmup::Options(job->record, job->user_data);
+		auto translated    = ShaderRecompiler::TranslateProgram(job->record.code, options);
+		job->plan          = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		job->result        = ShaderRecompiler::CompileProgram(std::move(translated), options, job->record.specialization,
+		                                                      job->record.push_cursor);
+		return job;
+	}
+
+	// Streams the records, in Warm's descending order, through the workers; they stay
+	// at most Window records ahead because a result holds a whole program.
+	class WarmWorkers {
+	public:
+		WarmWorkers(const std::vector<std::vector<uint32_t>>& records, uint32_t threads)
+		    : records(records), jobs(records.size()), ready(records.size()) {
+			for (uint32_t t = 0; t < threads; ++t) pool.emplace_back([this] { Run(); });
+		}
+		~WarmWorkers() {
+			stop.store(true, std::memory_order_relaxed);
+			consumed.fetch_add(1, std::memory_order_release);
+			consumed.notify_all();
+			for (auto& thread: pool) thread.join();
+		}
+		WarmWorkers(const WarmWorkers&)            = delete;
+		WarmWorkers& operator=(const WarmWorkers&) = delete;
+		// Warm takes every index once, in descending order; null for an invalid record.
+		std::unique_ptr<WarmJob> Take(size_t index) {
+			ready[index].wait(0, std::memory_order_acquire);
+			consumed.fetch_add(1, std::memory_order_release);
+			consumed.notify_all();
+			return std::move(jobs[index]);
+		}
+
+	private:
+		static constexpr size_t Window = 512;
+		void Run() {
+			for (;;) {
+				const size_t n = taken.fetch_add(1, std::memory_order_relaxed);
+				if (n >= jobs.size()) return;
+				for (size_t c = consumed.load(std::memory_order_acquire); n >= c + Window;
+				     c = consumed.load(std::memory_order_acquire)) {
+					if (stop.load(std::memory_order_relaxed)) return;
+					consumed.wait(c, std::memory_order_acquire);
+				}
+				if (stop.load(std::memory_order_relaxed)) return;
+				const size_t index = jobs.size() - 1 - n;
+				jobs[index]        = PrepareWarmJob(records[index]);
+				ready[index].store(1, std::memory_order_release);
+				ready[index].notify_one();
+			}
+		}
+		const std::vector<std::vector<uint32_t>>& records;
+		std::vector<std::unique_ptr<WarmJob>>     jobs;
+		std::vector<std::atomic<uint8_t>>         ready;
+		std::atomic<size_t>                       taken {0};
+		std::atomic<size_t>                       consumed {0};
+		std::atomic<bool>                         stop {false};
+		std::vector<std::thread>                  pool;
+	};
+
 	void Warm(const std::filesystem::path& path, const std::string& identity, bool compile) {
 		if (!warmup.Open(path, identity))
 			PipelineCacheLog("Shader warmup: ignoring invalid cache {}", Common::PathToString(path));
@@ -544,13 +639,22 @@ struct PipelineCache::ProgramCache {
 		if (budget_seconds) warm_deadline = begin + std::chrono::seconds(budget_seconds);
 		warm_permutations.resize(warmup.records.size());
 		size_t compiled = 0;
+		const uint32_t threads = WarmupThreads();
+		std::optional<WarmWorkers> workers;
+		if (threads > 1) workers.emplace(warmup.records, threads);
 		for (size_t remaining = warmup.records.size(); remaining != 0; --remaining) {
 			const size_t index = remaining - 1;
 			if (std::chrono::steady_clock::now() >= warm_deadline) break;
-			const auto& saved = warmup.records[index];
-			LocalShaderWarmup::Record record;
-			LocalShaderWarmup::Reader reader {saved};
-			if (!LocalShaderWarmup::Visit(reader, record) || !LocalShaderWarmup::ValidKey(record)) continue;
+			std::unique_ptr<WarmJob> job;
+			LocalShaderWarmup::Record parsed;
+			if (workers) {
+				job = workers->Take(index);
+				if (!job) continue;
+			} else {
+				LocalShaderWarmup::Reader reader {warmup.records[index]};
+				if (!LocalShaderWarmup::Visit(reader, parsed) || !LocalShaderWarmup::ValidKey(parsed)) continue;
+			}
+			auto& record = job ? job->record : parsed;
 			ProgramKey key {record.stage, record.hash, record.user_data_count,
 			                static_cast<uint32_t>(record.code.size()), record.static_key};
 			auto entry = programs.find(key);
@@ -565,25 +669,39 @@ struct PipelineCache::ProgramCache {
 			}
 			// The compiler consumes the user-data width; values are resolved anew by
 			// MaterializeResources when the guest actually draws or dispatches.
-			std::vector<uint32_t> user_data(record.user_data_count);
+			std::vector<uint32_t> user_data = job ? std::move(job->user_data) : std::vector<uint32_t>(record.user_data_count);
 			auto options = LocalShaderWarmup::Options(record, user_data);
-			auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
-			if (entry == programs.end()) {
-				auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-				entry = programs.try_emplace(std::move(key), std::move(plan)).first;
-				entry->second.warm_code = record.code;
-				entry->second.warm_back_code = record.back_code;
+			if (job) {
+				if (entry == programs.end()) {
+					entry = programs.try_emplace(std::move(key), std::move(job->plan)).first;
+					entry->second.warm_code = record.code;
+					entry->second.warm_back_code = record.back_code;
+				}
+				ShaderParams params {record.code, std::move(user_data), record.hash, record.back_code};
+				entry->second.permutations.push_back(
+				    FinishPermutation(params, options, std::move(job->result), std::move(record.specialization)));
+			} else {
+				auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
+				if (entry == programs.end()) {
+					auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+					entry = programs.try_emplace(std::move(key), std::move(plan)).first;
+					entry->second.warm_code = record.code;
+					entry->second.warm_back_code = record.back_code;
+				}
+				ShaderParams params {record.code, std::move(user_data), record.hash, record.back_code};
+				entry->second.permutations.push_back(CompilePermutation(params, options, std::move(translated),
+				    std::move(record.specialization), record.push_cursor));
 			}
-			ShaderParams params {record.code, std::move(user_data), record.hash, record.back_code};
-			entry->second.permutations.push_back(CompilePermutation(params, options, std::move(translated),
-			    std::move(record.specialization), record.push_cursor));
 			auto& permutation = entry->second.permutations.back();
 			recorded_programs[permutation.handle.id] = uint32_t(index);
 			warm_permutations[index] = &permutation;
 			if (++compiled % 250 == 0) PipelineCacheLog("Shader warmup: compiling {}/{}", compiled, warmup.records.size());
 		}
-		PipelineCacheLog("Shader warmup: compiled {}/{} permutations in {} ms", compiled, warmup.records.size(),
-		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+		workers.reset();
+		PipelineCacheLog("Shader warmup: compiled {}/{} permutations in {} ms ({} threads)", compiled,
+		    warmup.records.size(),
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(),
+		    threads);
 	}
 	LocalShaderWarmup::Cache warmup;
 	std::unordered_map<uint64_t, uint32_t> recorded_programs;
