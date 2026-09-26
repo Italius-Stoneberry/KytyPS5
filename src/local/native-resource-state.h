@@ -49,4 +49,6 @@ extern volatile std::atomic<uint32_t> kyty_local_image_granules_mode;
 extern volatile std::atomic<uint32_t> kyty_local_texture_resolve_pages_mode;
 // 1: write protection after uploads runs on the upload worker (memoryTracker.h).
 extern volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode;
+// 1: guest readbacks narrow a window that meets an image to the request's pages (bufferCache.cpp).
+extern volatile std::atomic<uint32_t> kyty_local_readback_narrow_mode;
 }

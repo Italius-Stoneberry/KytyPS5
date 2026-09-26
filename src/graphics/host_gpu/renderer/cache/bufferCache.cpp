@@ -22,6 +22,8 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 // 1: RangeSet fast paths (rangeSet.h) for the GPU-modified range set.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode {0};
+// 1: a guest readback whose window meets an image falls back to the request's own pages.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_narrow_mode {0};
 // 1: pack the LOD report on the GPU instead of a CPU wait and copy.
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // 1: shader constants stream through a host-visible upload ring.
@@ -137,8 +139,8 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// A request spanning several pending page spans cannot share just one ticket.
 	DrainGuestReadback(address, size);
 	auto& buffer = m_slot_buffers[FindBuffer(address, size)];
-	const auto begin = std::max(address & ~(WindowSize - 1), buffer.CpuAddress());
-	const auto end = std::min(std::max(begin + WindowSize, address + size),
+	auto begin = std::max(address & ~(WindowSize - 1), buffer.CpuAddress());
+	auto end = std::min(std::max(begin + WindowSize, address + size),
 	                          buffer.CpuAddress() + buffer.Size());
 	if (!m_resources->IsMapped(begin, end - begin) ||
 	    !LibKernel::Memory::IsUniqueGuestBackingRange(begin, end - begin)) {
@@ -146,8 +148,18 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		return {};
 	}
 	if (m_texture_cache.HasTrackedDataOverlap(begin, end - begin)) {
-		LiveCounters::Add(LiveCounters::RbRejectImage);
-		return {};
+		// KYTY_READBACK_NARROW: the widening is speculative; an image elsewhere in the window
+		// leaves the request's own pages, if no image covers them, to an asynchronous copy.
+		const bool narrow = kyty_local_readback_narrow_mode.load(std::memory_order_relaxed) != 0;
+		if (narrow) {
+			begin = std::max(address & ~(TRACKER_PAGE_SIZE - 1), buffer.CpuAddress());
+			end   = std::min((address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1),
+			               buffer.CpuAddress() + buffer.Size());
+		}
+		if (!narrow || m_texture_cache.HasTrackedDataOverlap(begin, end - begin)) {
+			LiveCounters::Add(LiveCounters::RbRejectImage);
+			return {};
+		}
 	}
 	RangeSet available_pages;
 	m_memory_tracker.ForEachDownloadRange<false>(begin, end - begin,
