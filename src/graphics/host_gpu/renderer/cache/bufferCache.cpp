@@ -8,10 +8,6 @@
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "gpu_tiler_shaders/lod_stats_pack_spv.h"
 
-namespace {
-std::array<std::pair<uint64_t, uint64_t>, 4096> g_writer_ticks {}; // render thread only (diagnostic)
-} // namespace
-
 extern "C" {
 volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {0};
 volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
@@ -849,20 +845,6 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	    });
 	if (!copies.empty()) {
 		LiveCounters::Add(LiveCounters::SyncDownloads);
-		uint64_t writer = 0;
-		bool     known  = false;
-		for (const auto& copy: copies)
-			for (auto granule = copy.address >> 16u; granule <= (copy.address + copy.size - 1) >> 16u; ++granule) {
-				const auto& entry = g_writer_ticks[granule % g_writer_ticks.size()];
-				if (entry.first == granule) {
-					known  = true;
-					writer = std::max(writer, entry.second);
-				}
-			}
-		LiveCounters::Add(!known                                  ? LiveCounters::SyncWriterUnknown
-		                  : writer >= m_scheduler.CurrentTick()   ? LiveCounters::SyncWriterCurrent
-		                  : m_scheduler.IsFree(writer)            ? LiveCounters::SyncWriterDone
-		                                                          : LiveCounters::SyncWriterPending);
 		DownloadBufferMemory(copies);
 		// The enumeration covered whole dirty pages and every exact interval on them.
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
@@ -1144,9 +1126,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(*buffer);
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
-		// Diagnostic: the last GPU writer's tick per 64 KiB granule (sync_writer_* counters).
-		for (auto granule = vaddr >> 16u; granule <= (vaddr + size - 1) >> 16u; ++granule)
-			g_writer_ticks[granule % g_writer_ticks.size()] = {granule, m_scheduler.CurrentTick()};
 		InvalidateCopyFeedback(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
