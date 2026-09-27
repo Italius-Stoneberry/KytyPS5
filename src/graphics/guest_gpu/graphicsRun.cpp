@@ -424,6 +424,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (dw_num == 0) {
 		return;
 	}
+	LiveTrace::Event(LiveTrace::LabelWrite, reinterpret_cast<uint64_t>(dst),
+	                 src[write_one_address ? dw_num - 1 : 0] | uint64_t {2} << 56u);
 
 	if (write_one_address) {
 		for (uint32_t i = 0; i < dw_num; i++) {

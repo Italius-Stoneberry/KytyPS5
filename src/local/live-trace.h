@@ -39,6 +39,8 @@ enum Type : uint32_t {
 	GpuMark       = 24, // a: mark slot, b: tag (shader address of the draw/dispatch recorded)
 	GpuMarkValue  = 25, // a: mark slot, b: GPU timestamp (ns) after the command completed
 	GpuWrite      = 26, // a: address, b: size | tick the writing command is recorded in << 32
+	LabelWrite    = 27, // a: address, b: value (low 48 bits) | source << 56 (1 end of pipe, 2 WRITE_DATA)
+	SyncReadback  = 28, // a: address, b: size | tick the copy is recorded in << 32 (drains the queue)
 };
 
 struct Record {

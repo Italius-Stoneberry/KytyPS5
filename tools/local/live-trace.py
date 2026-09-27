@@ -5,6 +5,9 @@
     live-trace.py frame TRACE INDEX [--span MS]  one frame as an event timeline
     live-trace.py producers TRACE [--frames A:B] async guest readbacks and their GPU producers
                                                  (needs `tracew`)
+    live-trace.py gpu TRACE INDEX [--span MS]    GPU command buffers of one frame: when they ran,
+                                                 when the render thread submitted them, from which
+                                                 guest queue slice
 
 The TSC rate is read from TRACE.hz when present (the LIVE_TRACE line prints it), else --hz.
 Memory stays bounded: ranges are matched with sorted intervals, never expanded per page.
@@ -18,7 +21,7 @@ from pathlib import Path
 
 SUBMIT, GUEST_DONE, EQUEUE_WAIT, FLIP_SUBMIT, FLIP_COMPLETE, FRONT_SUSPEND = 1, 2, 7, 8, 9, 10
 GPU_SUBMIT, GPU_DONE, GUEST_READBACK, RENDER_IDLE, READBACK_TICKS = 11, 12, 13, 14, 19
-TICK_DONE, RENDER_SLICE, GPU_SPAN, GPU_SPAN_NS, GPU_WRITE = 20, 21, 22, 23, 26
+TICK_DONE, RENDER_SLICE, GPU_SPAN, GPU_SPAN_NS, GPU_WRITE, SYNC_READBACK = 20, 21, 22, 23, 26, 28
 
 
 class Trace:
@@ -146,8 +149,8 @@ def cmd_frame(t, args):
 
 def cmd_producers(t, args):
     import numpy as np
-    reads = [(t.ms(tsc), a, b & 0xffffffff, b >> 32, tid) for tsc, tid, kind, a, b in t.records
-             if kind == READBACK_TICKS]
+    reads = [(t.ms(tsc), a, b & 0xffffffff, b >> 32, 'sync' if kind == SYNC_READBACK else 'async')
+             for tsc, tid, kind, a, b in t.records if kind in (READBACK_TICKS, SYNC_READBACK)]
     writes = [(tsc, a, b) for tsc, tid, kind, a, b in t.records if kind == GPU_WRITE]
     w_time = np.array([(tsc - t.t0) / t.hz * 1e3 for tsc, _, _ in writes])
     w_lo = np.array([a for _, a, _ in writes], dtype=np.uint64)
@@ -180,7 +183,30 @@ def cmd_producers(t, args):
                 text = f'producer tick {p[1]} recorded {p[0] - lo:7.2f} done {done:7.2f} ({tick - p[1]} ticks older)'
             else:
                 text = 'producer not traced'
-            print(f'  req {x - lo:6.2f} tid {tid} {a:#x}+{size:#x} copy tick {tick} done {copy_done:6.2f}  {text}')
+            print(f'  {tid:5s} {x - lo:6.2f} {a:#x}+{size:#x} copy tick {tick} done {copy_done:6.2f}  {text}')
+
+
+def cmd_gpu(t, args):
+    lo = t.flips[args.index]
+    hi = lo + args.span
+    submitted, queue = {}, None
+    for tsc, tid, kind, a, b in t.records:
+        if tid != t.render:
+            continue
+        if kind == RENDER_SLICE:
+            queue = f'q{a & 0xff}' if (a >> 17) & 1 else None
+        elif kind == GPU_SUBMIT and b == 0:
+            submitted[a] = (t.ms(tsc), queue)
+    busy_by_queue = collections.Counter()
+    for s, e, tick in t.gpu:
+        if e < lo or s > hi:
+            continue
+        at, q = submitted.get(tick, (None, None))
+        busy_by_queue[q] += min(e, hi) - max(s, lo)
+        if e - s >= args.min:
+            print(f'GPU {s - lo:7.2f}-{e - lo:7.2f} ({e - s:5.2f} ms) tick {tick} from {q} submitted '
+                  f'{"?" if at is None else f"{at - lo:.2f}"}')
+    print('busy by submitting slice:', {k: round(v, 2) for k, v in busy_by_queue.most_common()})
 
 
 def main():
@@ -198,6 +224,12 @@ def main():
     p.add_argument('index', type=int)
     p.add_argument('--span', type=float, default=34)
     p.set_defaults(func=cmd_frame)
+    p = sub.add_parser('gpu')
+    p.add_argument('trace')
+    p.add_argument('index', type=int)
+    p.add_argument('--span', type=float, default=34)
+    p.add_argument('--min', type=float, default=0.1)
+    p.set_defaults(func=cmd_gpu)
     p = sub.add_parser('producers')
     p.add_argument('trace')
     p.add_argument('--frames', default='5:7')
