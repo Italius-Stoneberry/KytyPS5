@@ -23,7 +23,8 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 // 1: a guest readback whose window meets an image falls back to the request's own pages.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_narrow_mode {0};
 // KYTY_READBACK_QUEUE (readback-queue.h): 1: readbacks whose bytes no in-flight GPU work writes
-// copy on the transfer queue; 2: also those whose last writer is submitted but still running.
+// copy on the transfer queue; 2: also those whose last writer is submitted but still running;
+// 3: as 1, and each such copy is repeated on the graphics queue and compared (verification).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_queue_mode {0};
 // 1: pack the LOD report on the GPU instead of a CPU wait and copy.
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
@@ -47,7 +48,10 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
+#include <fmt/format.h>
+#include <string>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -97,8 +101,10 @@ struct BufferCache::GuestReadback {
 	std::vector<GuestRange> pages;
 	uint64_t begin = 0, size = 0, tick = 0, packed_size = 0;
 	// KYTY_READBACK_QUEUE: the copy-engine value that completes the copy (0: graphics queue
-	// at `tick`), and the graphics tick of the last GPU write it waited for.
+	// at `tick`), and the graphics tick of the last GPU write it waited for. Mode 3 also copies
+	// on the graphics queue at `tick` into `verify`.
 	uint64_t queue_value = 0, producer_tick = 0;
+	Buffer* verify = nullptr;
 	size_t slot = 0;
 	Buffer* download = nullptr;
 	std::atomic<bool> copying {false};
@@ -233,6 +239,8 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// need not wait behind the rest of the graphics queue.
 	if (const std::pair<uint64_t, uint64_t> window[] {{begin, end}};
 	    ReadbackQueueReady(window, true, request->producer_tick)) {
+		// Also after the slot's last graphics-queue copy (it is submitted: that path flushes).
+		request->producer_tick = std::max(request->producer_tick, m_download_ticks[slot]);
 		std::vector<ReadbackQueue::Queue::Region> regions;
 		regions.reserve(copies.size());
 		uint64_t cursor = 0;
@@ -245,8 +253,23 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		request->queue_value = m_readback_queue->Copy(regions, download->Handle(),
 		                                              m_scheduler.GetMasterSemaphore().Handle(),
 		                                              request->producer_tick);
+		LiveTrace::Event(LiveTrace::RbFast, begin, (end - begin) | request->producer_tick << 32u);
 		m_download_queue_values[slot] = request->queue_value;
 		request->tick                 = m_scheduler.CurrentTick();
+		if (kyty_local_readback_queue_mode.load(std::memory_order_relaxed) == 3) {
+			auto& verify = m_verify_downloads[slot];
+			if (!verify)
+				verify = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+				                                  vk::BufferUsageFlagBits::eTransferDst, Capacity);
+			for (size_t i = 0; i < copies.size(); ++i)
+				verify->CopyFrom(m_scheduler.Current(), *copies[i].buffer, regions[i].copy.srcOffset,
+				                 regions[i].copy.dstOffset, regions[i].copy.size, vk::AccessFlagBits::eMemoryWrite,
+				                 vk::AccessFlagBits::eHostRead,
+				                 vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+				                 vk::AccessFlagBits::eHostRead);
+			request->verify = verify.get();
+			m_scheduler.Flush();
+		}
 		if (LiveTrace::WriteTicks())
 			LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
 		m_guest_readbacks[slot] = request;
@@ -265,6 +288,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		cursor += AlignDownload(envelope_size);
 	}
 	request->tick = m_scheduler.CurrentTick();
+	m_download_ticks[slot] = request->tick;
 	if (LiveTrace::WriteTicks()) LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
 	m_scheduler.Flush();
 	// Keep GPU ownership and page protection until the caller has copied every byte.
@@ -275,9 +299,16 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	return request;
 }
 
+// Local diagnostic: every GPU write into guest buffers (tracew), noted or not.
+static void TraceGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick) {
+	if (LiveTrace::WriteTicks()) LiveTrace::Event(LiveTrace::GpuWrite, vaddr, size | tick << 32u);
+}
+
 // KYTY_READBACK_QUEUE. GPU thread, inside a command: the write is recorded at or after the
-// current tick, so its tick is only set at the next point between commands.
+// current tick, so its tick is only set at the next point between commands. Every GPU write
+// into a guest buffer is noted: shader writes, uploads, image copies and buffer joins.
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	TraceGpuWrite(vaddr, size, m_scheduler.CurrentTick());
 	if (kyty_local_readback_queue_mode.load(std::memory_order_relaxed) == 0 || m_graphics.readback_queue == nullptr) {
 		if (m_gpu_writes_on) {
 			m_gpu_writes_on = false;
@@ -297,6 +328,7 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	}
 	m_gpu_writes.push_back({vaddr, vaddr + size, 0});
 }
+
 
 // KYTY_READBACK_QUEUE. GPU thread: the latest tick of a possibly unfinished GPU write
 // overlapping [begin, end); 0 when there is none. Between commands (guest readbacks run there)
@@ -339,11 +371,44 @@ bool BufferCache::ReadbackQueueReady(std::span<const std::pair<uint64_t, uint64_
 		producer = std::max(producer, InflightWriteTick(begin, end, completed, between_commands));
 	// Writes before the log started are dated only once everything recorded then completed.
 	if (m_gpu_writes_from == UINT64_MAX || completed < m_gpu_writes_from) return false;
-	if (producer != 0 && (mode < 2 || producer >= m_scheduler.CurrentTick())) return false;
+	if (producer != 0 && (mode != 2 || producer >= m_scheduler.CurrentTick())) return false;
 	if (!m_readback_queue) m_readback_queue = std::make_unique<ReadbackQueue::Queue>(m_graphics);
 	LiveCounters::Add(producer == 0 ? LiveCounters::RbQueueDone : LiveCounters::RbQueueInflight);
 	wait_tick = std::max(producer, completed);
 	return true;
+}
+
+// KYTY_READBACK_QUEUE=3. Any thread.
+void BufferCache::VerifyReadback(uint64_t address, const uint8_t* fast, const uint8_t* reference, uint64_t size,
+                                 const char* path, uint64_t waited) {
+	LiveCounters::Add(LiveCounters::RbQueueVerified);
+	if (std::memcmp(fast, reference, size) == 0) return;
+	LiveCounters::Add(LiveCounters::RbQueueMismatch);
+	LiveTrace::Event(LiveTrace::RbMismatch, address, size | waited << 32u);
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 40) {
+		uint64_t first = 0, differing = 0;
+		while (fast[first] == reference[first]) ++first;
+		for (uint64_t i = 0; i < size; ++i) differing += fast[i] != reference[i];
+		// Every logged write overlapping the range, oldest first (the log is GPU-thread state;
+		// a guest thread's report may race, it is diagnostic only).
+		std::string writes;
+		for (size_t i = m_gpu_writes_head; i < m_gpu_writes.size() && writes.size() < 300; ++i) {
+			const auto& write = m_gpu_writes[i];
+			if (write.begin < address + size && address < write.end)
+				writes += fmt::format(" [{:#x}+{:#x} t{}{}]", write.begin, write.end - write.begin, write.tick,
+				                      i < m_gpu_writes_stamped ? "" : "?");
+		}
+		std::string bytes;
+		for (uint64_t i = first & ~uint64_t {3}; i < std::min(size, (first & ~uint64_t {3}) + 16); ++i)
+			bytes += fmt::format("{:02x}/{:02x} ", fast[i], reference[i]);
+		std::printf("READBACK_QUEUE_MISMATCH %s address=0x%" PRIx64 " size=0x%" PRIx64 " first=0x%" PRIx64
+		            " differing=%" PRIu64 " waited=%" PRIu64 " current=%" PRIu64 " known=%" PRIu64
+		            " bytes(fast/ref)=%s writes:%s\n",
+		            path, address, size, first, differing, waited, m_scheduler.CurrentTick(),
+		            m_scheduler.GetMasterSemaphore().KnownGpuTick(), bytes.c_str(), writes.c_str());
+		std::fflush(stdout);
+	}
 }
 
 void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& request) {
@@ -358,12 +423,23 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 		m_scheduler.GetMasterSemaphore().Wait(request->tick);
 		m_scheduler.WaitPriorityOperations(request->tick);
 	}
+	if (request->verify != nullptr) {
+		m_scheduler.GetMasterSemaphore().Wait(request->tick);
+		m_scheduler.WaitPriorityOperations(request->tick);
+	}
 	uint32_t pending = GuestReadback::Pending;
 	if (request->state.compare_exchange_strong(pending, GuestReadback::Copying, std::memory_order_acq_rel)) {
 		request->download->Invalidate(0, request->packed_size);
+		if (request->verify != nullptr) {
+			request->verify->Invalidate(0, request->packed_size);
+			for (const auto& part: request->parts)
+				VerifyReadback(part.address, request->download->Mapped().data() + part.offset,
+				               request->verify->Mapped().data() + part.offset, part.size, "guest",
+				               request->producer_tick);
+		}
+		const auto* source = (request->verify != nullptr ? request->verify : request->download)->Mapped().data();
 		for (const auto& part: request->parts)
-			LibKernel::Memory::WriteBacking(part.address,
-			    request->download->Mapped().data() + part.offset, part.size);
+			LibKernel::Memory::WriteBacking(part.address, source + part.offset, part.size);
 	}
 	request->copied.store(true, std::memory_order_release);
 	request->copied.notify_all();
@@ -681,6 +757,31 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 			m_readback_queue->Wait(m_readback_queue->Copy(regions, download.Handle(),
 			                                              m_scheduler.GetMasterSemaphore().Handle(), wait_tick));
 			m_scheduler.WaitPriorityOperations(wait_tick);
+			if (kyty_local_readback_queue_mode.load(std::memory_order_relaxed) == 3) {
+				// The reference copy lands in a second reservation; the backing gets its bytes.
+				const auto [reference, reference_offset] = download.Map(packed_size, DOWNLOAD_ALIGNMENT);
+				EXIT_IF(reference == nullptr);
+				for (size_t i = 0; i < batch.size(); ++i)
+					download.CopyFrom(m_scheduler.Current(), *batch[i].buffer, regions[i].copy.srcOffset,
+					                  reference_offset + regions[i].copy.dstOffset - base_offset, regions[i].copy.size,
+					                  vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+					                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+					                  vk::AccessFlagBits::eHostRead);
+				download.Commit();
+				const auto completion_tick = m_scheduler.CurrentTick();
+				m_scheduler.Finish();
+				m_scheduler.WaitPriorityOperations(completion_tick);
+				uint64_t at = 0;
+				for (const auto& copy: batch) {
+					const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+					const auto offset = at + copy.source_offset - source_begin;
+					download.Invalidate(base_offset + offset, copy.size);
+					download.Invalidate(reference_offset + offset, copy.size);
+					VerifyReadback(copy.address, mapped + offset, reference + offset, copy.size, "sync", wait_tick);
+					std::memcpy(mapped + offset, reference + offset, copy.size);
+					at += AlignDownload(envelope_size);
+				}
+			}
 		} else {
 			for (const auto& copy: batch) {
 				const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
@@ -1080,6 +1181,8 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	// The new owner holds these bytes only once the copy ran.
+	NoteGpuWrite(overlap.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
 }
 
@@ -1136,8 +1239,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
-		for (const auto& copy: copies)
+		for (const auto& copy: copies) {
 			InvalidateCopyFeedback(buffer.CpuAddress() + copy.dstOffset, copy.size);
+			NoteGpuWrite(buffer.CpuAddress() + copy.dstOffset, copy.size);
+		}
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -1251,6 +1356,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
 	DrainGuestReadback(vaddr, size, !is_written && !is_texel_buffer, is_written);
+	if (LiveTrace::WriteTicks())
+		LiveTrace::Event(LiveTrace::BufferUse, vaddr, size | (is_written ? uint64_t {1} << 63u : 0));
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -1279,8 +1386,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		InvalidateCopyFeedback(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
 		NoteGpuWrite(vaddr, size);
-		if (LiveTrace::WriteTicks())
-			LiveTrace::Event(LiveTrace::GpuWrite, vaddr, size | m_scheduler.CurrentTick() << 32u);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
 	}

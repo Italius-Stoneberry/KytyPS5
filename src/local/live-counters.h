@@ -49,13 +49,15 @@ enum Id : uint32_t {
 	RbRejectCapacity,      // ... more than the download capacity
 	RbQueueDone,           // guest readbacks on the copy engine: no GPU write of the bytes in flight
 	RbQueueInflight,       // ... waiting only for their last writer (KYTY_READBACK_QUEUE=2)
+	RbQueueVerified,       // copy-engine copies compared with a graphics-queue copy (mode 3)
+	RbQueueMismatch,       // ... that differed
 	Count
 };
 
 inline constexpr const char* Names[Count] = {
     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight"};
+    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch"};
 
 inline std::atomic<uint64_t> g_values[Count];
 // Render thread: the last draw (0) or dispatch shader address.

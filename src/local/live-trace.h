@@ -41,6 +41,9 @@ enum Type : uint32_t {
 	GpuWrite      = 26, // a: address, b: size | tick the writing command is recorded in << 32
 	LabelWrite    = 27, // a: address, b: value (low 48 bits) | source << 56 (1 end of pipe, 2 WRITE_DATA)
 	SyncReadback  = 28, // a: address, b: size | tick the copy is recorded in << 32 (drains the queue)
+	RbMismatch    = 29, // a: address, b: size | tick the copy engine waited for << 32 (KYTY_READBACK_QUEUE=3)
+	RbFast        = 30, // a: window address, b: size | tick the copy engine waits for << 32
+	BufferUse     = 31, // a: address, b: size | 1 << 63 when written (every ObtainBuffer, `tracew`)
 };
 
 struct Record {

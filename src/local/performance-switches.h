@@ -72,7 +72,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_ASYNC_REPROTECT", &kyty_local_async_reprotect_mode},
 	    Switch {"KYTY_READBACK_NARROW", &kyty_local_readback_narrow_mode},
 	    // Also creates the transfer queue at device creation (vulkanWindow.cpp).
-	    Switch {"KYTY_READBACK_QUEUE", &kyty_local_readback_queue_mode, 0, 2},
+	    Switch {"KYTY_READBACK_QUEUE", &kyty_local_readback_queue_mode, 0, 3},
 	    // Images and command submission.
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},

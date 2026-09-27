@@ -246,8 +246,14 @@ private:
 	bool                  m_gpu_writes_on      = false;
 	// Writes before this tick were not noted (UINT64_MAX: set at the next stamp).
 	uint64_t              m_gpu_writes_from    = UINT64_MAX;
-	// Last copy-engine value that wrote each download slot.
+	// Last copy-engine value, and last graphics tick, that wrote each download slot: a detached
+	// request's copy may still be pending on either queue when its slot is reused.
 	std::array<uint64_t, GuestReadbackSlots> m_download_queue_values {};
+	std::array<uint64_t, GuestReadbackSlots> m_download_ticks {};
+	// Mode 3 (verification): the same bytes copied on the graphics queue, compared on use.
+	std::array<std::unique_ptr<Buffer>, GuestReadbackSlots> m_verify_downloads {};
+	void VerifyReadback(uint64_t address, const uint8_t* fast, const uint8_t* reference, uint64_t size,
+	                    const char* path, uint64_t waited);
 	// Last member: destroyed (queue idle) before the buffers its copies use.
 	std::unique_ptr<ReadbackQueue::Queue> m_readback_queue;
 };
