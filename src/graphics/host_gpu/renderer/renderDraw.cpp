@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "live-trace-gpu.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -1836,6 +1837,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 	LiveCensus::Scope census(LiveCensus::Draw, sh_ctx.GetVs().gs_regs.data_addr, sh_ctx.GetPs().ps_regs.data_addr);
+	LiveTrace::MarkAfter gpu_mark {[&] { return m_context.GetCommandScheduler().Current().RawHandle(); },
+	                               LiveTrace::MarkDraw, sh_ctx.GetPs().ps_regs.data_addr};
 	DebugDelay::At(DebugDelay::Draw);
 	LiveCounters::g_last_dispatch_shader = 0;
 

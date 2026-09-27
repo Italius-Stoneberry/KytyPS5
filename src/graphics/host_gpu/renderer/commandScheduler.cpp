@@ -123,6 +123,29 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 			      LiveTrace::g_timestamp_period = m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
 			      LiveTrace::g_timestamp_pool   = static_cast<VkQueryPool>(pool);
 		      }
+		      // Per-draw marks (`tracem`): reset on the host, read after tracing stops.
+		      info.queryCount = LiveTrace::MarkSlots;
+		      vk::QueryPool marks {};
+		      if (m_graphics.device.createQueryPool(&info, nullptr, &marks) == vk::Result::eSuccess) {
+			      m_graphics.device.resetQueryPool(marks, 0, LiveTrace::MarkSlots);
+			      LiveTrace::g_mark_pool = static_cast<VkQueryPool>(marks);
+			      static vk::Device device = m_graphics.device;
+			      LiveTrace::g_read_marks = [](uint32_t count) {
+				      const auto            pool = static_cast<VkQueryPool>(LiveTrace::g_mark_pool);
+				      std::vector<uint64_t> values(count);
+				      if (count != 0 &&
+				          device.getQueryPoolResults(pool, 0, count, count * sizeof(uint64_t), values.data(),
+				                                     sizeof(uint64_t),
+				                                     vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait) ==
+				              vk::Result::eSuccess) {
+					      for (uint32_t i = 0; i < count; ++i)
+						      LiveTrace::Append(LiveTrace::GpuMarkValue, i,
+						                        static_cast<uint64_t>(static_cast<double>(values[i]) *
+						                                              LiveTrace::g_timestamp_period));
+				      }
+				      device.resetQueryPool(pool, 0, LiveTrace::MarkSlots);
+			      };
+		      }
 	      }
 	      uint64_t next = 0;
 	      while (!stop.stop_requested()) {

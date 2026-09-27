@@ -8,6 +8,9 @@
     live-trace.py gpu TRACE INDEX [--span MS]    GPU command buffers of one frame: when they ran,
                                                  when the render thread submitted them, from which
                                                  guest queue slice
+    live-trace.py marks TRACE [--top N]          GPU time per shader from a `tracem` capture (a GPU
+                                                 timestamp after every draw, dispatch and native XPR
+                                                 run), all frames and the part after each flip
 
 The TSC rate is read from TRACE.hz when present (the LIVE_TRACE line prints it), else --hz.
 Memory stays bounded: ranges are matched with sorted intervals, never expanded per page.
@@ -44,6 +47,7 @@ class Trace:
         # GPU clock -> TSC: the completion a monitor sees is never earlier than the GPU end.
         offsets = [self.done[t] - e / 1e6 for t, (bg, e) in spans.items() if t in self.done]
         offset = min(offsets) if offsets else 0.0
+        self.gpu_offset = offset
         self.gpu = sorted((bg / 1e6 + offset, e / 1e6 + offset, t) for t, (bg, e) in spans.items())
         self.render = collections.Counter(r[1] for r in records if r[2] == RENDER_SLICE).most_common(1)[0][0]
         self.flips = [self.ms(r[0]) for r in records if r[2] == FLIP_SUBMIT and r[1] == self.render]
@@ -209,6 +213,49 @@ def cmd_gpu(t, args):
     print('busy by submitting slice:', {k: round(v, 2) for k, v in busy_by_queue.most_common()})
 
 
+def cmd_marks(t, args):
+    kinds = {1: 'draw', 2: 'dispatch', 3: 'native'}
+    recorded = {}
+    for tsc, tid, kind, a, b in t.records:
+        if kind == 24:
+            recorded[a] = (t.ms(tsc), b >> 60, b & 0x0fffffffffffffff)
+    done = {a: b / 1e6 + t.gpu_offset for tsc, tid, kind, a, b in t.records if kind == 25}
+    flush_times, flush_ticks = [], []
+    for tsc, tid, kind, a, b in t.records:
+        if tid == t.render and kind == GPU_SUBMIT and b == 0:
+            flush_times.append(t.ms(tsc))
+            flush_ticks.append(a)
+    begin = {tick: s for s, e, tick in t.gpu}
+    import bisect
+    by_tick = collections.defaultdict(list)
+    for slot, (x, kind, shader) in recorded.items():
+        i = bisect.bisect_left(flush_times, x)
+        if i < len(flush_ticks) and slot in done:
+            by_tick[flush_ticks[i]].append((slot, kind, shader))
+    total, after_flip = collections.Counter(), collections.Counter()
+    count = collections.Counter()
+    frames = max(1, len(t.flips) - 1)
+    for tick, marks in by_tick.items():
+        if tick not in begin:
+            continue
+        previous = begin[tick]
+        for slot, kind, shader in sorted(marks):
+            end = done[slot]
+            cost = max(0.0, end - previous)
+            previous = max(previous, end)
+            key = (kinds.get(kind, kind), shader)
+            total[key] += cost
+            count[key] += 1
+            i = bisect.bisect_right(t.flips, end) - 1
+            if 0 <= i < len(t.flips) - 1 and end - t.flips[i] < args.after:
+                after_flip[key] += cost
+    print(f'{frames} frames; GPU ms per frame by shader (whole frame | first {args.after} ms after each flip)')
+    for key, value in total.most_common(args.top):
+        print(f'  {key[0]:8s} {key[1]:#014x}  {value / frames:6.3f} | {after_flip[key] / frames:6.3f}  '
+              f'({count[key] / frames:.1f}/frame)')
+    print(f'  all marks: {sum(total.values()) / frames:.2f} | {sum(after_flip.values()) / frames:.2f}')
+
+
 def main():
     # A runaway report must never take the machine down with the game running.
     resource.setrlimit(resource.RLIMIT_AS, (16 << 30, 16 << 30))
@@ -230,6 +277,11 @@ def main():
     p.add_argument('--span', type=float, default=34)
     p.add_argument('--min', type=float, default=0.1)
     p.set_defaults(func=cmd_gpu)
+    p = sub.add_parser('marks')
+    p.add_argument('trace')
+    p.add_argument('--top', type=int, default=30)
+    p.add_argument('--after', type=float, default=7.0)
+    p.set_defaults(func=cmd_marks)
     p = sub.add_parser('producers')
     p.add_argument('trace')
     p.add_argument('--frames', default='5:7')

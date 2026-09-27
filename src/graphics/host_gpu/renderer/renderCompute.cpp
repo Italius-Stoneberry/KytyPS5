@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "live-trace-gpu.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -299,6 +300,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 	LiveCensus::Scope census(LiveCensus::Dispatch, sh_ctx.GetCs().cs_regs.data_addr, indirect_args != 0);
+	LiveTrace::MarkAfter gpu_mark {[&] { return m_context.GetCommandScheduler().Current().RawHandle(); },
+	                               LiveTrace::MarkDispatch, sh_ctx.GetCs().cs_regs.data_addr};
 	if (LiveCounters::g_last_dispatch_shader != 0) {
 		LiveCounters::Add(LiveCounters::DispatchAfterDispatch);
 		if (LiveCounters::g_last_dispatch_shader == sh_ctx.GetCs().cs_regs.data_addr)

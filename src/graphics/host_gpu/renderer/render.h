@@ -127,6 +127,8 @@ public:
 	[[nodiscard]] bool ComputeChainPending() const noexcept { return m_compute_access_pending; }
 	void ContinueComputeChain() const;
 	[[nodiscard]] vk::CommandBuffer HandleForFullBarrier() const;
+	// Local diagnostic (GPU marks): the handle without draining a pending dependency.
+	[[nodiscard]] vk::CommandBuffer RawHandle() const noexcept { return m_buffer; }
 
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }

@@ -23,6 +23,7 @@
 
 #include "debug-delay.h"
 #include "live-trace.h"
+#include "live-trace-gpu.h"
 #include "live-census.h"
 #include "draw-state-observer.h"
 #include "live-control.h"
@@ -1060,6 +1061,8 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 
 uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, bool clean) {
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 0);
+	LiveTrace::MarkAfter gpu_mark {[&] { return GetScheduler().Current().RawHandle(); }, LiveTrace::MarkNativeXpr,
+	                               m_sh_ctx.GetPs().ps_regs.data_addr};
 	DebugDelay::At(DebugDelay::NativeXpr);
 	LiveCounters::g_last_dispatch_shader = 0;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
