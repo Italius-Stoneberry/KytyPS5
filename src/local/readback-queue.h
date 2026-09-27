@@ -24,6 +24,10 @@ namespace ReadbackQueue {
 class Queue {
 public:
 	static constexpr size_t Buffers = 64;
+	struct Region {
+		VkBuffer     source;
+		VkBufferCopy copy;
+	};
 
 	explicit Queue(Libs::Graphics::GraphicContext& graphics)
 	    :
@@ -60,11 +64,10 @@ public:
 	Queue(const Queue&)            = delete;
 	Queue& operator=(const Queue&) = delete;
 
-	// GPU thread: copies `regions` from `source` to `destination` once `timeline` reaches
-	// `wait_value`. Returns the value this queue's timeline reaches when the bytes are
-	// available to the host.
-	uint64_t Copy(VkBuffer source, VkBuffer destination, std::span<const VkBufferCopy> regions,
-	              VkSemaphore timeline, uint64_t wait_value) {
+	// GPU thread: copies `regions` to `destination` once `timeline` reaches `wait_value`.
+	// Returns the value this queue's timeline reaches when the bytes are available to the host.
+	uint64_t Copy(std::span<const Region> regions, VkBuffer destination, VkSemaphore timeline,
+	              uint64_t wait_value) {
 		const uint64_t value   = ++m_submitted;
 		const size_t   index   = value % Buffers;
 		const auto     command = m_commands[index];
@@ -82,7 +85,7 @@ public:
 		barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 		d.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
 		                       &barrier, 0, nullptr, 0, nullptr);
-		d.vkCmdCopyBuffer(command, source, destination, static_cast<uint32_t>(regions.size()), regions.data());
+		for (const auto& region: regions) d.vkCmdCopyBuffer(command, region.source, destination, 1, &region.copy);
 		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 		barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
 		d.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier,

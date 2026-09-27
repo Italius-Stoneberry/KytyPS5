@@ -234,7 +234,12 @@ private:
 		uint64_t begin, end, tick;
 	};
 	void                  NoteGpuWrite(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] uint64_t InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed);
+	[[nodiscard]] uint64_t InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed,
+	                                         bool between_commands);
+	// The graphics tick a transfer-queue copy of `ranges` ({begin, end}) waits for; false when
+	// the copy must drain the graphics queue as before.
+	[[nodiscard]] bool ReadbackQueueReady(std::span<const std::pair<uint64_t, uint64_t>> ranges,
+	                                      bool between_commands, uint64_t& wait_tick);
 	std::vector<GpuWrite> m_gpu_writes;
 	size_t                m_gpu_writes_head    = 0;
 	size_t                m_gpu_writes_stamped = 0;

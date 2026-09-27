@@ -231,38 +231,28 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	request->packed_size = packed_size;
 	// KYTY_READBACK_QUEUE: bytes whose writers the GPU finished (or, mode 2, has been handed)
 	// need not wait behind the rest of the graphics queue.
-	if (const auto mode = kyty_local_readback_queue_mode.load(std::memory_order_relaxed);
-	    mode != 0 && m_graphics.readback_queue != nullptr && m_gpu_writes_on) {
-		auto& master = m_scheduler.GetMasterSemaphore();
-		master.Refresh();
-		const uint64_t completed = master.KnownGpuTick();
-		const uint64_t producer  = InflightWriteTick(begin, end, completed);
-		if (completed >= m_gpu_writes_from &&
-		    (producer == 0 || (mode >= 2 && producer < m_scheduler.CurrentTick()))) {
-			if (!m_readback_queue) m_readback_queue = std::make_unique<ReadbackQueue::Queue>(m_graphics);
-			std::vector<VkBufferCopy> regions;
-			regions.reserve(copies.size());
-			uint64_t cursor = 0;
-			for (const auto& copy: copies) {
-				EXIT_IF(copy.buffer != &buffer);
-				const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-				regions.push_back({source_begin, cursor, envelope_size});
-				request->parts.push_back({copy.address, copy.size, cursor + copy.source_offset - source_begin});
-				cursor += AlignDownload(envelope_size);
-			}
-			request->producer_tick = std::max(producer, completed);
-			request->queue_value   = m_readback_queue->Copy(buffer.Handle(), download->Handle(), regions,
-			                                                master.Handle(), request->producer_tick);
-			m_download_queue_values[slot] = request->queue_value;
-			request->tick                 = m_scheduler.CurrentTick();
-			if (LiveTrace::WriteTicks())
-				LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
-			m_guest_readbacks[slot] = request;
-			m_active_guest_readbacks |= 1u << slot;
-			LiveCounters::Add(LiveCounters::AsyncReadbacks);
-			LiveCounters::Add(producer == 0 ? LiveCounters::RbQueueDone : LiveCounters::RbQueueInflight);
-			return request;
+	if (const std::pair<uint64_t, uint64_t> window[] {{begin, end}};
+	    ReadbackQueueReady(window, true, request->producer_tick)) {
+		std::vector<ReadbackQueue::Queue::Region> regions;
+		regions.reserve(copies.size());
+		uint64_t cursor = 0;
+		for (const auto& copy: copies) {
+			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+			regions.push_back({copy.buffer->Handle(), {source_begin, cursor, envelope_size}});
+			request->parts.push_back({copy.address, copy.size, cursor + copy.source_offset - source_begin});
+			cursor += AlignDownload(envelope_size);
 		}
+		request->queue_value = m_readback_queue->Copy(regions, download->Handle(),
+		                                              m_scheduler.GetMasterSemaphore().Handle(),
+		                                              request->producer_tick);
+		m_download_queue_values[slot] = request->queue_value;
+		request->tick                 = m_scheduler.CurrentTick();
+		if (LiveTrace::WriteTicks())
+			LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
+		m_guest_readbacks[slot] = request;
+		m_active_guest_readbacks |= 1u << slot;
+		LiveCounters::Add(LiveCounters::AsyncReadbacks);
+		return request;
 	}
 	uint64_t cursor = 0;
 	for (const auto& copy: copies) {
@@ -308,15 +298,20 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	m_gpu_writes.push_back({vaddr, vaddr + size, 0});
 }
 
-// KYTY_READBACK_QUEUE. GPU thread, between commands (guest readbacks run there): the latest
-// tick of a possibly unfinished GPU write overlapping [begin, end); 0 when there is none.
-uint64_t BufferCache::InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed) {
-	const uint64_t current = m_scheduler.CurrentTick();
-	for (; m_gpu_writes_stamped < m_gpu_writes.size(); ++m_gpu_writes_stamped)
-		m_gpu_writes[m_gpu_writes_stamped].tick = current;
-	if (m_gpu_writes_from == UINT64_MAX) m_gpu_writes_from = current;
-	// Stamps never decrease: the completed writes are a prefix.
-	while (m_gpu_writes_head < m_gpu_writes.size() && m_gpu_writes[m_gpu_writes_head].tick <= completed)
+// KYTY_READBACK_QUEUE. GPU thread: the latest tick of a possibly unfinished GPU write
+// overlapping [begin, end); 0 when there is none. Between commands (guest readbacks run there)
+// every noted write is recorded by now and gets its tick; inside a command an undated write
+// may still be recorded later, so it yields UINT64_MAX.
+uint64_t BufferCache::InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed,
+                                        bool between_commands) {
+	if (between_commands) {
+		const uint64_t current = m_scheduler.CurrentTick();
+		for (; m_gpu_writes_stamped < m_gpu_writes.size(); ++m_gpu_writes_stamped)
+			m_gpu_writes[m_gpu_writes_stamped].tick = current;
+		if (m_gpu_writes_from == UINT64_MAX) m_gpu_writes_from = current;
+	}
+	// Stamps never decrease: the completed writes are a prefix of the dated ones.
+	while (m_gpu_writes_head < m_gpu_writes_stamped && m_gpu_writes[m_gpu_writes_head].tick <= completed)
 		++m_gpu_writes_head;
 	if (m_gpu_writes_head >= 4096 && m_gpu_writes_head * 2 >= m_gpu_writes.size()) {
 		m_gpu_writes.erase(m_gpu_writes.begin(), m_gpu_writes.begin() + static_cast<std::ptrdiff_t>(m_gpu_writes_head));
@@ -326,9 +321,29 @@ uint64_t BufferCache::InflightWriteTick(uint64_t begin, uint64_t end, uint64_t c
 	uint64_t tick = 0;
 	for (size_t i = m_gpu_writes_head; i < m_gpu_writes.size(); ++i) {
 		const auto& write = m_gpu_writes[i];
-		if (write.begin < end && begin < write.end) tick = std::max(tick, write.tick);
+		if (write.begin < end && begin < write.end)
+			tick = std::max(tick, i < m_gpu_writes_stamped ? write.tick : UINT64_MAX);
 	}
 	return tick;
+}
+
+bool BufferCache::ReadbackQueueReady(std::span<const std::pair<uint64_t, uint64_t>> ranges,
+                                     bool between_commands, uint64_t& wait_tick) {
+	const auto mode = kyty_local_readback_queue_mode.load(std::memory_order_relaxed);
+	if (mode == 0 || m_graphics.readback_queue == nullptr || !m_gpu_writes_on) return false;
+	auto& master = m_scheduler.GetMasterSemaphore();
+	master.Refresh();
+	const uint64_t completed = master.KnownGpuTick();
+	uint64_t       producer  = 0;
+	for (const auto& [begin, end]: ranges)
+		producer = std::max(producer, InflightWriteTick(begin, end, completed, between_commands));
+	// Writes before the log started are dated only once everything recorded then completed.
+	if (m_gpu_writes_from == UINT64_MAX || completed < m_gpu_writes_from) return false;
+	if (producer != 0 && (mode < 2 || producer >= m_scheduler.CurrentTick())) return false;
+	if (!m_readback_queue) m_readback_queue = std::make_unique<ReadbackQueue::Queue>(m_graphics);
+	LiveCounters::Add(producer == 0 ? LiveCounters::RbQueueDone : LiveCounters::RbQueueInflight);
+	wait_tick = std::max(producer, completed);
+	return true;
 }
 
 void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& request) {
@@ -646,18 +661,43 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		const auto [mapped, base_offset] = download.Map(packed_size, DOWNLOAD_ALIGNMENT);
 		EXIT_IF(mapped == nullptr);
 		uint64_t cursor = 0;
-		for (const auto& copy: batch) {
-			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-			download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, base_offset + cursor,
-			                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
-			                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-			                  vk::AccessFlagBits::eHostRead);
-			cursor += AlignDownload(envelope_size);
+		// KYTY_READBACK_QUEUE: bytes no unfinished GPU write touches copy on the transfer queue
+		// instead of draining the graphics queue. This may run inside a command.
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		ranges.reserve(batch.size());
+		for (const auto& copy: batch) ranges.emplace_back(copy.address, copy.address + copy.size);
+		if (uint64_t wait_tick = 0; ReadbackQueueReady(ranges, false, wait_tick)) {
+			std::vector<ReadbackQueue::Queue::Region> regions;
+			regions.reserve(batch.size());
+			for (const auto& copy: batch) {
+				const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+				regions.push_back({copy.buffer->Handle(), {source_begin, base_offset + cursor, envelope_size}});
+				cursor += AlignDownload(envelope_size);
+			}
+			download.Commit();
+			if (LiveTrace::WriteTicks())
+				for (const auto& copy: batch)
+					LiveTrace::Event(LiveTrace::SyncReadback, copy.address, copy.size | m_scheduler.CurrentTick() << 32u);
+			m_readback_queue->Wait(m_readback_queue->Copy(regions, download.Handle(),
+			                                              m_scheduler.GetMasterSemaphore().Handle(), wait_tick));
+			m_scheduler.WaitPriorityOperations(wait_tick);
+		} else {
+			for (const auto& copy: batch) {
+				const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+				download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, base_offset + cursor,
+				                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+				                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+				                  vk::AccessFlagBits::eHostRead);
+				cursor += AlignDownload(envelope_size);
+			}
+			download.Commit();
+			const auto completion_tick = m_scheduler.CurrentTick();
+			if (LiveTrace::WriteTicks())
+				for (const auto& copy: batch)
+					LiveTrace::Event(LiveTrace::SyncReadback, copy.address, copy.size | completion_tick << 32u);
+			m_scheduler.Finish();
+			m_scheduler.WaitPriorityOperations(completion_tick);
 		}
-		download.Commit();
-		const auto completion_tick = m_scheduler.CurrentTick();
-		m_scheduler.Finish();
-		m_scheduler.WaitPriorityOperations(completion_tick);
 		cursor = 0;
 		for (const auto& copy: batch) {
 			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
