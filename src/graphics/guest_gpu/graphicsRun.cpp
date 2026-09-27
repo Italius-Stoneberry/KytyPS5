@@ -22,6 +22,7 @@
 #include "libs/errno.h"
 
 #include "debug-delay.h"
+#include "live-trace.h"
 #include "live-census.h"
 #include "draw-state-observer.h"
 #include "live-control.h"
@@ -242,6 +243,7 @@ void GuestGpu::Done() {
 					m_idle.Wait(&m_queue_mutex);
 				}
 			}
+			LiveTrace::Event(LiveTrace::GuestDone, m_submitted_frame);
 			Submission boundary;
 			boundary.type = SubmissionType::FrameBoundary;
 			Enqueue(std::move(boundary));
@@ -395,6 +397,8 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	(void)poll;
 	BreakComputeChain();
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+		LiveTrace::Event(LiveTrace::FrontSuspend, reinterpret_cast<uint64_t>(addr),
+		                 (static_cast<uint64_t>(*addr) << 32u) | static_cast<uint32_t>(ref));
 		SuspendPm4();
 	}
 }
@@ -502,6 +506,8 @@ void GuestGpu::Enqueue(Submission submission) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	submission.frame_epoch = m_submitted_frame;
+	LiveTrace::Event(LiveTrace::Submit, submission.queue_id | static_cast<uint32_t>(submission.type) << 8u,
+	                 submission.commands.size());
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -550,7 +556,9 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				LiveTrace::Event(LiveTrace::RenderIdle, 1, 0);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				LiveTrace::Event(LiveTrace::RenderIdle, 0, 0);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -573,7 +581,9 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					LiveTrace::Event(LiveTrace::RenderIdle, 1, 1);
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					LiveTrace::Event(LiveTrace::RenderIdle, 0, 1);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -611,7 +621,14 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
+		LiveTrace::Event(LiveTrace::RenderSlice,
+		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u | 1u << 17u,
+		                 submission.frame_epoch);
 		const bool complete = gpu->Process(submission);
+		LiveTrace::Event(LiveTrace::RenderSlice,
+		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u |
+		                     static_cast<uint32_t>(complete) << 16u,
+		                 submission.frame_epoch);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		LiveCounters::Add(LiveCounters::Submissions);
@@ -1859,6 +1876,7 @@ void CommandProcessor::Flip() {
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
+	LiveTrace::Event(LiveTrace::FlipSubmit, request);
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
 	                               m_flip.flip_mode, m_flip.flip_arg, request);
 	GetScheduler().Flush();
@@ -1878,6 +1896,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
+	LiveTrace::Event(LiveTrace::FlipSubmit, request);
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
 	                                 value, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                 m_flip.flip_arg, request);
@@ -1904,6 +1923,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
+	LiveTrace::Event(LiveTrace::FlipSubmit, request);
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
 	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
 	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request, m_interrupt_event_id);
@@ -1921,6 +1941,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	};
 	ProcessorScope processor_scope(*this);
 
+	LiveTrace::Event(LiveTrace::FlipSubmit, request_id, 1);
 	m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
 	GetScheduler().Flush();
 	m_renderer.GetVideoOut().CompleteFlip(request_id);

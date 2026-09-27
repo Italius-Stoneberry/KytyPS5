@@ -150,6 +150,7 @@ private:
 	mutable bool        m_compute_access_pending = false;
 	mutable uint64_t    m_graphics_generation    = 0;
 	vk::CommandBuffer   m_buffer          = nullptr;
+	uint32_t            m_timestamp_slot  = UINT32_MAX; // live trace GPU timestamps
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
 	uint32_t            m_debug_arg0      = 0;

@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "live-trace.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -63,6 +64,12 @@ static void ReplayBegin(std::span<const LocalVulkanRecording::Segment> segments,
 	if (dispatch.vkBeginCommandBuffer(command, &info) != VK_SUCCESS) {
 		EXIT("deferred vkBeginCommandBuffer failed\n");
 	}
+	const auto slot = *static_cast<const uint32_t*>(segments[1].data);
+	if (slot != UINT32_MAX && LiveTrace::g_timestamp_pool != nullptr) {
+		const auto pool = static_cast<VkQueryPool>(LiveTrace::g_timestamp_pool);
+		dispatch.vkCmdResetQueryPool(command, pool, slot * 2u, 2u);
+		dispatch.vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, slot * 2u);
+	}
 }
 #endif
 
@@ -73,8 +80,11 @@ void CommandBuffer::Begin() {
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	// The recording worker owns this pool's buffers while it replays them; begin there too.
 	{
-		const VkCommandBuffer               raw = buffer;
-		const LocalVulkanRecording::Segment segments[] {{&raw, sizeof(raw)}};
+		const VkCommandBuffer raw = buffer;
+		m_timestamp_slot          = LiveTrace::g_on.load(std::memory_order_relaxed) && LiveTrace::g_timestamp_pool
+		                                ? LiveTrace::g_timestamp_next.fetch_add(1) % LiveTrace::TimestampSlots
+		                                : UINT32_MAX;
+		const LocalVulkanRecording::Segment segments[] {{&raw, sizeof(raw)}, {&m_timestamp_slot, sizeof(m_timestamp_slot)}};
 		if (LocalVulkanRecording::EnqueueDeferred(ReplayBegin, segments, false)) {
 			return;
 		}

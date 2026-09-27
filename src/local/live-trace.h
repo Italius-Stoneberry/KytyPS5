@@ -1,0 +1,105 @@
+#pragma once
+// Local diagnostic: a timeline of scheduling events (live `trace SECONDS PATH`).
+// Recording costs one relaxed load while tracing is off.
+
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <x86intrin.h>
+
+namespace LiveTrace {
+
+enum Type : uint32_t {
+	Submit        = 1,  // a: queue | type << 8, b: dwords
+	GuestDone     = 2,  // a: submitted frame
+	FrontIdle     = 3,  // a: 1 begin / 0 end, b: 0 empty, 1 blocked
+	BackIdle      = 4,  // a: 1 begin / 0 end
+	BackFrame     = 5,  // a: consumed frame
+	Interrupt     = 6,  // a: event id, b: context id
+	EqueueWait    = 7,  // a: 1 begin / 0 end, b: events received
+	FlipSubmit    = 8,  // a: request id
+	FlipComplete  = 9,  // a: request id
+	FrontSuspend  = 10, // a: address, b: value
+	GpuSubmit     = 11, // a: tick
+	GpuDone       = 12, // a: tick
+	GuestReadback = 13, // a: 1 begin / 0 end, b: address
+	RenderIdle    = 14, // combined mode: a: 1 begin / 0 end, b: 0 empty, 1 blocked
+	BackItem      = 15, // a: 1 begin / 0 end, b: sequence
+	FrontItem     = 16, // a: sequence, b: queue
+	SemaWait      = 17, // a: 1 begin / 0 end
+	CondWait      = 18, // a: 1 begin / 0 end
+	ReadbackTicks = 19, // a: read address, b: size | tick the copy is recorded in << 32
+	TickDone      = 20, // a: tick the GPU completed (monitor thread)
+	RenderSlice   = 21, // combined mode: a: queue | type << 8 | complete << 16 | begin << 17, b: epoch
+	GpuSpan       = 22, // a: tick, b: GPU nanoseconds begin << 32... see GpuSpanNs
+	GpuSpanNs     = 23, // a: GPU begin timestamp (ns), b: GPU end timestamp (ns); follows GpuSpan
+	GpuMark       = 24, // a: mark slot, b: tag (shader address of the draw/dispatch recorded)
+	GpuMarkValue  = 25, // a: mark slot, b: GPU timestamp (ns) after the command completed
+	GpuWrite      = 26, // a: address, b: size | tick the writing command is recorded in << 32
+};
+
+struct Record {
+	uint64_t tsc;
+	uint32_t tid;
+	uint32_t type;
+	uint64_t a, b;
+};
+
+constexpr size_t           Capacity = 1u << 22;
+inline std::atomic_bool     g_on {false};
+inline std::atomic<uint64_t> g_count {0};
+inline Record               g_records[Capacity];
+
+// GPU buffer writes and readback ranges as events (live `tracew`): producers are matched offline.
+inline std::atomic_bool g_writes_on {false};
+inline bool             WriteTicks() {
+	return g_writes_on.load(std::memory_order_relaxed) && g_on.load(std::memory_order_relaxed);
+}
+
+// GPU timestamps per command buffer while tracing: query pair `slot` of g_timestamp_pool.
+constexpr uint32_t          TimestampSlots = 8192;
+inline void*                g_timestamp_pool = nullptr; // VkQueryPool
+inline double               g_timestamp_period = 1.0;  // ns per tick
+inline std::atomic<uint32_t> g_timestamp_next {0};
+inline std::atomic<uint32_t> g_tick_slot[TimestampSlots]; // tick % TimestampSlots -> slot + 1
+
+// Per-draw/dispatch GPU timestamps while tracing (`trace` with marks): a timestamp after each
+// recorded draw or dispatch, tagged with the recording thread's current tag.
+constexpr uint32_t           MarkSlots = 1u << 20;
+inline void*                 g_mark_pool = nullptr; // VkQueryPool
+inline std::atomic_bool      g_marks_on {false};
+inline std::atomic<uint32_t> g_mark_next {0};
+inline thread_local uint64_t g_mark_tag = 0;
+// Set by the renderer: reads the used marks into the trace (after tracing stops).
+inline void (*g_read_marks)(uint32_t count) = nullptr;
+
+inline void Append(uint32_t type, uint64_t a, uint64_t b) {
+	const auto index = g_count.fetch_add(1, std::memory_order_relaxed);
+	if (index < Capacity) g_records[index] = {__rdtsc(), 0, type, a, b};
+}
+
+inline uint32_t ThreadId() {
+	static thread_local uint32_t tid = static_cast<uint32_t>(syscall(SYS_gettid));
+	return tid;
+}
+
+inline void Event(uint32_t type, uint64_t a = 0, uint64_t b = 0) {
+	if (!g_on.load(std::memory_order_relaxed)) return;
+	const auto index = g_count.fetch_add(1, std::memory_order_relaxed);
+	if (index >= Capacity) return;
+	g_records[index] = {__rdtsc(), ThreadId(), type, a, b};
+}
+
+// Called by the live thread.
+inline void Dump(const char* path) {
+	const auto count = std::min<uint64_t>(g_count.load(), Capacity);
+	if (auto* out = std::fopen(path, "wb")) {
+		std::fwrite(g_records, sizeof(Record), count, out);
+		std::fclose(out);
+	}
+}
+
+} // namespace LiveTrace

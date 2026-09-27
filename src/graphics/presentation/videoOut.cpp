@@ -1,4 +1,5 @@
 #include "graphics/presentation/videoOut.h"
+#include "live-trace.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -1490,6 +1491,7 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& b
 }
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
+	LiveTrace::Event(LiveTrace::FlipComplete, request_id);
 	m_impl->GetFlipQueue().Complete(request_id);
 }
 

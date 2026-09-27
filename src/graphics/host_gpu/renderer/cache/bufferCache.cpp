@@ -3,6 +3,7 @@
 #include "native-buffer-residency.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "live-trace.h"
 #include "native-resource-state.h"
 #include "async-upload.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
@@ -227,6 +228,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		cursor += AlignDownload(envelope_size);
 	}
 	request->tick = m_scheduler.CurrentTick();
+	if (LiveTrace::WriteTicks()) LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
 	m_scheduler.Flush();
 	// Keep GPU ownership and page protection until the caller has copied every byte.
 	// Subsequent accesses to this window must retire this request before proceeding.
@@ -773,6 +775,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// GPU thread records the download instead of draining the GPU; the writer
 	// waits and copies, then the written range becomes CPU-owned.
 	const bool async_write = is_write && kyty_local_async_write_readback_mode.load(std::memory_order_relaxed) != 0;
+	const bool guest       = !GuestGpu::IsGpuThread();
+	if (guest) LiveTrace::Event(LiveTrace::GuestReadback, 1, vaddr);
+	struct TraceEnd {
+		bool     on;
+		uint64_t vaddr;
+		~TraceEnd() {
+			if (on) LiveTrace::Event(LiveTrace::GuestReadback, 0, vaddr);
+		}
+	} trace_end {guest, vaddr};
 	if ((!is_write || async_write) && !GuestGpu::IsGpuThread() && GuestReadbacksEnabled()) {
 		std::shared_ptr<GuestReadback> request;
 		auto& gpu = m_scheduler.Context().GetGpu();
@@ -1128,6 +1139,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		InvalidateCopyFeedback(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
+		if (LiveTrace::WriteTicks())
+			LiveTrace::Event(LiveTrace::GpuWrite, vaddr, size | m_scheduler.CurrentTick() << 32u);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
 	}

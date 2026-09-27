@@ -16,6 +16,7 @@
 
 #include "live-census.h"
 #include "live-counters.h"
+#include "live-trace.h"
 
 #include <algorithm>
 #include <array>
@@ -226,6 +227,23 @@ inline void Run(uint64_t id, const std::string& line) {
 		Measure(id, std::strtod(arg1, nullptr), n == 3 ? arg2 : "-");
 	} else if ((cmd == "prof" || cmd == "profp" || cmd == "profw") && n == 3) {
 		Profile(id, std::strtod(arg1, nullptr), arg2, cmd == "profp", cmd == "profw");
+	} else if ((cmd == "trace" || cmd == "tracew") && n == 3) {
+		LiveTrace::g_count.store(0);
+		LiveTrace::g_writes_on.store(cmd == "tracew");
+		const auto tsc0   = __rdtsc();
+		const auto clock0 = std::chrono::steady_clock::now();
+		LiveTrace::g_on.store(true);
+		std::this_thread::sleep_for(std::chrono::duration<double>(std::strtod(arg1, nullptr)));
+		LiveTrace::g_on.store(false);
+		LiveTrace::g_writes_on.store(false);
+		const auto tsc1   = __rdtsc();
+		const auto clock1 = std::chrono::steady_clock::now();
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		LiveTrace::Dump(arg2);
+		const double seconds = std::chrono::duration<double>(clock1 - clock0).count();
+		std::printf("LIVE_TRACE id=%" PRIu64 " records=%" PRIu64 " tsc_hz=%.0f path=%s\n", id,
+		            std::min<uint64_t>(LiveTrace::g_count.load(), LiveTrace::Capacity),
+		            static_cast<double>(tsc1 - tsc0) / seconds, arg2);
 	} else if (cmd == "census" && n >= 2) {
 		// census <seconds>: render-thread time per call kind and shader over the window.
 		LiveCensus::g_on.store(false);

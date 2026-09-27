@@ -7,6 +7,7 @@
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
+#include "live-trace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -110,7 +111,50 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
+      m_tick_monitor([this](std::stop_token stop) {
+	      (void)pthread_setname_np(pthread_self(), "Kyty.TickMon");
+	      {
+		      vk::QueryPoolCreateInfo info {};
+		      info.queryType  = vk::QueryType::eTimestamp;
+		      info.queryCount = LiveTrace::TimestampSlots * 2u;
+		      vk::QueryPool pool {};
+		      if (m_graphics.device.createQueryPool(&info, nullptr, &pool) == vk::Result::eSuccess) {
+			      LiveTrace::g_timestamp_period = m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+			      LiveTrace::g_timestamp_pool   = static_cast<VkQueryPool>(pool);
+		      }
+	      }
+	      uint64_t next = 0;
+	      while (!stop.stop_requested()) {
+		      if (!LiveTrace::g_on.load(std::memory_order_relaxed)) {
+			      next = 0;
+			      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+			      continue;
+		      }
+		      if (next == 0) next = m_master.KnownGpuTick() + 1;
+		      vk::SemaphoreWaitInfo wait {};
+		      const auto            semaphore = m_master.Handle();
+		      wait.semaphoreCount           = 1;
+		      wait.pSemaphores              = &semaphore;
+		      wait.pValues                  = &next;
+		      if (m_graphics.device.waitSemaphores(&wait, 2000000) == vk::Result::eSuccess) {
+			      LiveTrace::Event(LiveTrace::TickDone, next);
+			      auto& mapped = LiveTrace::g_tick_slot[next % LiveTrace::TimestampSlots];
+			      if (const auto slot = mapped.exchange(0); slot != 0 && LiveTrace::g_timestamp_pool != nullptr) {
+				      uint64_t times[2] {};
+				      if (m_graphics.device.getQueryPoolResults(
+				              static_cast<VkQueryPool>(LiveTrace::g_timestamp_pool), (slot - 1u) * 2u, 2u,
+				              sizeof(times), times, sizeof(uint64_t), vk::QueryResultFlagBits::e64) == vk::Result::eSuccess) {
+					      LiveTrace::Event(LiveTrace::GpuSpan, next);
+					      LiveTrace::Event(LiveTrace::GpuSpanNs,
+					                       static_cast<uint64_t>(static_cast<double>(times[0]) * LiveTrace::g_timestamp_period),
+					                       static_cast<uint64_t>(static_cast<double>(times[1]) * LiveTrace::g_timestamp_period));
+				      }
+			      }
+			      ++next;
+		      }
+	      }
+      }) {}
 
 void CommandScheduler::CompleteDispatch() {
 	// Expose command-processor/GPU overlap without a host fence. Bound the
@@ -328,6 +372,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active_tick = operation.tick;
 		}
 		m_master.Wait(operation.tick);
+		LiveTrace::Event(LiveTrace::GpuDone, operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -405,11 +450,20 @@ struct DeferredSubmit {
 	uint64_t             signal_ticks[SubmitInfo::MaxSemaphores];
 	uint64_t             tick;
 	uint64_t             upload_sequence; // KYTY_ASYNC_UPLOAD copies this buffer reads
+	uint32_t             timestamp_slot;  // live trace
 };
 void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
                   const vk::detail::DispatchLoaderDynamic& dispatch) {
 	const auto& submit = *static_cast<const DeferredSubmit*>(segments[0].data);
 	AsyncUpload::Wait(submit.upload_sequence);
+	LiveTrace::Event(LiveTrace::GpuSubmit, submit.tick, 1);
+	if (submit.timestamp_slot != UINT32_MAX && LiveTrace::g_timestamp_pool != nullptr) {
+		dispatch.vkCmdWriteTimestamp(submit.command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		                             static_cast<VkQueryPool>(LiveTrace::g_timestamp_pool),
+		                             submit.timestamp_slot * 2u + 1u);
+		LiveTrace::g_tick_slot[submit.tick % LiveTrace::TimestampSlots].store(submit.timestamp_slot + 1u,
+		                                                                        std::memory_order_release);
+	}
 	if (dispatch.vkEndCommandBuffer(submit.command) != VK_SUCCESS) {
 		EXIT("deferred vkEndCommandBuffer failed, tick=%" PRIu64 "\n", submit.tick);
 	}
@@ -457,6 +511,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 			submit.AddSignal(m_master.Handle(), deferred.tick);
 		}
 		deferred.command         = m_command.m_buffer;
+		deferred.timestamp_slot  = m_command.m_timestamp_slot;
 		deferred.upload_sequence = AsyncUpload::SubmitSequence();
 		deferred.queue           = m_graphics.queue;
 		deferred.queue_mutex = &m_graphics.queue_mutex;
@@ -479,6 +534,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 		m_command.m_buffer    = nullptr;
 		m_recorded_dispatches = 0;
+		LiveTrace::Event(LiveTrace::GpuSubmit, deferred.tick);
 		return deferred.tick;
 	}
 #endif

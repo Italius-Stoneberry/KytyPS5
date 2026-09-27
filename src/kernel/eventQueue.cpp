@@ -1,4 +1,5 @@
 #include "kernel/eventQueue.h"
+#include "live-trace.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -409,6 +410,7 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
 
+	LiveTrace::Event(LiveTrace::EqueueWait, 1, timo == nullptr ? ~0ull : *timo);
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}
@@ -420,6 +422,8 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 			*out = owner->WaitForEvents(ev, num, *timo);
 		}
 	}
+
+	LiveTrace::Event(LiveTrace::EqueueWait, 0, *out > 0 ? (uint64_t {static_cast<uint32_t>(*out)} << 32u) | static_cast<uint32_t>(ev[0].ident) : 0);
 
 	if (*out == KERNEL_ERROR_EBADF) {
 		return KERNEL_ERROR_EBADF;
