@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+namespace ReadbackQueue { class Queue; }
+
 namespace Libs::Graphics {
 
 struct GraphicContext;
@@ -224,6 +226,25 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+
+	// KYTY_READBACK_QUEUE: GPU writes that may still be in flight, oldest first. An entry's
+	// tick is set at the next point between commands (every write noted by then is recorded
+	// at or before the current tick); entries the GPU completed are dropped from the front.
+	struct GpuWrite {
+		uint64_t begin, end, tick;
+	};
+	void                  NoteGpuWrite(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed);
+	std::vector<GpuWrite> m_gpu_writes;
+	size_t                m_gpu_writes_head    = 0;
+	size_t                m_gpu_writes_stamped = 0;
+	bool                  m_gpu_writes_on      = false;
+	// Writes before this tick were not noted (UINT64_MAX: set at the next stamp).
+	uint64_t              m_gpu_writes_from    = UINT64_MAX;
+	// Last copy-engine value that wrote each download slot.
+	std::array<uint64_t, GuestReadbackSlots> m_download_queue_values {};
+	// Last member: destroyed (queue idle) before the buffers its copies use.
+	std::unique_ptr<ReadbackQueue::Queue> m_readback_queue;
 };
 
 } // namespace Libs::Graphics

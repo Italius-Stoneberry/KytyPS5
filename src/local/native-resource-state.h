@@ -51,4 +51,5 @@ extern volatile std::atomic<uint32_t> kyty_local_texture_resolve_pages_mode;
 extern volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode;
 // 1: guest readbacks narrow a window that meets an image to the request's pages (bufferCache.cpp).
 extern volatile std::atomic<uint32_t> kyty_local_readback_narrow_mode;
+extern volatile std::atomic<uint32_t> kyty_local_readback_queue_mode;
 }

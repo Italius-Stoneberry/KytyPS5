@@ -6,6 +6,7 @@
 #include "live-trace.h"
 #include "native-resource-state.h"
 #include "async-upload.h"
+#include "readback-queue.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "gpu_tiler_shaders/lod_stats_pack_spv.h"
 
@@ -21,6 +22,9 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode {0};
 // 1: a guest readback whose window meets an image falls back to the request's own pages.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_narrow_mode {0};
+// KYTY_READBACK_QUEUE (readback-queue.h): 1: readbacks whose bytes no in-flight GPU work writes
+// copy on the transfer queue; 2: also those whose last writer is submitted but still running.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_queue_mode {0};
 // 1: pack the LOD report on the GPU instead of a CPU wait and copy.
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // 1: shader constants stream through a host-visible upload ring.
@@ -92,6 +96,9 @@ struct BufferCache::GuestReadback {
 	std::vector<Part> parts;
 	std::vector<GuestRange> pages;
 	uint64_t begin = 0, size = 0, tick = 0, packed_size = 0;
+	// KYTY_READBACK_QUEUE: the copy-engine value that completes the copy (0: graphics queue
+	// at `tick`), and the graphics tick of the last GPU write it waited for.
+	uint64_t queue_value = 0, producer_tick = 0;
 	size_t slot = 0;
 	Buffer* download = nullptr;
 	std::atomic<bool> copying {false};
@@ -210,6 +217,11 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	if (!download)
 		download = std::make_unique<Buffer>(m_graphics, m_scheduler,
 		    MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, Capacity);
+	// A detached copy-engine request may still write this slot.
+	if (m_download_queue_values[slot] != 0) {
+		m_readback_queue->Wait(m_download_queue_values[slot]);
+		m_download_queue_values[slot] = 0;
+	}
 	auto request = std::make_shared<GuestReadback>();
 	request->begin = begin;
 	request->size = end - begin;
@@ -217,6 +229,41 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	request->slot = slot;
 	request->download = download.get();
 	request->packed_size = packed_size;
+	// KYTY_READBACK_QUEUE: bytes whose writers the GPU finished (or, mode 2, has been handed)
+	// need not wait behind the rest of the graphics queue.
+	if (const auto mode = kyty_local_readback_queue_mode.load(std::memory_order_relaxed);
+	    mode != 0 && m_graphics.readback_queue != nullptr && m_gpu_writes_on) {
+		auto& master = m_scheduler.GetMasterSemaphore();
+		master.Refresh();
+		const uint64_t completed = master.KnownGpuTick();
+		const uint64_t producer  = InflightWriteTick(begin, end, completed);
+		if (completed >= m_gpu_writes_from &&
+		    (producer == 0 || (mode >= 2 && producer < m_scheduler.CurrentTick()))) {
+			if (!m_readback_queue) m_readback_queue = std::make_unique<ReadbackQueue::Queue>(m_graphics);
+			std::vector<VkBufferCopy> regions;
+			regions.reserve(copies.size());
+			uint64_t cursor = 0;
+			for (const auto& copy: copies) {
+				EXIT_IF(copy.buffer != &buffer);
+				const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+				regions.push_back({source_begin, cursor, envelope_size});
+				request->parts.push_back({copy.address, copy.size, cursor + copy.source_offset - source_begin});
+				cursor += AlignDownload(envelope_size);
+			}
+			request->producer_tick = std::max(producer, completed);
+			request->queue_value   = m_readback_queue->Copy(buffer.Handle(), download->Handle(), regions,
+			                                                master.Handle(), request->producer_tick);
+			m_download_queue_values[slot] = request->queue_value;
+			request->tick                 = m_scheduler.CurrentTick();
+			if (LiveTrace::WriteTicks())
+				LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
+			m_guest_readbacks[slot] = request;
+			m_active_guest_readbacks |= 1u << slot;
+			LiveCounters::Add(LiveCounters::AsyncReadbacks);
+			LiveCounters::Add(producer == 0 ? LiveCounters::RbQueueDone : LiveCounters::RbQueueInflight);
+			return request;
+		}
+	}
 	uint64_t cursor = 0;
 	for (const auto& copy: copies) {
 		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
@@ -238,13 +285,64 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	return request;
 }
 
+// KYTY_READBACK_QUEUE. GPU thread, inside a command: the write is recorded at or after the
+// current tick, so its tick is only set at the next point between commands.
+void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (kyty_local_readback_queue_mode.load(std::memory_order_relaxed) == 0 || m_graphics.readback_queue == nullptr) {
+		if (m_gpu_writes_on) {
+			m_gpu_writes_on = false;
+			m_gpu_writes.clear();
+			m_gpu_writes_head = m_gpu_writes_stamped = 0;
+		}
+		return;
+	}
+	// Starting, or no point between commands for very long: forget what is not stamped and
+	// refuse the fast path until everything recorded so far has completed.
+	constexpr size_t Limit = size_t {1} << 20;
+	if (!m_gpu_writes_on || m_gpu_writes.size() - m_gpu_writes_head >= Limit) {
+		m_gpu_writes_on = true;
+		m_gpu_writes.clear();
+		m_gpu_writes_head = m_gpu_writes_stamped = 0;
+		m_gpu_writes_from = UINT64_MAX;
+	}
+	m_gpu_writes.push_back({vaddr, vaddr + size, 0});
+}
+
+// KYTY_READBACK_QUEUE. GPU thread, between commands (guest readbacks run there): the latest
+// tick of a possibly unfinished GPU write overlapping [begin, end); 0 when there is none.
+uint64_t BufferCache::InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed) {
+	const uint64_t current = m_scheduler.CurrentTick();
+	for (; m_gpu_writes_stamped < m_gpu_writes.size(); ++m_gpu_writes_stamped)
+		m_gpu_writes[m_gpu_writes_stamped].tick = current;
+	if (m_gpu_writes_from == UINT64_MAX) m_gpu_writes_from = current;
+	// Stamps never decrease: the completed writes are a prefix.
+	while (m_gpu_writes_head < m_gpu_writes.size() && m_gpu_writes[m_gpu_writes_head].tick <= completed)
+		++m_gpu_writes_head;
+	if (m_gpu_writes_head >= 4096 && m_gpu_writes_head * 2 >= m_gpu_writes.size()) {
+		m_gpu_writes.erase(m_gpu_writes.begin(), m_gpu_writes.begin() + static_cast<std::ptrdiff_t>(m_gpu_writes_head));
+		m_gpu_writes_stamped -= m_gpu_writes_head;
+		m_gpu_writes_head = 0;
+	}
+	uint64_t tick = 0;
+	for (size_t i = m_gpu_writes_head; i < m_gpu_writes.size(); ++i) {
+		const auto& write = m_gpu_writes[i];
+		if (write.begin < end && begin < write.end) tick = std::max(tick, write.tick);
+	}
+	return tick;
+}
+
 void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& request) {
 	if (request->copying.exchange(true, std::memory_order_acq_rel)) {
 		while (!request->copied.load(std::memory_order_acquire)) request->copied.wait(false);
 		return;
 	}
-	m_scheduler.GetMasterSemaphore().Wait(request->tick);
-	m_scheduler.WaitPriorityOperations(request->tick);
+	if (request->queue_value != 0) {
+		m_readback_queue->Wait(request->queue_value);
+		m_scheduler.WaitPriorityOperations(request->producer_tick);
+	} else {
+		m_scheduler.GetMasterSemaphore().Wait(request->tick);
+		m_scheduler.WaitPriorityOperations(request->tick);
+	}
 	uint32_t pending = GuestReadback::Pending;
 	if (request->state.compare_exchange_strong(pending, GuestReadback::Copying, std::memory_order_acq_rel)) {
 		request->download->Invalidate(0, request->packed_size);
@@ -741,6 +839,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 
 BufferCache::~BufferCache() {
 	DrainGuestReadback();
+	m_readback_queue.reset();
     m_graphics.device.destroyPipeline(m_lod_pack_pipeline, nullptr);
     m_graphics.device.destroyPipelineLayout(m_lod_pack_layout, nullptr);
     m_graphics.device.destroyDescriptorSetLayout(m_lod_pack_descriptors, nullptr);
@@ -1139,6 +1238,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		InvalidateCopyFeedback(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
+		NoteGpuWrite(vaddr, size);
 		if (LiveTrace::WriteTicks())
 			LiveTrace::Event(LiveTrace::GpuWrite, vaddr, size | m_scheduler.CurrentTick() << 32u);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);

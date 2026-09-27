@@ -70,6 +70,13 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	// KYTY_READBACK_QUEUE: the transfer queue reads guest buffers and writes download buffers.
+	const uint32_t families[] {graphics.queue_family, graphics.readback_family};
+	if (graphics.readback_family != static_cast<uint32_t>(-1)) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = 2;
+		buffer_info.pQueueFamilyIndices   = families;
+	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =

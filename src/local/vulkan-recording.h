@@ -12,6 +12,8 @@ namespace vk::detail { class DispatchLoaderDynamic; }
 // only fully copied Vulkan call arguments.
 namespace LocalVulkanRecording {
 void Install();
+// The Vulkan entry points without recording: for a queue the recording worker does not own.
+const vk::detail::DispatchLoaderDynamic& DirectDispatch();
 // Complete this producer's CPU recording before handing its Vulkan objects to
 // another thread. A receiver's drain cannot flush the sender's thread-local queue.
 // This does not wait for GPU execution.

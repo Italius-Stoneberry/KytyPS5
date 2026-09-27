@@ -277,6 +277,7 @@ std::atomic<uint64_t> g_work_calls {0};
 } // namespace
 
 void Install() { InstallDispatch(); }
+const vk::detail::DispatchLoaderDynamic& DirectDispatch() { return original; }
 uint64_t WorkCalls() { return g_work_calls.load(std::memory_order_relaxed); }
 void Drain() { if (producer) producer->Drain(); }
 bool PacketsEnabled() {

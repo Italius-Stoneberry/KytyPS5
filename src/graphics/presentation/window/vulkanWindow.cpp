@@ -41,6 +41,8 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -574,6 +576,30 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	queue_create_info.queueCount       = 1;
 	queue_create_info.pQueuePriorities = &queue_priority;
 
+	// KYTY_READBACK_QUEUE: also a queue of a transfer-only family (the copy engine).
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {queue_create_info, queue_create_info};
+	uint32_t                                 queue_create_count = 1;
+	graphics.readback_family                                    = static_cast<uint32_t>(-1);
+	if (const char* readback = std::getenv("KYTY_READBACK_QUEUE");
+	    readback != nullptr && readback[0] != '\0' && std::strcmp(readback, "0") != 0) {
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		const vk::QueueFlags transfer_only = vk::QueueFlagBits::eTransfer | vk::QueueFlagBits::eSparseBinding;
+		for (uint32_t family = 0; family < family_count; ++family) {
+			const auto flags = families[family].queueFlags;
+			if (family != queue_family && families[family].queueCount != 0 &&
+			    (flags & vk::QueueFlagBits::eTransfer) && (flags & ~transfer_only) == vk::QueueFlags {}) {
+				graphics.readback_family                         = family;
+				queue_create_infos[1].queueFamilyIndex           = family;
+				queue_create_count                               = 2;
+				LOGF("\treadback queue family %u\n", family);
+				break;
+			}
+		}
+	}
+
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.sType = vk::StructureType::ePhysicalDeviceColorWriteEnableFeaturesEXT;
 	color_write_ext.pNext = nullptr;
@@ -776,8 +802,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		create_info.pNext = &provoking_vertex;
 	}
 	create_info.flags                   = {};
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1195,6 +1221,10 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.queue_family = queue_family;
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+		EXIT_IF(graphic_ctx.readback_queue == nullptr);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1318,6 +1348,8 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 #endif
 	graphic_ctx.queue_family = queue_family;
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
+	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1))
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
 	return graphic_ctx.queue != nullptr && graphic_ctx.CreateAllocator();
 }
 
@@ -1350,8 +1382,9 @@ WindowContext::~WindowContext() {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
-		graphic_ctx.device = nullptr;
-		graphic_ctx.queue  = nullptr;
+		graphic_ctx.device         = nullptr;
+		graphic_ctx.queue          = nullptr;
+		graphic_ctx.readback_queue = nullptr;
 	}
 	if (surface != nullptr) {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
