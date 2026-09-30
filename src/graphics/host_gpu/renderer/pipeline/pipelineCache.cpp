@@ -931,7 +931,7 @@ struct PipelineCache::ProgramCache {
 		for (size_t remaining = warmup.records.size(); remaining != 0; --remaining) {
 			const size_t index = remaining - 1;
 			if (std::chrono::steady_clock::now() >= warm_deadline) break;
-			StartupProgress::Report("正在准备着色器", warmup.records.size() - remaining, warmup.records.size());
+			StartupProgress::Report("Preparing shaders", warmup.records.size() - remaining, warmup.records.size());
 			std::unique_ptr<WarmJob> job;
 			LocalShaderWarmup::Record parsed;
 			if (workers) {
@@ -1172,7 +1172,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
-	StartupProgress::Report("正在载入管线缓存", 0, 0);
+	StartupProgress::Report("Loading the pipeline cache", 0, 0);
 	InitializeStaticCache(false);
 	// Not in the static precompile: a shell that ran the game passes its KYTY_SHADER_WARMUP(_ONLY) on.
 #ifndef KYTY_STATIC_PRECOMPILE
@@ -1307,7 +1307,7 @@ void PipelineCache::WarmPipelines() {
 			}
 			if (const auto done = compiled.fetch_add(1, std::memory_order_relaxed) + 1; done % 250 == 0)
 				PipelineCacheLog("Pipeline warmup: compiling {}/{}", done, jobs.size());
-			StartupProgress::Report("正在准备管线", n + 1, jobs.size()); // shown from the main thread only
+			StartupProgress::Report("Preparing pipelines", n + 1, jobs.size()); // shown from the main thread only
 		}
 	};
 	const uint32_t threads = std::min<uint32_t>(ProgramCache::WarmupThreads(),

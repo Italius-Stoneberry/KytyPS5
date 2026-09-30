@@ -385,7 +385,7 @@ struct Presenter::Impl {
 		}
 		std::array<char, 128> line {};
 		if (progress.done < progress.total) {
-			std::snprintf(line.data(), line.size(), "后台准备着色器 %zu%%  (%zu / %zu)", progress.done * 100 / progress.total,
+			std::snprintf(line.data(), line.size(), "Preparing shaders %zu%%  (%zu / %zu)", progress.done * 100 / progress.total,
 			              progress.done, progress.total);
 		} else {
 			if (prefetch_finished == std::chrono::steady_clock::time_point {}) {
@@ -394,7 +394,7 @@ struct Presenter::Impl {
 			if (now - prefetch_finished >= std::chrono::seconds(3)) {
 				return;
 			}
-			std::snprintf(line.data(), line.size(), "着色器已全部准备好 (%zu)", progress.total);
+			std::snprintf(line.data(), line.size(), "All shaders ready (%zu)", progress.total);
 		}
 		hud.status          = line.data();
 		hud.status_fraction = static_cast<float>(progress.done) / static_cast<float>(progress.total);

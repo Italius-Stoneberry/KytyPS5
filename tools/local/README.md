@@ -1,26 +1,50 @@
-# 本地工具
+# Local tools
 
-日常启动与必要资产见 [当前版本](../../docs/CURRENT-PLAYABLE.md)，所有实验结论见 [实验简记](../../docs/EXPERIMENTS.md)，测试流程见 [性能复测](../../docs/BENCHMARKING.md)。
+For day-to-day launching and the required assets see the [current build](../../docs/CURRENT-PLAYABLE.md),
+for every experiment's conclusion the [experiment log](../../docs/EXPERIMENTS.md), and for the test
+procedure [benchmarking](../../docs/BENCHMARKING.md).
 
-## 日常运行和测量
+## Running and measuring
 
-- 项目根目录 `./run.sh`，或 `play-demons-souls.py --2k`：同一正式配置。后者支持运行日志、录像和 shader 预热选项。
-- `benchmark-entry.py`：备份用户存档、加载固定基线、正常 Continue、定位、静止测量，正常退出后恢复原存档。
-- `quick-benchmark-game.py`：已有进程的短测/截图；默认无镜头输入。
-- `switch-control.py`、`abba-switch.py`、`abba-cpu.py`：身份/指纹绑定的同进程开关与 CPU/帧对照。
-- `debug-run.py`、`debug_cpu_policy.py`、`demons-souls-smoke.py`、`close-game-window.py`：进程、绑核、菜单及正常关闭。
-- `game_recording.py`、`recording_hud.py`、`playtest_log.py`：录像与运行日志。
+- `./run.sh` in the repository root, or `play-demons-souls.py --2k`: the same release configuration.
+  The latter supports run logs, recording and shader warmup options.
+- `benchmark-entry.py`: backs up the user's save, loads the fixed baseline, continues normally,
+  positions, measures standing still, and restores the original save after a normal exit.
+- `quick-benchmark-game.py`: a short measurement/screenshot of a running process; no camera input by
+  default.
+- `switch-control.py`, `abba-switch.py`, `abba-cpu.py`: same-process switch and CPU/frame comparisons
+  bound to the process identity/fingerprint.
+- `debug-run.py`, `debug_cpu_policy.py`, `demons-souls-smoke.py`, `close-game-window.py`: processes,
+  CPU pinning, menus and a clean shutdown.
+- `game_recording.py`, `recording_hud.py`, `playtest_log.py`: recording and run logs.
+- Windows: `windows/bench-run.ps1` (launch to the HUD from the fixed save), `windows/ab-spot.ps1`
+  (same-process ABBA of a runtime switch), `windows/ab-exe.ps1` (ABBA of two builds),
+  `windows/walk-run.ps1` (the walk route), `windows/prof-spot.ps1` (render-thread profile),
+  `windows/pgo-train.ps1` (PGO profile refresh).
 
-## 构建和诊断
+## Building and diagnostics
 
-- `compile-srt-aot.py`：从生成的计划重建 AOT，ABI 头为 `src/local/SrtAotAbi.h`。
-- `extract-game-shaders.py`、`capture-srt-plans.py`、`shader_precompile_audit.py`：资源提取、计划导出与预热审计。
-- [static-precompile](static-precompile/README.md)：从游戏文件静态收集全部 shader/管线，独立程序（`precompile-windows.ps1`，多进程）预编译进跨构建保留的静态管线缓存；含与录制缓存的覆盖率对比。
-- `profile-game.py`、`perf-code-maps.py` 和各 `*-report.py`：按需诊断；不能把插桩 FPS 当成净收益。
-- `stage-candidate.py`：为独立候选生成配置，避免覆盖正式版本。
-- `run-reviewed.py`、`benchmark-build.py`：高级独立构建入口；需显式提供自己的二进制/收据，不是当前日常入口。
-- [PGO](PGO.md)：当前 profile 输入与重新训练的注意事项。
+- `compile-srt-aot.py` (Linux) / `compile-srt-aot-windows.py` (Windows DLL): rebuild the SRT AOT
+  library from exported plans; the ABI header is `src/local/SrtAotAbi.h`.
+- `extract-game-shaders.py`, `capture-srt-plans.py`, `shader_precompile_audit.py`: resource
+  extraction, plan export and warmup audits.
+- [static-precompile](static-precompile/README.md): collects every shader/pipeline statically from the
+  game files; a standalone program (`precompile-windows.ps1`, several processes) precompiles them into a
+  static pipeline cache kept across builds; includes coverage comparisons with recorded caches.
+- `profile-game.py`, `perf-code-maps.py`, `prof-inline.py` and the `*-report.py` scripts: on-demand
+  diagnostics; instrumented FPS is never a net gain.
+- `stage-candidate.py`: makes a configuration for an independent candidate without overwriting the
+  release one.
+- `run-reviewed.py`, `benchmark-build.py`: advanced entry points for independent builds; they need
+  their own binary/receipt given explicitly and are not the day-to-day entry.
+- [PGO](PGO.md): the current profile inputs and notes on retraining.
 
-CMake 与测试引用的本地源码（vulkan-recording、native-resource 等）都在 `src/local/`，可选实验默认关闭。本目录原有的 shader-preparation、prepared-draw、render-cost/playtest 等旧实验源码、`src/local` 文件的旧副本、`*.cmake` 片段及其测试源码，以及 `build-pbr-full-overlay.py`，都不再被引用，已于 2026-09-28 移除。已结束的 PT/SRT 捕获回放专用工具、旧 checkpoint 字节补丁工具及大体积运行产物已移除。
+The local sources CMake and the tests refer to (vulkan-recording, native-resource, ...) are all in
+`src/local/`; optional experiments are off by default. The old experiment sources of this folder
+(shader-preparation, prepared-draw, render-cost/playtest), old copies of `src/local` files, `*.cmake`
+fragments with their test sources, and `build-pbr-full-overlay.py` were no longer referenced and were
+removed on 2026-09-28. Tools for the finished PT/SRT capture replays, the old checkpoint byte-patch
+tools and large run outputs were removed as well.
 
-新实验只在实验简记追加一行。保留可复用工具，及时删除旧输出目录；不要删除正在使用的进程锁、正式库、存档或构建输入。
+A new experiment only appends one line to the experiment log. Keep reusable tools and delete old
+output folders promptly; never delete process locks in use, release libraries, saves or build inputs.

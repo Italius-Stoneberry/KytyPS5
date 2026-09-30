@@ -1,9 +1,11 @@
-# 文档导航
+# Documentation
 
-- [当前可玩版本](CURRENT-PLAYABLE.md)：日常启动、正式版本指纹、必须保留的资产。
-- [性能实验简记](EXPERIMENTS.md)：全部历史优化实验与最新 PBR 结果，后续只追加简短记录。
-- [性能复测](BENCHMARKING.md)：固定存档、同进程 A/B、验证及存档恢复。
-- [游戏兼容性](compatibility/demons-souls.md)：兼容状态。
-- [上游提交说明](upstream/README.md)：补丁拆分、移植和验证资料。
+- [Current playable build](CURRENT-PLAYABLE.md): day-to-day launch, the release build's fingerprint, assets that must be kept.
+- [Performance experiment log](EXPERIMENTS.md): every past optimization experiment and the latest PBR results; later entries are only appended as short notes.
+- [Benchmarking](BENCHMARKING.md): fixed save, same-process A/B, verification and save restore.
+- [Game compatibility](compatibility/demons-souls.md): compatibility status.
+- [Upstream contribution notes](upstream/README.md): patch splitting, porting and verification material.
+- [Portable package README](PORTABLE-README.md): the README shipped with the Windows portable package.
 
-历史逐轮长文已合并；旧结论被后续实验推翻时，以实验简记的修正为准。
+The long per-round write-ups have been merged; where a later experiment overturned an earlier
+conclusion, the correction in the experiment log is authoritative.

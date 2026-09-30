@@ -45,7 +45,7 @@ void PaintClient(HWND hwnd, const char* text, double fraction) {
 	const int line_height = std::max(16, height / 32);
 	HFONT     font = CreateFontW(-line_height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 	                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
-	                             L"Microsoft YaHei UI");
+	                             L"Segoe UI");
 	HGDIOBJ   previous = SelectObject(dc, font);
 	SetBkMode(dc, TRANSPARENT);
 	SetTextColor(dc, RGB(225, 225, 225));
@@ -97,7 +97,7 @@ void Paint(const char* text, uint64_t done, uint64_t total) {
 		std::snprintf(line, sizeof(line), "%s  %llu / %llu", text, static_cast<unsigned long long>(done),
 		              static_cast<unsigned long long>(total));
 	} else {
-		std::snprintf(line, sizeof(line), "%s…", text);
+		std::snprintf(line, sizeof(line), "%s...", text);
 	}
 	Show(line, total != 0 ? static_cast<double>(done) / static_cast<double>(total) : -1.0);
 }
@@ -113,7 +113,7 @@ void StartupProgressShow(SDL_Window* window) {
 void StartupProgressHide() {
 	StartupProgress::g_painter.store(nullptr, std::memory_order_release);
 	if (g_window == nullptr) return;
-	Show("正在启动游戏…", -1.0);
+	Show("Starting the game...", -1.0);
 	SDL_SetWindowTitle(g_window, g_title.c_str());
 	g_window = nullptr;
 }

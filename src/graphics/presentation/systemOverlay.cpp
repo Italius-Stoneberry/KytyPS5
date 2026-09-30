@@ -622,8 +622,7 @@ struct SystemOverlay::Impl {
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
-		// The default font first (dialogs); the panels' where Windows has it, with Chinese glyphs
-		// (the progress line) merged in from Microsoft YaHei (loaded as the text needs them).
+		// The default font first (dialogs); the panels' where Windows has it.
 		io.Fonts->AddFontDefault();
 #ifdef _WIN32
 		const char* windows = std::getenv("WINDIR");
@@ -635,11 +634,6 @@ struct SystemOverlay::Impl {
 		};
 		if (exists(fonts + "segoeuib.ttf")) {
 			hud_font = io.Fonts->AddFontFromFileTTF((fonts + "segoeuib.ttf").c_str(), 32.0f);
-			if (exists(fonts + "msyhbd.ttc")) {
-				ImFontConfig merge;
-				merge.MergeMode = true;
-				io.Fonts->AddFontFromFileTTF((fonts + "msyhbd.ttc").c_str(), 32.0f, &merge);
-			}
 		}
 #endif
 		ImGui::StyleColorsDark();
