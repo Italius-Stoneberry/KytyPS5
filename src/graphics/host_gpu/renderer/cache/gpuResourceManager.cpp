@@ -188,13 +188,24 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
-		++m_mapping_epoch;
+		m_unmaps[m_unmap_count++ % m_unmaps.size()] = {++m_mapping_epoch, vaddr, vaddr + size};
 	};
 	if (m_gpu == nullptr) {
 		unmap();
 		return;
 	}
 	m_gpu->SendCommandSync(unmap);
+}
+
+bool GpuResourceManager::UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept {
+	const auto end = vaddr + size;
+	for (auto count = m_unmap_count; count != 0; --count) {
+		if (m_unmap_count - count == m_unmaps.size()) return true; // older ones are overwritten
+		const auto& unmap = m_unmaps[(count - 1) % m_unmaps.size()];
+		if (unmap.epoch <= epoch) return false;
+		if (unmap.begin < end && vaddr < unmap.end) return true;
+	}
+	return false;
 }
 
 void GpuResourceManager::RefreshBdaRanges() {

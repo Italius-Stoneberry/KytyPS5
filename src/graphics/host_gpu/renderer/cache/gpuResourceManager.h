@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include <array>
 #include <cstdint>
 #include <shared_mutex>
 
@@ -47,6 +48,9 @@ public:
 	[[nodiscard]] uint64_t MappingEpoch() const noexcept {
 		return m_mapping_epoch.load(std::memory_order_acquire);
 	}
+	// Whether memory in [vaddr, vaddr + size) was unmapped after mapping epoch `epoch` (also
+	// true when that is further back than the unmaps kept). GPU thread, as UnmapMemory.
+	[[nodiscard]] bool UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept;
 
 	bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
 	void               RunGarbageCollector();
@@ -63,6 +67,12 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::atomic<uint64_t> m_mapping_epoch {1};
+	// The latest unmaps, with the mapping epoch each made (written by UnmapMemory's GPU-thread part).
+	struct Unmap {
+		uint64_t epoch = 0, begin = 0, end = 0;
+	};
+	std::array<Unmap, 64> m_unmaps {};
+	uint64_t              m_unmap_count = 0;
 	uint64_t m_bda_mapping_epoch = 0, m_bda_registration_epoch = 0;
 	std::vector<BufferCache::SyncRegionRequest> m_bda_region_requests;
 	GuestGpu*                 m_gpu = nullptr;

@@ -2013,6 +2013,17 @@ bool RenderExecutor::NativeXprValidate(NativeXprRecord& record, uint64_t frame) 
 	// A guest mapping change forces the buffer and image proofs below; the words
 	// are compared again anyway.
 	const bool mapping_moved = resources.MappingEpoch() != record.mapping_epoch;
+	// An unmap can take words the record reads (tables the SRT no longer reaches):
+	// those are read directly, so none may have been unmapped since the proof.
+	if (mapping_moved) {
+		const auto unmapped = [&](uint64_t address, uint32_t count) {
+			return resources.UnmappedSince(record.mapping_epoch, address, 4ull * count);
+		};
+		if (record.gather.traced
+		        ? std::ranges::any_of(record.gather.spans, [&](const auto& span) { return unmapped(span.address, span.count); })
+		        : std::ranges::any_of(record.reads, [&](const auto& read) { return unmapped(read.first, read.second); }))
+			return false;
+	}
 	if (record.gather.traced) {
 		if (!NativeXprGather(record) && (record.gather.broken || !NativeXprReevaluate(record))) {
 			return false;
@@ -2154,11 +2165,23 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 		}
 		cpu_epoch += epoch;
 	}
+	// After a mapping change, the ranges as FindBuffers gives them now: none unmapped since
+	// the proof (the refresh below reads them), and one it clamped to the mappings not grown.
+	const auto range_current = [&](const NativeXprRecord::BufferDep& dep) {
+		const auto& descriptors = record.stages[dep.stage].snapshot.buffers;
+		if (dep.slot >= descriptors.size() || resources.UnmappedSince(record.mapping_epoch, dep.address, dep.size))
+			return false;
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(descriptors[dep.slot]);
+		const auto stride     = descriptor.Stride();
+		const auto requested  = stride != 0 ? uint64_t(stride) * descriptor.NumRecords() : uint64_t(descriptor.NumRecords());
+		return requested == dep.size || Libs::LibKernel::Memory::ClampRangeSize(dep.address, requested) == dep.size;
+	};
 	// TouchLiveBuffer also keeps the owners from the garbage collector, as the
 	// normal path's per-draw ObtainBuffer would.
 	const bool cpu_proven = !mapping_moved && cpu_epoch != 0 && cpu_epoch == record.cpu_epoch;
 	for (const auto& dep: record.buffers) {
-		if (!buffers.TouchLiveBuffer(dep.id, dep.handle, dep.address, dep.size)) {
+		if ((mapping_moved && !range_current(dep)) ||
+		    !buffers.TouchLiveBuffer(dep.id, dep.handle, dep.address, dep.size)) {
 			return false;
 		}
 		if (cpu_proven || !buffers.IsRegionCpuModified(dep.address, dep.size)) continue;
