@@ -39,6 +39,11 @@ struct CompileResult {
 	IR::Program            program;
 };
 
+// Storage buffer accesses without an explicit bounds check where the device checks them the same
+// way: robustBufferAccess2 with byte-exact ranges (robustStorageBufferAccessSizeAlignment 1) reads
+// zero out of bounds and drops the stores. Set with the device, before any program compiles.
+void SetDeviceStorageBufferBounds(bool enabled);
+
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);
 [[nodiscard]] CompileResult CompileProgram(TranslateResult translated,

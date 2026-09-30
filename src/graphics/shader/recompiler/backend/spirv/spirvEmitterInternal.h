@@ -694,8 +694,14 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
                                 uint32_t raw_index);
 
+// True where the access is in bounds; a constant for storage buffers whose bounds the device
+// checks (SetDeviceStorageBufferBounds). Atomics keep the explicit check.
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
+uint32_t EmitMemoryElementInBoundsExplicit(EmitterState& state, const MemoryResourceAccess& access,
+                                           uint32_t index);
+// Storage buffer accesses of this kind are bounds-checked by the device (SetDeviceStorageBufferBounds).
+bool DeviceStorageBufferBounds(IR::ResourceKind kind);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
@@ -802,6 +808,10 @@ void DefineGetBdaPointer(EmitterState& state);
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) {
+		fn();
+		return;
+	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
@@ -815,6 +825,9 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) {
+		return fn();
+	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto then_exit   = state.builder.AllocateId();
 	const auto else_label  = state.builder.AllocateId();

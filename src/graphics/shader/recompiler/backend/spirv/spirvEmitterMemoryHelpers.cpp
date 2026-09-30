@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <atomic>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
@@ -172,8 +174,27 @@ uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess&
 	return access.add_index_offset ? EmitAddU32(state, raw_index, access.index_offset) : raw_index;
 }
 
+namespace {
+std::atomic<bool> g_device_storage_buffer_bounds {false};
+} // namespace
+
+bool DeviceStorageBufferBounds(IR::ResourceKind kind) {
+	return (kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer) &&
+	       g_device_storage_buffer_bounds.load(std::memory_order_relaxed);
+}
+
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index) {
+	// The device drops out-of-bounds storage buffer loads and stores the same way
+	// (SetDeviceStorageBufferBounds): the check and its branch only held back the shader.
+	if (DeviceStorageBufferBounds(access.kind)) {
+		return ConstantBool(state, true);
+	}
+	return EmitMemoryElementInBoundsExplicit(state, access, index);
+}
+
+uint32_t EmitMemoryElementInBoundsExplicit(EmitterState& state, const MemoryResourceAccess& access,
+                                           uint32_t index) {
 	const auto in_bounds = state.builder.AllocateId();
 	state.builder.AddFunction({OpULessThan, TypeBool(state), in_bounds, index, access.length});
 	return in_bounds;
@@ -546,3 +567,11 @@ uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t c
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler {
+
+void SetDeviceStorageBufferBounds(bool enabled) {
+	Spirv::Emitter::g_device_storage_buffer_bounds.store(enabled, std::memory_order_relaxed);
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler

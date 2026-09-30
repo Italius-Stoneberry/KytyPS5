@@ -318,8 +318,15 @@ uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
+// A load runs for the lanes EXEC enables. A storage buffer load the device bounds needs no guard:
+// a disabled lane loads harmlessly, and its register write (a Select on EXEC) drops the result.
+static uint32_t LoadGuard(ValueEmitContext& ctx, const IR::Inst& inst, IR::ResourceKind kind) {
+	return DeviceStorageBufferBounds(kind) ? ConstantBool(ctx.state, true)
+	                                       : ctx.Arg(inst, inst.NumArgs() - 1);
+}
+
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+	return EmitValueOrZeroIfCondition(ctx.state, LoadGuard(ctx, inst, mem.kind), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return LoadWordPrepared(ctx, inst, mem, resource);
 	});
@@ -366,7 +373,7 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
                      bool sign_extend) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+	return EmitValueOrZeroIfCondition(ctx.state, LoadGuard(ctx, inst, mem.kind), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return LoadSubwordPrepared(ctx, inst, mem, resource, bits, sign_extend);
 	});
@@ -731,7 +738,7 @@ uint32_t FormattedLoadPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 }
 
 uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+	return EmitValueOrZeroIfCondition(ctx.state, LoadGuard(ctx, inst, mem.kind), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return FormattedLoadPrepared(ctx, inst, mem, 0u, resource);
 	});
@@ -892,7 +899,7 @@ uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
 		return EmitValueOrZeroIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+		    ctx.state, EmitMemoryElementInBoundsExplicit(ctx.state, access.resource, access.index), [&]() {
 			    return operation(EmitMemoryElementPointer(ctx.state, access.resource, access.index));
 		    });
 	});
@@ -952,7 +959,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 		    const auto index = Binary(state, OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
 		    return EmitValueOrDefaultIfCondition(
-		        state, EmitMemoryElementInBounds(state, resource, index), TypeU64(state),
+		        state, EmitMemoryElementInBoundsExplicit(state, resource, index), TypeU64(state),
 		        ConstantU64(state, 0), [&]() {
 			        const auto value = Unary(state, OpBitcast, TypeScalarU64(state),
 			                                 ctx.Arg(inst, inst.NumArgs() - 2));
@@ -982,7 +989,7 @@ uint32_t SharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
 		EmitIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+		    ctx.state, EmitMemoryElementInBoundsExplicit(ctx.state, access.resource, access.index), [&]() {
 			    ctx.state.builder.AddFunction(
 			        {OpStore, ctx.scratch_u32_variable, ctx.Arg(inst, 1)});
 			    const auto data = ctx.state.builder.AllocateId();
@@ -1038,7 +1045,7 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	                                               : first;
 	const auto is_first =
 	    Binary(state, OpIEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), source_lane);
-	const auto storage_bounds = EmitMemoryElementInBounds(state, access, index);
+	const auto storage_bounds = EmitMemoryElementInBoundsExplicit(state, access, index);
 	const auto m0_bounds =
 	    mem.kind == IR::ResourceKind::Gds
 	        ? Binary(state, OpINotEqual, TypeBool(state), size, ConstantU32(state, 0))
@@ -1254,11 +1261,11 @@ uint32_t LoadWideBufferPrepared(ValueEmitContext& ctx, const IR::Inst& inst, con
 }
 
 uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
-	auto& state = ctx.state;
+	auto&      state = ctx.state;
+	const auto mem   = ctx.Memory(inst);
 	return EmitValueOrDefaultIfCondition(
-	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
+	    state, LoadGuard(ctx, inst, mem.kind), TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
-		    const auto mem      = ctx.Memory(inst);
 		    const auto resource = PrepareMemoryResourceAccess(state, mem);
 		    return LoadWideBufferPrepared(ctx, inst, mem, resource, components);
 	    });

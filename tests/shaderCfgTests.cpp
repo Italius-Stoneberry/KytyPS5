@@ -8940,7 +8940,13 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
       EncodeSopp(0x01),
   };
 
+  // A partial wave64 on a 32-wide host starts with a lane-dependent EXEC, so the guard is a
+  // branch (a guard on a constant EXEC is emitted as straight-line code).
+  auto compute = RegressionComputeInputInfo();
+  compute.threads_num[0]     = 48;
+  compute.host_subgroup_size = 32;
   auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);

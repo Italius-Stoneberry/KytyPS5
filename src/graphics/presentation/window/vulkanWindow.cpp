@@ -33,6 +33,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -49,6 +50,7 @@
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -781,6 +783,20 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
+	// Byte-exact device bounds make the shaders' own storage buffer checks redundant
+	// (ShaderRecompiler::SetDeviceStorageBufferBounds). KYTY_ROBUST_BUFFERS=0 keeps them.
+	bool device_buffer_bounds = false;
+	if (robustness2.robustBufferAccess2 == VK_TRUE) {
+		vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
+		vk::PhysicalDeviceProperties2              properties {};
+		properties.pNext = &robustness2_properties;
+		physical_device.getProperties2(&properties);
+		const char* setting  = std::getenv("KYTY_ROBUST_BUFFERS");
+		device_buffer_bounds = robustness2_properties.robustStorageBufferAccessSizeAlignment == 1 &&
+		                       !(setting != nullptr && std::string_view(setting) == "0");
+	}
+	ShaderRecompiler::SetDeviceStorageBufferBounds(device_buffer_bounds);
+	LOGF("Vulkan storage buffer bounds: %s\n", device_buffer_bounds ? "device" : "shader");
 
 	const bool subgroup_size_control_enabled =
 	    graphics.compute_subgroup_size_control_enabled &&
