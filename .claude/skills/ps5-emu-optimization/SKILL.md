@@ -9,6 +9,10 @@ Distilled from ~100 perf commits, ~150 recorded experiments and the tooling buil
 Demon's Souls (PPSA01341) on KytyPS5 from ~21 fps to ~40 fps, and from multi-second shader stalls
 to none. Numbers are from that project (i9-14900K + RTX 5090); treat them as orders of magnitude.
 
+Source: the `experiment/perf-40fps-20260926` branch of https://github.com/chenxiao07/KytyPS5 (an
+earlier snapshot: https://github.com/KytyPS5/KytyPS5/pull/599). The `KYTY_*` switches, scripts and
+file names mentioned here live in that branch; take them as examples and adapt the ideas to your tree.
+
 Read the reference that matches the task:
 - `references/lessons.md`: what worked, what failed and why (check before proposing an idea).
 - `references/measurement.md`: benchmark harness, A/B protocol, noise, correctness gates.
