@@ -837,8 +837,68 @@ private:
 	std::vector<std::thread>          m_threads;
 };
 
+PipelineCache::CompileWorkers& PipelineCache::Workers() {
+	if (m_compile_workers == nullptr) {
+		m_compile_workers = std::make_unique<CompileWorkers>(2);
+	}
+	return *m_compile_workers;
+}
+
+// KYTY_PIPELINE_FAST_BUILD=0: a pipeline no cache holds is compiled optimized before its first use
+// (up to seconds on NVIDIA) instead of unoptimized now and optimized on a worker.
+static PipelineBuild FirstBuild() {
+	static const bool fast = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_FAST_BUILD");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return fast ? PipelineBuild::Fast : PipelineBuild::Full;
+}
+
+// An unoptimized pipeline (PipelineBuild::Fast): `build` compiles the optimized one on a worker, into
+// a copy with the same layouts; PromoteOptimized() puts it in place.
+void PipelineCache::BuildOptimized(Pipeline& pipeline, std::function<void(Pipeline&)> build) {
+	if (!pipeline.unoptimized) return;
+	m_unoptimized_builds++;
+	m_optimizing.push_back(&pipeline);
+	pipeline.optimized = std::make_shared<OptimizedBuild>();
+	auto layouts       = pipeline;
+	layouts.pipeline   = nullptr;
+	layouts.optimized  = nullptr;
+	Workers().Push([this, optimized = pipeline.optimized, layouts, build = std::move(build)]() mutable {
+		if (!m_stopping.load(std::memory_order_relaxed)) build(layouts);
+		optimized->pipeline = layouts.pipeline;
+		optimized->done.store(true, std::memory_order_release);
+		m_optimized_builds.fetch_add(1, std::memory_order_release);
+	});
+}
+
+// Finished optimized builds replace their pipelines in place, for every holder of the Pipeline
+// (native XPR records never look it up again). The unoptimized pipeline stays alive until this
+// cache is destroyed: commands recorded before may still use it.
+void PipelineCache::PromoteOptimized() {
+	const auto finished = m_optimized_builds.load(std::memory_order_acquire);
+	if (finished == m_promoted_builds) return;
+	m_promoted_builds = finished;
+	std::erase_if(m_optimizing, [&](Pipeline* pipeline) {
+		const auto& build = *pipeline->optimized;
+		if (!build.done.load(std::memory_order_acquire)) return false;
+		if (build.pipeline != nullptr) {
+			m_replaced_pipelines.push_back(pipeline->pipeline);
+			pipeline->pipeline    = build.pipeline;
+			pipeline->unoptimized = false;
+		}
+		pipeline->optimized.reset();
+		return true;
+	});
+}
+
 void PipelineCache::FinishCompileWorkers() {
+	m_stopping.store(true, std::memory_order_relaxed);
 	m_compile_workers.reset();
+	if (m_unoptimized_builds != 0) {
+		PipelineCacheLog("Pipelines compiled unoptimized first: {}, replaced by their optimized build: {}",
+		                 m_unoptimized_builds, m_replaced_pipelines.size());
+	}
 	for (auto& [key, pending]: m_pending_graphics_pipelines) {
 		if (pending->done.load(std::memory_order_acquire) && pending->pipeline->pipeline != nullptr) {
 			m_graphics_pipelines.emplace(key, std::move(pending->pipeline));
@@ -991,6 +1051,9 @@ PipelineCache::~PipelineCache() {
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
+			if (pipeline->optimized != nullptr) {
+				m_graphics.device.destroyPipeline(pipeline->optimized->pipeline, nullptr);
+			}
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
 			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
@@ -998,6 +1061,9 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	for (const auto pipeline: m_replaced_pipelines) {
+		m_graphics.device.destroyPipeline(pipeline, nullptr);
+	}
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -1403,6 +1469,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	const auto color_count = static_cast<uint32_t>(colors.size());
 
 	Common::LockGuard lock(m_mutex);
+	PromoteOptimized();
 	auto&             ctx = command.GetRegisters();
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
@@ -1571,10 +1638,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 			job->ps_input_info = *ps_input_info;
 		}
 		m_pending_graphics_pipelines.emplace(key, job);
-		if (m_compile_workers == nullptr) {
-			m_compile_workers = std::make_unique<CompileWorkers>(2);
-		}
-		m_compile_workers->Push([this, job] {
+		Workers().Push([this, job] {
 			CreatePipelineInternal(m_graphics, *job->pipeline, job->rendering, job->vertex_input,
 			                       job->vs_input_info, job->vertex_program,
 			                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
@@ -1603,7 +1667,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program, ps_input_info, pixel_program, static_params,
-	                       m_driver_cache, native_bindings);
+	                       m_driver_cache, native_bindings, FirstBuild());
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -1614,6 +1678,15 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	if (indexed) {
 		m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
 	}
+	std::optional<ShaderPixelInputInfo> pixel_info;
+	if (ps_active) pixel_info = *ps_input_info;
+	BuildOptimized(*iter->second, [this, rendering, vertex_input = iter->first.vertex_input, vs_input_info,
+	                               pixel_info, vertex_program, pixel_program, static_params,
+	                               native_bindings](Pipeline& layouts) {
+		CreatePipelineInternal(m_graphics, layouts, rendering, vertex_input, vs_input_info, vertex_program,
+		                       pixel_info ? &*pixel_info : nullptr, pixel_program, static_params, m_driver_cache,
+		                       native_bindings, PipelineBuild::Optimize);
+	});
 	// Warmup recipes describe the normal variant only.
 	if (native_bindings) {
 		return iter->second.get();
@@ -1641,6 +1714,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_IF(!compute_program);
 
 	Common::LockGuard lock(m_mutex);
+	PromoteOptimized();
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
@@ -1656,13 +1730,17 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 		            static_cast<unsigned long long>(compute_program.id));
 	});
 	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
+	                       FirstBuild());
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	BuildOptimized(*iter->second, [this, input_info, module = compute_program.module](Pipeline& layouts) {
+		CreatePipelineInternal(m_graphics, layouts, input_info, module, m_driver_cache, PipelineBuild::Optimize);
+	});
 	LocalShaderWarmup::PipelineRecord recipe;
 	recipe.compute = m_program_cache->RecordedIndex(compute_program);
 	if (recipe.compute != LocalShaderWarmup::NoShader) {

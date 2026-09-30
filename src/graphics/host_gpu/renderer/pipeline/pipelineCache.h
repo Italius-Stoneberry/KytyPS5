@@ -10,13 +10,16 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -136,6 +139,13 @@ public:
 	static bool MergePrecompileShards(GraphicContext& graphics);
 #endif
 
+	// A pipeline no cache holds, compiled without optimization so its draw or dispatch need not wait:
+	// a worker compiles the optimized one, which then replaces it (PromoteOptimized).
+	struct OptimizedBuild {
+		std::atomic<bool> done {false};
+		vk::Pipeline      pipeline = nullptr;
+	};
+
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
@@ -143,6 +153,9 @@ public:
 		bool                    uses_push_descriptors = false;
 		// Native XPR variant: ordinary set, flattened SRT/shader data dynamic.
 		bool                    native_bindings       = false;
+		// PipelineBuild::Fast compiled it unoptimized; `optimized` is its optimized build.
+		bool                            unoptimized = false;
+		std::shared_ptr<OptimizedBuild> optimized;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// Immutable encoding plan; queued packets keep their own shared ownership.
 		mutable std::shared_ptr<const LocalDescriptorPlan> local_descriptor_plan;
@@ -289,6 +302,14 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::shared_ptr<PendingGraphicsPipeline>, GraphicsPipelineKeyHash>
 	                                m_pending_graphics_pipelines;
 	std::unique_ptr<CompileWorkers> m_compile_workers;
+	// Unoptimized pipelines whose optimized build is pending, and those it replaced (recorded commands
+	// may still use them).
+	std::vector<Pipeline*>    m_optimizing;
+	std::vector<vk::Pipeline> m_replaced_pipelines;
+	uint32_t                  m_unoptimized_builds = 0;
+	std::atomic<uint32_t>     m_optimized_builds {0}; // finished by workers
+	uint32_t                  m_promoted_builds = 0;  // of those, seen by PromoteOptimized
+	std::atomic<bool>         m_stopping {false};     // optimized builds not started yet are skipped
 
 	Pipeline* CreateGraphicsPipelineImpl(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                                     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
@@ -296,6 +317,9 @@ private:
 	                                     bool primitive_restart_enable, const ShaderProgram& vertex_program,
 	                                     const ShaderProgram& pixel_program, bool native_bindings, bool async);
 	void      FinishCompileWorkers();
+	CompileWorkers& Workers();
+	void            BuildOptimized(Pipeline& pipeline, std::function<void(Pipeline&)> build);
+	void            PromoteOptimized();
 	void InitializeDriverCache();
 	void InitializeStaticCache(bool create);
 	void WarmPipelines();
@@ -306,16 +330,21 @@ private:
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+// A pipeline the static cache lacks is compiled (Full); or taken from the driver cache, else compiled
+// unoptimized (Fast: Pipeline::unoptimized); Optimize compiles the optimized build of a Fast one (its
+// layouts given, `pipeline` null).
+enum class PipelineBuild { Full, Fast, Optimize };
 void CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     const ShaderVertexInputInfo& vs_input_info, const ShaderProgram& vertex_program,
     const ShaderPixelInputInfo* ps_input_info, const ShaderProgram& pixel_program,
     const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache,
-    bool native_bindings = false);
+    bool native_bindings = false, PipelineBuild build = PipelineBuild::Full);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
+                            PipelineBuild build = PipelineBuild::Full);
 
 } // namespace Libs::Graphics
 
