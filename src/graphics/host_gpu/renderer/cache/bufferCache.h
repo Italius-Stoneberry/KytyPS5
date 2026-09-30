@@ -196,6 +196,7 @@ private:
 	struct CopyFeedback;
 	void InvalidateCopyFeedback(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool is_write);
 	std::unique_ptr<CopyFeedback> m_copy_feedback;
 	bool TryReportLodStatsOnGpu(uint64_t address, bool reset);
 	vk::Pipeline m_lod_pack_pipeline = nullptr;

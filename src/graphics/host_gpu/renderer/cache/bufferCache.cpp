@@ -695,6 +695,34 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 	return true;
 }
 
+// GPU thread: a guest access to bytes a copy-feedback snapshot holds (copied after their last GPU
+// write, the copy complete) is served from it at once, instead of a transfer and a second command
+// for the reader; the whole snapshot then, whose other pages would fault one by one. Not while a
+// pending readback covers the pages: its copy would land later.
+bool BufferCache::TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool is_write) {
+	if (!m_copy_feedback || m_copy_feedback->index.empty()) return false;
+	auto& feedback = *m_copy_feedback;
+	if (!feedback.MayOverlap(vaddr, size) || !IsRegionRegistered(vaddr, size)) return false;
+	auto first = vaddr, last = vaddr + size;
+	if (auto it = feedback.UpperBound(vaddr); it != feedback.index.begin()) {
+		const auto& slot = feedback.slots[std::prev(it)->second];
+		if (slot.address <= vaddr && vaddr < slot.address + slot.size) {
+			first = std::min(first, slot.address);
+			last  = std::max(last, slot.address + slot.size);
+		}
+	}
+	const auto begin = first & ~(TRACKER_PAGE_SIZE - 1);
+	const auto end   = (last + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	for (const auto& pending: m_guest_readbacks)
+		if (pending && pending->begin < end && begin < pending->begin + pending->size) return false;
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	if (last - first == size || !buffer.IsInBounds(first, last - first) || !TryReadCopyFeedback(buffer, first, last - first)) {
+		if (!TryReadCopyFeedback(buffer, vaddr, size)) return false;
+	}
+	if (is_write) m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	return true;
+}
+
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
 }
@@ -1090,6 +1118,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		std::shared_ptr<GuestReadback> request;
 		auto& gpu = m_scheduler.Context().GetGpu();
 		gpu.SendCommandSync([&] {
+			if (TryGuestReadFromFeedback(vaddr, size, is_write)) return;
 			bool completed = false;
 			request = BeginGuestReadback(vaddr, size, &completed);
 			if (!request && (is_write || !completed)) {
