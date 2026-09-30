@@ -65,6 +65,9 @@ def main():
 
     def compile_one(unit):
         obj = build / (unit.stem + '.obj')
+        # A unit compiled by an earlier, interrupted run is kept.
+        if obj.exists() and obj.stat().st_mtime >= unit.stat().st_mtime:
+            return obj
         result = subprocess.run([clang_cl, *FLAGS, f'/I{directory}', str(unit), f'/Fo{obj}'],
                                 env=environment, capture_output=True, text=True)
         if result.returncode:
@@ -76,8 +79,11 @@ def main():
     definitions = build / 'srt-aot.def'
     definitions.write_text('EXPORTS\n' + ''.join(f'    {name}\n' for name in names))
     library = directory / 'srt-aot.dll'
+    # Thousands of plans make hundreds of objects: past the command-line length limit.
+    response = build / 'objects.rsp'
+    response.write_text(''.join(f'"{obj}"\n' for obj in objects))
     subprocess.run([lld_link, '/nologo', '/DLL', f'/DEF:{definitions}', f'/OUT:{library}', '/OPT:REF',
-                    *map(str, objects)], env=environment, check=True)
+                    f'@{response}'], env=environment, check=True)
     receipt = dict(library=str(library), library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
                    exports=len(names), units=len(units), flags=FLAGS)
     (directory / 'receipt-windows.json').write_text(json.dumps(receipt, indent=2) + '\n')
