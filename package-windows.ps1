@@ -41,8 +41,8 @@ $aot = Get-ChildItem "$PSScriptRoot\_Build\srt-aot\windows-libraries\*\srt-aot.d
 	Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if ($aot) { Copy-Item $aot.FullName $Out }
 
-# The launch config minus this PC's CPUs (its affinity list leaves out two unstable ones, the
-# recording CPUs are its P-cores) and the Linux paths.
+# The launch config minus this PC's CPUs (its affinity list, its P-cores as the render and recording
+# CPUs: "auto" lets the launcher find the performance cores of the PC it runs on) and the Linux paths.
 $launch = Get-Content $Config -Raw | ConvertFrom-Json
 $command = @($launch.command)
 $options = New-Object System.Collections.Generic.List[string]
@@ -52,7 +52,8 @@ for ($i = [Array]::IndexOf($command, '--') + 2; $i -lt $command.Count; $i++) {
 }
 $environment = [ordered]@{}
 foreach ($property in $launch.environment.PSObject.Properties) {
-	if ($property.Name -in 'KYTY_RECORDING_CPUS', 'KYTY_RENDER_CPUS') { continue }
+	if ($property.Name -eq 'KYTY_RECORDING_CPUS') { $environment[$property.Name] = 'auto'; continue }
+	if ($property.Name -eq 'KYTY_RENDER_CPUS') { continue }
 	if ($property.Name -eq 'KYTY_SRT_AOT_LIBRARY') { if ($aot) { $environment[$property.Name] = 'srt-aot.dll' }; continue }
 	$environment[$property.Name] = $property.Value
 }

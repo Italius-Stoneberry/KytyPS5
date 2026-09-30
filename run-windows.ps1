@@ -167,7 +167,8 @@ for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $c
 
 # The render thread on the recording worker's CPUs (this PC's P-cores without CPU 0, which takes
 # most interrupts on Windows): +2.5% over free placement in the fixed scene. Pinning it to CPU 0
-# alone, as on Linux, halved the frame rate here. A config without them leaves both to Windows.
+# alone, as on Linux, halved the frame rate here. A config without them leaves both to Windows;
+# "auto" (the portable package's config) picks the performance cores of this PC (below).
 if (!$environment.Contains('KYTY_RENDER_CPUS') -and $environment.Contains('KYTY_RECORDING_CPUS')) {
 	$environment['KYTY_RENDER_CPUS'] = $environment['KYTY_RECORDING_CPUS']
 }
@@ -215,12 +216,56 @@ foreach ($pair in ($Set | ForEach-Object { $_ -split ',(?=[A-Za-z_][A-Za-z0-9_]*
 	if ($value) { $environment[$key] = $value } else { $environment.Remove($key); Remove-Item "env:$key" -ErrorAction SilentlyContinue }
 }
 
+# The performance cores of a hybrid CPU (Windows' CPU set efficiency classes: an Intel Core with
+# P- and E-cores), without the core of CPU 0, within the launch's CPUs: a list such as "1,2,3,4,5",
+# or nothing when every core is alike (the threads are left to Windows there).
+function Get-PerformanceCpus([int64]$allowed) {
+	Add-Type -Namespace Kyty -Name CpuSets -MemberDefinition @'
+[DllImport("kernel32.dll")]
+static extern bool GetSystemCpuSetInformation(IntPtr information, uint length, out uint returned, IntPtr process, uint flags);
+// Group 0's logical processors as (index, core, efficiency class) triples.
+public static int[] Query() {
+	var result = new System.Collections.Generic.List<int>();
+	uint length;
+	GetSystemCpuSetInformation(IntPtr.Zero, 0, out length, IntPtr.Zero, 0);
+	if (length == 0) return result.ToArray();
+	IntPtr buffer = Marshal.AllocHGlobal((int)length);
+	try {
+		if (!GetSystemCpuSetInformation(buffer, length, out length, IntPtr.Zero, 0)) return result.ToArray();
+		for (int offset = 0; offset < length; offset += Marshal.ReadInt32(buffer, offset)) {
+			if (Marshal.ReadInt32(buffer, offset + 4) != 0 || Marshal.ReadInt16(buffer, offset + 12) != 0) continue;
+			result.Add(Marshal.ReadByte(buffer, offset + 14));
+			result.Add(Marshal.ReadByte(buffer, offset + 15));
+			result.Add(Marshal.ReadByte(buffer, offset + 18));
+		}
+	} finally {
+		Marshal.FreeHGlobal(buffer);
+	}
+	return result.ToArray();
+}
+'@
+	$values = [Kyty.CpuSets]::Query()
+	$sets = for ($i = 0; $i + 2 -lt $values.Count; $i += 3) { [pscustomobject]@{ Cpu = $values[$i]; Core = $values[$i + 1]; Class = $values[$i + 2] } }
+	if (@($sets | ForEach-Object Class | Sort-Object -Unique).Count -lt 2) { return '' }
+	$fastest = ($sets | Measure-Object Class -Maximum).Maximum
+	$interrupts = ($sets | Where-Object Cpu -eq 0).Core
+	return (($sets | Where-Object { $_.Class -eq $fastest -and $_.Core -ne $interrupts -and $_.Cpu -lt 64 -and
+		($allowed -band ([int64]1 -shl $_.Cpu)) } | ForEach-Object Cpu) -join ',')
+}
+if ('KYTY_RECORDING_CPUS', 'KYTY_RENDER_CPUS' | Where-Object { $environment[$_] -eq 'auto' }) {
+	$performance = Get-PerformanceCpus $mask
+	foreach ($key in 'KYTY_RECORDING_CPUS', 'KYTY_RENDER_CPUS') {
+		if ($environment[$key] -ne 'auto') { continue }
+		if ($performance) { $environment[$key] = $performance } else { $environment.Remove($key) }
+	}
+}
+
 $quoted = @('--game', "`"$Game`"") + ($options | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } })
 $logDir = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\run-logs" } else { "$PSScriptRoot\logs" }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 Write-Host "game:     $(if ($titleName) { "$titleName, " })$version$(if (!$tested) { " (untested: the emulator is tested with $testedVersion)" })"
 Write-Host "config:   $Config$(if ($Baseline) { ' (baseline: no switches)' })$(if ($Precompile) { ' (precompile)' })"
-Write-Host ("affinity: 0x{0:X} ({1} CPUs)" -f $mask, $cpus)
+Write-Host ("affinity: 0x{0:X} ({1} CPUs){2}" -f $mask, $cpus, $(if ($environment['KYTY_RENDER_CPUS']) { "; render threads on CPUs $($environment['KYTY_RENDER_CPUS'])" }))
 Write-Host "switches: $($environment.Count)"
 Write-Host "command:  $Exe $($quoted -join ' ')"
 if ($DryRun) { $environment.GetEnumerator() | ForEach-Object { "  $($_.Key)=$($_.Value)" }; return }

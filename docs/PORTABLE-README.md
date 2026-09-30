@@ -29,6 +29,11 @@ At start-up the launcher reads the game's `sce_sys\param.json` and warns when th
 On the test PC (i9-14900K + RTX 5090, 2560×1440 window) the game runs at roughly 35–60 fps, with the
 lowest around 35 fps in the open areas. Much slower PCs may not run it or may stutter badly.
 
+On a CPU with performance and efficiency cores (Intel Core 12th generation and later), the launcher
+keeps the emulator's render threads on the performance cores (all but the one of CPU 0) by itself,
+which was about 2% faster than leaving them to Windows; the console shows them as "render threads on
+CPUs ...". To leave everything to Windows instead: `run.cmd -Set KYTY_RECORDING_CPUS=,KYTY_RENDER_CPUS=`.
+
 ## Where to put the game files
 
 You need the unpacked PS5 game folder: the level that directly contains `eboot.bin` and the `sce_sys`
