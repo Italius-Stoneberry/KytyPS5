@@ -7,7 +7,6 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <map>
 #include <vector>
 
 extern "C" {
@@ -32,39 +31,59 @@ public:
 		const auto end = End(address, size);
 		if (Fast() && Covered(address, end)) return;
 		++m_version;
-		auto       it  = m_ranges.lower_bound(address);
-		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
-			it = std::prev(it);
+		// Intervals that overlap or touch [address, end) merge with it.
+		auto first = LowerBound(address);
+		if (first != m_ranges.begin() && std::prev(first)->end >= address) {
+			--first;
 		}
 		uint64_t begin = address;
 		uint64_t last  = end;
-		while (it != m_ranges.end() && it->first <= last) {
-			begin = std::min(begin, it->first);
-			last  = std::max(last, it->second);
-			it    = m_ranges.erase(it);
+		auto     it    = first;
+		for (; it != m_ranges.end() && it->begin <= last; ++it) {
+			begin = std::min(begin, it->begin);
+			last  = std::max(last, it->end);
 		}
-		m_ranges.emplace(begin, last);
+		if (first == it) {
+			m_ranges.insert(first, {begin, last});
+			return;
+		}
+		*first = {begin, last};
+		m_ranges.erase(first + 1, it);
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
 		++m_version;
-		auto       it  = m_ranges.lower_bound(address);
-		if (it != m_ranges.begin() && std::prev(it)->second > address) {
-			it = std::prev(it);
+		auto first = LowerBound(address);
+		if (first != m_ranges.begin() && std::prev(first)->end > address) {
+			--first;
 		}
-		while (it != m_ranges.end() && it->first < end) {
-			const auto begin = it->first;
-			const auto last  = it->second;
-			it               = m_ranges.erase(it);
-			if (begin < address) {
-				m_ranges.emplace(begin, address);
-			}
-			if (last > end) {
-				m_ranges.emplace(end, last);
-				break;
-			}
+		auto last = first;
+		while (last != m_ranges.end() && last->begin < end) {
+			++last;
 		}
+		if (first == last) {
+			return;
+		}
+		// What remains of the first and the last interval replaces them all.
+		Interval parts[2];
+		size_t   count = 0;
+		if (first->begin < address) {
+			parts[count++] = {first->begin, address};
+		}
+		if (std::prev(last)->end > end) {
+			parts[count++] = {end, std::prev(last)->end};
+		}
+		const auto index   = static_cast<size_t>(first - m_ranges.begin());
+		const auto removed = static_cast<size_t>(last - first);
+		if (count > removed) {
+			m_ranges[index] = parts[0];
+			m_ranges.insert(m_ranges.begin() + static_cast<ptrdiff_t>(index + 1), parts[1]);
+			return;
+		}
+		std::copy(parts, parts + count, m_ranges.begin() + static_cast<ptrdiff_t>(index));
+		m_ranges.erase(m_ranges.begin() + static_cast<ptrdiff_t>(index + count),
+		               m_ranges.begin() + static_cast<ptrdiff_t>(index + removed));
 	}
 
 	void Clear() {
@@ -74,8 +93,8 @@ public:
 
 	template <typename Func>
 	void ForEach(Func&& func) const {
-		for (const auto& [begin, end]: m_ranges) {
-			func(begin, end);
+		for (const auto& range: m_ranges) {
+			func(range.begin, range.end);
 		}
 	}
 
@@ -87,34 +106,34 @@ public:
 
 	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
-		auto       it  = m_ranges.lower_bound(address);
-		if (it != m_ranges.begin() && std::prev(it)->second > address) {
+		auto       it  = LowerBound(address);
+		if (it != m_ranges.begin() && std::prev(it)->end > address) {
 			return true;
 		}
-		return it != m_ranges.end() && it->first < end;
+		return it != m_ranges.end() && it->begin < end;
 	}
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
 		if (Fast()) return Covered(address, end);
-		auto       it  = m_ranges.upper_bound(address);
+		auto       it  = UpperBound(address);
 		if (it == m_ranges.begin()) {
 			return false;
 		}
 		--it;
-		return it->first <= address && it->second >= end;
+		return it->begin <= address && it->end >= end;
 	}
 
 	template <typename Func>
 	void ForEachIntersection(uint64_t address, uint64_t size, Func&& func) const {
 		const auto end = End(address, size);
-		auto       it  = m_ranges.upper_bound(address);
+		auto       it  = UpperBound(address);
 		if (it != m_ranges.begin()) {
 			--it;
 		}
-		for (; it != m_ranges.end() && it->first < end; ++it) {
-			const auto begin = std::max(address, it->first);
-			const auto last  = std::min(end, it->second);
+		for (; it != m_ranges.end() && it->begin < end; ++it) {
+			const auto begin = std::max(address, it->begin);
+			const auto last  = std::min(end, it->end);
 			if (begin < last) {
 				func(Range {begin, last - begin});
 			}
@@ -135,12 +154,32 @@ private:
 	bool Covered(uint64_t address, uint64_t end) const {
 		for (const auto& hint: m_hints)
 			if (hint.version == m_version && hint.begin <= address && end <= hint.end) return true;
-		auto it = m_ranges.upper_bound(address);
+		auto it = UpperBound(address);
 		if (it == m_ranges.begin()) return false;
 		--it;
-		if (it->first > address || it->second < end) return false;
-		m_hints[m_next_hint++ % m_hints.size()] = {m_version, it->first, it->second};
+		if (it->begin > address || it->end < end) return false;
+		m_hints[m_next_hint++ % m_hints.size()] = {m_version, it->begin, it->end};
 		return true;
+	}
+
+	// Disjoint, non-adjacent intervals sorted by address: lookups (thousands per frame, most of
+	// them for SRT words and bindings) search one contiguous array instead of walking tree nodes.
+	struct Interval {
+		uint64_t begin = 0, end = 0;
+	};
+	using Intervals = std::vector<Interval>;
+
+	[[nodiscard]] Intervals::const_iterator LowerBound(uint64_t address) const {
+		return std::lower_bound(m_ranges.begin(), m_ranges.end(), address,
+		                        [](const Interval& range, uint64_t value) { return range.begin < value; });
+	}
+	[[nodiscard]] Intervals::iterator LowerBound(uint64_t address) {
+		return std::lower_bound(m_ranges.begin(), m_ranges.end(), address,
+		                        [](const Interval& range, uint64_t value) { return range.begin < value; });
+	}
+	[[nodiscard]] Intervals::const_iterator UpperBound(uint64_t address) const {
+		return std::upper_bound(m_ranges.begin(), m_ranges.end(), address,
+		                        [](uint64_t value, const Interval& range) { return value < range.begin; });
 	}
 
 	static uint64_t End(uint64_t address, uint64_t size) {
@@ -150,9 +189,9 @@ private:
 		return address + size;
 	}
 
-	std::map<uint64_t, uint64_t> m_ranges;
-	bool                         m_fast_eligible = false;
-	uint64_t                     m_version = 1;
+	Intervals m_ranges;
+	bool      m_fast_eligible = false;
+	uint64_t  m_version       = 1;
 	struct Hint {
 		uint64_t version = 0, begin = 0, end = 0;
 	};

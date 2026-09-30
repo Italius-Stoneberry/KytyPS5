@@ -516,8 +516,30 @@ struct BufferCache::CopyFeedback {
 	};
 	Buffer download;
 	std::array<Slot, SlotCount> slots {};
-	std::map<uint64_t, size_t> index;
+	// Slot of each snapshot by its guest address, sorted by address (at most SlotCount entries:
+	// a search of one array, where a map walked cold tree nodes on every GPU write).
+	std::vector<std::pair<uint64_t, size_t>> index;
 	size_t cursor = 0;
+	[[nodiscard]] auto UpperBound(uint64_t address) {
+		return std::upper_bound(index.begin(), index.end(), address,
+		                        [](uint64_t value, const auto& entry) { return value < entry.first; });
+	}
+	[[nodiscard]] auto LowerBound(uint64_t address) {
+		return std::lower_bound(index.begin(), index.end(), address,
+		                        [](const auto& entry, uint64_t value) { return entry.first < value; });
+	}
+	bool Erase(uint64_t address) {
+		const auto it = LowerBound(address);
+		if (it == index.end() || it->first != address) return false;
+		index.erase(it);
+		return true;
+	}
+	bool Insert(uint64_t address, size_t slot) {
+		const auto it = LowerBound(address);
+		if (it != index.end() && it->first == address) return false;
+		index.insert(it, {address, slot});
+		return true;
+	}
 	// Index entries per 16 MiB granule, hashed into 4096 counters: a range whose granules count
 	// none overlaps no entry, and the walk of the index (a cold tree) is skipped. Counters two
 	// granules share only cost that walk.
@@ -546,17 +568,18 @@ void BufferCache::InvalidateCopyFeedback(uint64_t vaddr, uint64_t size) {
 	if (!m_copy_feedback || m_copy_feedback->index.empty()) return;
 	auto& feedback = *m_copy_feedback;
 	if (!feedback.MayOverlap(vaddr, size)) return;
-	auto it = feedback.index.lower_bound(vaddr);
+	auto it = feedback.LowerBound(vaddr);
 	if (it != feedback.index.begin()) {
 		const auto prior = std::prev(it);
 		const auto& slot = feedback.slots[prior->second];
 		if (slot.address + slot.size > vaddr) it = prior;
 	}
-	while (it != feedback.index.end() && it->first < vaddr + size) {
-		feedback.Count(feedback.slots[it->second], -1);
-		feedback.slots[it->second].address = 0;
-		it = feedback.index.erase(it);
+	auto last = it;
+	for (; last != feedback.index.end() && last->first < vaddr + size; ++last) {
+		feedback.Count(feedback.slots[last->second], -1);
+		feedback.slots[last->second].address = 0;
 	}
+	feedback.index.erase(it, last);
 }
 
 void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
@@ -599,7 +622,7 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 	}
 	if (m_resources->MappingEpoch() != mapping_epoch) return;
 	auto& slot = feedback.slots[selected];
-	if (slot.address && feedback.index.erase(slot.address) != 0) {
+	if (slot.address && feedback.Erase(slot.address)) {
 		feedback.Count(slot, -1);
 	}
 	InvalidateCopyFeedback(vaddr, size);
@@ -609,7 +632,7 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 	    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	    vk::AccessFlagBits::eHostRead);
 	slot = {vaddr, size, m_scheduler.CurrentTick(), mapping_epoch, owner->Handle()};
-	if (feedback.index.emplace(vaddr, selected).second) feedback.Count(slot, 1);
+	if (feedback.Insert(vaddr, selected)) feedback.Count(slot, 1);
 	feedback.cursor = (selected + 1) % CopyFeedback::SlotCount;
 }
 
@@ -642,7 +665,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 	for (const auto& copy: copies) {
 		auto cursor = copy.address;
 		while (cursor < copy.address + copy.size) {
-			auto it = feedback.index.upper_bound(cursor);
+			auto it = feedback.UpperBound(cursor);
 			if (it == feedback.index.begin()) return false;
 			--it;
 			const auto& slot = feedback.slots[it->second];
