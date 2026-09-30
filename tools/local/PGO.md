@@ -12,3 +12,19 @@
 4. 在独立构建中使用 `-fprofile-instr-use=/绝对路径/kyty.profdata`，记录源码和二进制指纹，按 [同进程测量方法](../../docs/BENCHMARKING.md) 验证。
 
 不要在 FPS 测量期间编译或训练，不要覆盖正在运行或正式交付的二进制。mimalloc 是独立宿主分配器选择，不能把更换分配器与 PGO 收益混为一谈。
+
+## Windows
+
+`build-windows.cmd` 在 `_Build\pgo\windows\kyty.profdata` 存在时自动带上 `-DKYTY_PGO_USE`。源码改动多了之后，
+profile 里改过的函数会因哈希不符而失去 PGO，需要重新训练：
+
+1. `python tools\local\bench-windows.py prepare`，然后 `tools\local\windows\pgo-train.ps1`：
+   它在 `_Build\windows-pgogen` 构建插桩版本（`-DKYTY_PGO_GENERATE=ON`），用它跑训练场景
+   （基准路线走过去站立、转镜头、走进遗迹、横移），用 live 命令 `pgo <file>` 写出 profile，
+   再用 `llvm-profdata merge` 得到 `_Build\pgo\windows\kyty-<日期>.profdata`。
+2. 把旧的 `kyty.profdata` 另存一份，新文件复制成 `kyty.profdata`；路径不变时 Ninja 不会重编，
+   所以先 `cmake --build _Build\windows --target clean` 再 `build-windows.cmd`。
+3. 用 `ab-exe.ps1` 对比旧 profile 的可执行文件（先复制到自己的目录）和新构建。
+
+2026-10-01：9 月 27 日的 profile 换成新训练的之后，固定场景 43.83 → 45.17 fps
+（ab-exe 三轮，B 组每个窗口都高于 A 组）。

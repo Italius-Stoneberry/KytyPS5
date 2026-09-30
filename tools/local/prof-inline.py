@@ -4,11 +4,13 @@ frames (llvm-symbolizer and the PDB of the same build, which needs line tables: 
 so time inside a big function is split by the functions and lines inlined into it.
 
     prof-inline.py PROF EXE [--function REGEX [--callers N]] [--top 40] [--lines] [--modules MODULES]
+                   [--range 10:22]
 
 Without --function: self time by source function (innermost inlined frame) and inclusive time by
 source function (every frame of every stack, inlined ones included). With --function: the samples
 whose stack holds a frame matching REGEX, split by the innermost frame below it (--lines: by
-source line; --callers N: by the N frames above the outermost match instead). MODULES (prof-spot.ps1 writes modules.txt: base, size, name per line) names the
+source line; --callers N: by the N frames above the outermost match instead). --range: only the
+samples of that span of seconds (4 kHz). MODULES (prof-spot.ps1 writes modules.txt: base, size, name per line) names the
 frames outside the executable by module.
 """
 import argparse
@@ -58,10 +60,15 @@ def main():
     p.add_argument('--lines', action='store_true')
     p.add_argument('--callers', type=int, default=0)
     p.add_argument('--modules', default='')
+    p.add_argument('--range', default='')
+    p.add_argument('--hz', type=float, default=4000.0)
     args = p.parse_args()
     data = Path(args.prof).read_bytes()
     words = struct.unpack(f'<{len(data) // 8}Q', data[:len(data) // 8 * 8])
     samples = [words[i:i + 16] for i in range(0, len(words) - 15, 16)]
+    if args.range:
+        lo, hi = (float(v) for v in args.range.split(':'))
+        samples = samples[int(lo * args.hz):int(hi * args.hz)]
     samples = [s for s in samples if s[0]]
     modules = []
     if args.modules:
