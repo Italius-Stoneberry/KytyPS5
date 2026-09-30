@@ -177,9 +177,19 @@ void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
 	}
 }
 
+// KYTY_DUMP_HASHES=<hash,hash,...>: the SPIR-V and guest code of these programs, without the whole
+// graphics debug dump (tools/local/spirv-stats.py reads the driver's statistics of the modules).
+bool DumpWanted(uint64_t hash) {
+	static const std::string list = [] {
+		const char* value = std::getenv("KYTY_DUMP_HASHES");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	return !list.empty() && list.find(fmt::format("{:016x}", hash)) != std::string::npos;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!Config::GraphicsDebugDumpEnabled() && !DumpWanted(shader_hash)) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -197,7 +207,7 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code, const std::string& decoded_dump) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!Config::GraphicsDebugDumpEnabled() && !DumpWanted(shader_hash)) {
 		return;
 	}
 	EXIT_IF(code.empty());
