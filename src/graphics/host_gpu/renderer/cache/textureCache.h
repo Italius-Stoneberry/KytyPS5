@@ -81,6 +81,9 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source = "");
 	[[nodiscard]] bool HasTrackedDataOverlap(uint64_t address, uint64_t size);
+	// An image over the range holds data the GPU wrote to it (a download of the range must come
+	// from the image, not from the buffer).
+	[[nodiscard]] bool HasGpuWrittenImageOverlap(uint64_t address, uint64_t size);
 	enum class ReadOnlyBufferOverlap { None, CpuSampled, Unsafe };
 	[[nodiscard]] ReadOnlyBufferOverlap ClassifyReadOnlyBufferOverlap(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);

@@ -167,7 +167,12 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		LiveCounters::Add(LiveCounters::RbRejectBacking);
 		return {};
 	}
-	if (m_texture_cache.HasTrackedDataOverlap(begin, end - begin)) {
+	// Only an image the GPU wrote holds bytes the buffer lacks. Other images over the pages
+	// (textures the game streams in, images the buffer is newer than) take no part in the
+	// copy, as in the synchronous download, and FindImage drains the copy before any use of
+	// them. Refusing them sent 1-byte guest reads of texture pages (~5 a frame) to a
+	// render-thread download of ~70 us each.
+	if (m_texture_cache.HasGpuWrittenImageOverlap(begin, end - begin)) {
 		// KYTY_READBACK_NARROW: the widening is speculative; an image elsewhere in the window
 		// leaves the request's own pages, if no image covers them, to an asynchronous copy.
 		const bool narrow = kyty_local_readback_narrow_mode.load(std::memory_order_relaxed) != 0;
@@ -176,7 +181,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 			end   = std::min((address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1),
 			               buffer.CpuAddress() + buffer.Size());
 		}
-		if (!narrow || m_texture_cache.HasTrackedDataOverlap(begin, end - begin)) {
+		if (!narrow || m_texture_cache.HasGpuWrittenImageOverlap(begin, end - begin)) {
 			LiveCounters::Add(LiveCounters::RbRejectImage);
 			return {};
 		}

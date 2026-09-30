@@ -2831,6 +2831,16 @@ bool TextureCache::HasTrackedDataOverlap(uint64_t address, uint64_t size) {
 	return !FindImagesInRegion(address, size, false).empty();
 }
 
+bool TextureCache::HasGpuWrittenImageOverlap(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) return true;
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto& image = m_slot_images[id];
+		if (image.IsGpuModified() || image.IsStencilModified()) return true;
+	}
+	return false;
+}
+
 TextureCache::ReadOnlyBufferOverlap TextureCache::ClassifyReadOnlyBufferOverlap(
     uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) return ReadOnlyBufferOverlap::Unsafe;
