@@ -504,11 +504,18 @@ struct PipelineCache::ProgramCache {
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
 		}
+		// With the slow-call log: the translation's specialization-independent part (front) and
+		// whether the program had other permutations already.
+		const bool known_program = entry != programs.end();
+		const auto front_begin   = std::chrono::steady_clock::now();
+		double     front_ms      = 0.0;
 		SlowLog::Scope translate_slow([&](double ms) {
-			std::printf("SLOW TranslateProgram %.1f ms %s hash=0x%016llx\n", ms, label,
-			            static_cast<unsigned long long>(params.hash));
+			std::printf("SLOW TranslateProgram %.1f ms %s hash=0x%016llx front=%.1f ms %s\n", ms, label,
+			            static_cast<unsigned long long>(params.hash), front_ms,
+			            known_program ? "specialization" : "program");
 		});
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 		if (entry == programs.end()) {
 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			ReportMaterialization(label, stage, params.hash, report,

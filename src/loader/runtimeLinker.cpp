@@ -877,6 +877,37 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// The host frames, by their unwind tables (the emulator's resolve with its linker map;
+		// guest code has none, which ends the walk), and the state of the faulting page.
+		if (info->native_context != nullptr) {
+			auto context = *static_cast<const CONTEXT*>(info->native_context);
+			std::printf("host frames (emulator at %p):", static_cast<void*>(GetModuleHandleA(nullptr)));
+			for (int i = 0; i < 32 && context.Rip != 0; i++) {
+				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", static_cast<uint64_t>(context.Rip));
+				DWORD64     image_base = 0;
+				auto*       function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+				if (function == nullptr) {
+					// Only the faulting frame can be a leaf function: its return address on top.
+					if (i != 0 || !IsReadableRange(context.Rsp, sizeof(DWORD64))) break;
+					context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+					context.Rsp += sizeof(DWORD64);
+					continue;
+				}
+				void*   handler_data = nullptr;
+				DWORD64 frame        = 0;
+				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context, &handler_data,
+				                 &frame, nullptr);
+			}
+			std::printf("\n");
+		}
+		MEMORY_BASIC_INFORMATION page {};
+		if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+		    VirtualQuery(reinterpret_cast<const void*>(info->access_violation_vaddr), &page, sizeof(page)) != 0) {
+			std::printf("fault page: state=0x%lx protect=0x%lx type=0x%lx region=%p+0x%zx\n", page.State,
+			            page.Protect, page.Type, page.BaseAddress, page.RegionSize);
+		}
+#endif
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64 " (%s)"
