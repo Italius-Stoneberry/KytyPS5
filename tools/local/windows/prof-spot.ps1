@@ -15,8 +15,9 @@ $out = "$root\_Build\prof\$Label"
 New-Item -ItemType Directory -Force $out | Out-Null
 $map = "$root\_Build\windows\kyty_emulator_clang_lld_link.map"
 Copy-Item $map "$out\map.map"
-# prof-hot-lines.py disassembles the build that ran.
+# prof-hot-lines.py disassembles the build that ran; prof-inline.py symbolizes it with its PDB.
 Copy-Item "$root\_Build\windows\kyty_emulator.exe" "$out\kyty_emulator.exe"
+Copy-Item "$root\_Build\windows\kyty_emulator.pdb" "$out\kyty_emulator.pdb"
 $pokes = foreach ($item in ($Poke | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
 	$symbol, $value = $item -split '=', 2
 	$entry = Select-String -Path $map -Pattern "\s$symbol\s*$" | Select-Object -First 1
@@ -34,6 +35,9 @@ $walk.WaitForExit()
 Get-Content "$out\keys.txt" | Select-Object -Last 1
 Start-Sleep -Seconds 2
 powershell -NoProfile -File "$S\screen.ps1" -Out "$out\spot.png" -Scale 0.25 | Out-Null
+# Frames outside the executable by module (prof-inline.py --modules).
+$process.Modules | ForEach-Object { '{0:x} {1:x} {2}' -f $_.BaseAddress.ToInt64(), $_.ModuleMemorySize, $_.ModuleName } |
+	Set-Content "$out\modules.txt" -Encoding ascii
 $bin = "$out\prof.bin" -replace '\\', '/'
 $commands = @('measure 4 before') + @($pokes) + @("prof $Seconds $bin", 'measure 4 after')
 if ($Live) { $commands += $Live }
