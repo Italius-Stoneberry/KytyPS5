@@ -375,15 +375,41 @@ struct Presenter::Impl {
 	std::chrono::steady_clock::time_point hud_window {};
 	uint32_t                              hud_frames = 0;
 
+	// The shader prefetch's progress line while it runs, and for a few seconds after.
+	std::chrono::steady_clock::time_point prefetch_finished {};
+	void UpdateStatus(std::chrono::steady_clock::time_point now) {
+		const auto progress = renderer.GetPipelineCache().GetPrefetchProgress();
+		hud.status.clear();
+		if (progress.total == 0) {
+			return;
+		}
+		std::array<char, 128> line {};
+		if (progress.done < progress.total) {
+			std::snprintf(line.data(), line.size(), "后台准备着色器 %zu%%  (%zu / %zu)", progress.done * 100 / progress.total,
+			              progress.done, progress.total);
+		} else {
+			if (prefetch_finished == std::chrono::steady_clock::time_point {}) {
+				prefetch_finished = now;
+			}
+			if (now - prefetch_finished >= std::chrono::seconds(3)) {
+				return;
+			}
+			std::snprintf(line.data(), line.size(), "着色器已全部准备好 (%zu)", progress.total);
+		}
+		hud.status          = line.data();
+		hud.status_fraction = static_cast<float>(progress.done) / static_cast<float>(progress.total);
+	}
+
 	[[nodiscard]] SystemOverlayHud* UpdateHud(bool reuse) {
 		static const bool enabled = [] {
 			const char* value = std::getenv("KYTY_FPS_HUD");
 			return value != nullptr && *value != '\0' && std::string_view(value) != "0";
 		}();
-		if (!enabled) {
-			return nullptr;
-		}
 		const auto now = std::chrono::steady_clock::now();
+		UpdateStatus(now);
+		if (!enabled) {
+			return hud.status.empty() ? nullptr : PlaceHud();
+		}
 		if (hud_window == std::chrono::steady_clock::time_point {}) {
 			hud_window = now;
 		}
@@ -406,9 +432,12 @@ struct Presenter::Impl {
 			hud_window = now;
 			hud_frames = 0;
 		}
-		if (hud.title.empty()) {
+		if (hud.title.empty() && hud.status.empty()) {
 			return nullptr;
 		}
+		return PlaceHud();
+	}
+	SystemOverlayHud* PlaceHud() {
 		hud.region = swapchain.PresentRegion();
 		if (hud.region.extent.width == 0 || hud.region.extent.height == 0) {
 			hud.region = vk::Rect2D {{0, 0}, swapchain.Extent()};

@@ -1,7 +1,7 @@
 // The static shader and pipeline precompile, a program of its own (tools/local/static-precompile):
 //
 //   kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] [--threads <n>]
-//                          [--out <file>] [--timings <file>] [--no-pipelines]
+//                          [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]
 //   kyty_shader_precompile --game <dir> --merge
 //
 // compiles the shaders and pipelines of a seed file on a headless Vulkan device (the one the emulator
@@ -9,9 +9,10 @@
 // the emulator looks up before compiling. With --shard, the i-th of n shares goes into a cache file of
 // its own next to it: the NVIDIA driver compiles big shaders nearly one at a time per process, so the
 // shares are processes (precompile-windows.ps1 runs them); --merge folds their files into the static
-// cache. --out writes what was compiled as a warmup file, for precompile.py coverage; --timings each
-// pipeline's compile time (ms, SPIR-V words, the seeds' hashes). Run it from the directory the emulator
-// runs in.
+// cache. --out writes what was compiled as a warmup file, for precompile.py coverage; --static-inputs
+// writes it where the emulator's shader prefetch reads it (_PipelineCache/static/<title>.shaders);
+// --timings each pipeline's compile time (ms, SPIR-V words, the seeds' hashes). Run it from the
+// directory the emulator runs in.
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -31,7 +32,7 @@ using Libs::Graphics::PipelineCache;
 
 static int Usage() {
 	std::fprintf(stderr, "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] "
-	                     "[--threads <n>] [--out <file>] [--timings <file>] [--no-pipelines]\n"
+	                     "[--threads <n>] [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]\n"
 	                     "       kyty_shader_precompile --game <dir> --merge\n");
 	return 2;
 }
@@ -48,6 +49,8 @@ int main(int argc, char* argv[]) {
 			merge = true;
 		} else if (arg == "--no-pipelines") {
 			options.pipelines = false;
+		} else if (arg == "--static-inputs") {
+			options.static_inputs = true;
 		} else if (value == nullptr) {
 			return Usage();
 		} else if (arg == "--game") {

@@ -21,6 +21,8 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <sched.h>
+#include <string>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -276,6 +278,55 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high) {
 	return stack_high > stack_low;
 }
 
+void MakeBackgroundThread(const char* avoid_cpus) {
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+	DWORD_PTR process = 0, system = 0;
+	if (const auto avoid = static_cast<DWORD_PTR>(CpuListMask(avoid_cpus));
+	    avoid != 0 && GetProcessAffinityMask(GetCurrentProcess(), &process, &system) != 0 && (process & ~avoid) != 0)
+		(void)SetThreadAffinityMask(GetCurrentThread(), process & ~avoid);
+}
+
+uint64_t OpenScratchFile() {
+	wchar_t directory[MAX_PATH + 1] {}, path[MAX_PATH + 1] {};
+	if (GetTempPathW(MAX_PATH + 1, directory) == 0 || GetTempFileNameW(directory, L"kyt", 0, path) == 0) return 0;
+	HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+	                          FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		(void)DeleteFileW(path);
+		return 0;
+	}
+	return reinterpret_cast<uint64_t>(file);
+}
+
+// ReadFile or WriteFile at an offset, in pieces a DWORD can count.
+template <typename Call, typename Byte>
+static bool ScratchTransfer(uint64_t file, uint64_t offset, Byte* data, size_t size, Call call) {
+	while (size != 0) {
+		OVERLAPPED at {};
+		at.Offset         = static_cast<DWORD>(offset);
+		at.OffsetHigh     = static_cast<DWORD>(offset >> 32u);
+		DWORD      done   = 0;
+		const auto length = static_cast<DWORD>(size < (1u << 30u) ? size : (1u << 30u));
+		if (call(reinterpret_cast<HANDLE>(file), data, length, &done, &at) == 0 || done == 0) return false;
+		data += done;
+		offset += done;
+		size -= done;
+	}
+	return true;
+}
+
+bool WriteScratchFile(uint64_t file, uint64_t offset, const void* data, size_t size) {
+	return file != 0 && ScratchTransfer(file, offset, static_cast<const uint8_t*>(data), size, WriteFile);
+}
+
+bool ReadScratchFile(uint64_t file, uint64_t offset, void* data, size_t size) {
+	return file != 0 && ScratchTransfer(file, offset, static_cast<uint8_t*>(data), size, ReadFile);
+}
+
+void CloseScratchFile(uint64_t file) {
+	if (file != 0) CloseHandle(reinterpret_cast<HANDLE>(file));
+}
+
 #else
 
 void SetThreadName(const char* name) {
@@ -369,6 +420,52 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high) {
 		pthread_attr_destroy(&attr);
 	}
 	return found;
+}
+
+void MakeBackgroundThread(const char* avoid_cpus) {
+	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(ThreadId()), 10);
+	cpu_set_t set;
+	if (const auto avoid = CpuListMask(avoid_cpus); avoid != 0 && sched_getaffinity(0, sizeof(set), &set) == 0) {
+		for (int cpu = 0; cpu < 64; ++cpu)
+			if ((avoid >> cpu) & 1u) CPU_CLR(cpu, &set);
+		if (CPU_COUNT(&set) != 0) (void)sched_setaffinity(0, sizeof(set), &set);
+	}
+}
+
+// Handles are the file descriptor + 1 (0: none).
+uint64_t OpenScratchFile() {
+	const char* directory = std::getenv("TMPDIR");
+	std::string path      = std::string(directory != nullptr && *directory != '\0' ? directory : "/tmp") + "/kyty-XXXXXX";
+	const int   fd        = mkstemp(path.data());
+	if (fd < 0) return 0;
+	(void)unlink(path.c_str());
+	return static_cast<uint64_t>(fd) + 1;
+}
+
+bool WriteScratchFile(uint64_t file, uint64_t offset, const void* data, size_t size) {
+	for (const auto* bytes = static_cast<const uint8_t*>(data); file != 0 && size != 0;) {
+		const auto done = pwrite(static_cast<int>(file - 1), bytes, size, static_cast<off_t>(offset));
+		if (done <= 0) return false;
+		bytes += done;
+		offset += static_cast<uint64_t>(done);
+		size -= static_cast<size_t>(done);
+	}
+	return file != 0;
+}
+
+bool ReadScratchFile(uint64_t file, uint64_t offset, void* data, size_t size) {
+	for (auto* bytes = static_cast<uint8_t*>(data); file != 0 && size != 0;) {
+		const auto done = pread(static_cast<int>(file - 1), bytes, size, static_cast<off_t>(offset));
+		if (done <= 0) return false;
+		bytes += done;
+		offset += static_cast<uint64_t>(done);
+		size -= static_cast<size_t>(done);
+	}
+	return file != 0;
+}
+
+void CloseScratchFile(uint64_t file) {
+	if (file != 0) close(static_cast<int>(file - 1));
 }
 
 #endif

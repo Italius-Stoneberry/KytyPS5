@@ -5,6 +5,9 @@
 #   .\precompile-windows.ps1 -Jobs 8      with 8 processes (default: 3 threads each on the allowed CPUs)
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
+#   .\precompile-windows.ps1 -InputsOnly  only the compiled inputs the emulator's shader prefetch
+#                                         translates in the background (_PipelineCache\static\<title>.shaders;
+#                                         every full run writes them too)
 # The NVIDIA driver compiles big compute shaders nearly one at a time per process, so the work is split
 # into shards, a below-normal-priority process each (kyty_shader_precompile --shard i/n), whose caches
 # are merged into the static cache at the end. An interrupted run resumes: the shards' checkpoints
@@ -17,6 +20,7 @@ param(
 	[int]$Threads = 3,
 	[int64]$Affinity = 0xFFFFCF, # CPUs 4 and 5 left out: the compiler crashes on them on this machine
 	[switch]$Coverage,
+	[switch]$InputsOnly,
 	[string]$Exe = "$PSScriptRoot\_Build\windows\kyty_shader_precompile.exe"
 )
 $ErrorActionPreference = 'Stop'
@@ -67,6 +71,14 @@ if ($Coverage) {
 	Write-Host "wrote $out"
 	return
 }
+# The compiled inputs for the emulator's shader prefetch: the seeds translated as the full run does,
+# without pipelines (half a minute).
+$inputs = @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$cpus", '--static-inputs')
+if ($InputsOnly) {
+	Wait-Precompile @(Start-Precompile 'inputs' $inputs) 'inputs'
+	Write-Host 'wrote _PipelineCache\static\<title>.shaders'
+	return
+}
 # Checkpoints of an interrupted run first: what they hold is not compiled again.
 Wait-Precompile @(Start-Precompile 'merge-before' @('--merge')) 'merge'
 $workers = for ($i = 0; $i -lt $Jobs; $i++) {
@@ -74,5 +86,6 @@ $workers = for ($i = 0; $i -lt $Jobs; $i++) {
 }
 Wait-Precompile $workers 'shards'
 Wait-Precompile @(Start-Precompile 'merge' @('--merge')) 'merge'
+Wait-Precompile @(Start-Precompile 'inputs' $inputs) 'inputs'
 $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.bin" | Sort-Object LastWriteTime | Select-Object -Last 1
 Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB)" -f ((Get-Date) - $begin), $cache.FullName, ($cache.Length / 1MB))

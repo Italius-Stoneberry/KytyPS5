@@ -33,6 +33,18 @@ double NamedThreadsCpuSeconds(const char* name);
 // Stack bounds of the calling thread; false when unknown.
 bool CurrentThreadStack(uint64_t* low, uint64_t* high);
 
+// Below-normal priority for the calling thread, kept off the CPUs of a list (KYTY_RENDER_CPUS; null
+// or empty: any CPU): background work that must not hold up the game's threads.
+void MakeBackgroundThread(const char* avoid_cpus);
+
+// A temporary file for scratch data, deleted when it is closed or the process ends (Windows keeps it
+// in memory while it can: FILE_ATTRIBUTE_TEMPORARY); 0 when none could be made. Writes and reads go
+// to any offset, from any thread.
+uint64_t OpenScratchFile();
+bool     WriteScratchFile(uint64_t file, uint64_t offset, const void* data, size_t size);
+bool     ReadScratchFile(uint64_t file, uint64_t offset, void* data, size_t size);
+void     CloseScratchFile(uint64_t file);
+
 #if defined(_WIN32)
 // Collects the unwind tables of the loaded images for SampleThread (call before sampling).
 void PrepareSampling();

@@ -34,6 +34,7 @@
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
+#include "graphics/presentation/window/startupProgress.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "frame-gen.h"
 #include "kytyGitVersion.h"
@@ -896,7 +897,10 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	window->graphic_ctx.screen_height = height;
 
 	WindowCreate(*window);
+	// The pipeline cache's start-up work (warmup) runs in CreateVulkan: its progress in the window.
+	StartupProgressShow(window->window);
 	window->CreateVulkan();
+	StartupProgressHide();
 	auto& presenter = *window->presenter;
 	g_window        = std::move(window);
 	return presenter;

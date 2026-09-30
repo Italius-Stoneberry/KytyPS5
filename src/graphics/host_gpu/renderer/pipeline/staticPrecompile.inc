@@ -370,14 +370,18 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args) {
 		}
 	}
 	if (target != nullptr && target != m_static_cache) m_graphics.device.destroyPipelineCache(target, nullptr);
-	PipelineCacheLog("Shader seeds: {} programs ({} with indirect image tables) in {} ms; {} pipelines in {} ms ({} threads)",
-	                 compiled, indirect.load(), programs_ms, created.load(), elapsed() - programs_ms, threads);
+	size_t spirv_words = 0;
+	for (const auto& [permutation, spirv]: spirv_of) spirv_words += spirv.words;
+	PipelineCacheLog("Shader seeds: {} programs ({} with indirect image tables, {} MiB of SPIR-V) in {} ms; {} pipelines "
+	                 "in {} ms ({} threads)",
+	                 compiled, indirect.load(), spirv_words >> 18u, programs_ms, created.load(), elapsed() - programs_ms,
+	                 threads);
 	for (const auto& [message, count]: rejections) PipelineCacheLog("Shader seeds: rejected {}: {}", count, message);
 
 	// What was compiled, as a warmup file (compiler inputs with the specialization used), with the SPIR-V
 	// hash of each input (.spirv.txt) and the rejected seeds (.rejected.txt: index, stage, hash, reason).
-	if (!args.out.empty()) {
-		const auto&              out = args.out;
+	if (!args.out.empty() || args.static_inputs) {
+		const auto               out = args.static_inputs ? StaticInputsPath() : args.out;
 		LocalShaderWarmup::Cache result;
 		std::error_code          error;
 		std::filesystem::remove(out, error);

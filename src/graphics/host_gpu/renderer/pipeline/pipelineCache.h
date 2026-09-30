@@ -128,6 +128,7 @@ public:
 	struct PrecompileOptions {
 		std::filesystem::path seeds;
 		std::filesystem::path out;     // what was compiled, as a warmup file (optional)
+		bool                  static_inputs = false; // out: the one the emulator's shader prefetch reads
 		std::filesystem::path timings; // each pipeline's compile time (optional)
 		uint32_t              shard   = 0;
 		uint32_t              shards  = 1;
@@ -208,6 +209,13 @@ public:
 	[[nodiscard]] bool TraceStage(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                              std::span<const uint32_t> user_data, uint64_t shader_base,
 	                              ShaderRecompiler::IR::SrtReadTrace& trace);
+
+	// The shader prefetch (ProgramCache::Prefetch): programs translated or taken over, of `total`;
+	// all zero while it loads its inputs or when it does not run. Any thread.
+	struct PrefetchProgress {
+		size_t done = 0, total = 0;
+	};
+	[[nodiscard]] PrefetchProgress GetPrefetchProgress() const;
 
 private:
 	struct ProgramCache;

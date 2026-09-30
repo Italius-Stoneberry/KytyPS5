@@ -24,7 +24,9 @@
 #include "shader-warmup-cache.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "local-platform.h"
 #include "slow-log.h"
+#include "startup-progress.h"
 
 #include <algorithm>
 #include <array>
@@ -50,6 +52,7 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -270,6 +273,14 @@ struct PipelineCache::ProgramCache {
 		ShaderProgram                                handle;
 	};
 
+	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file.
+	struct PrefetchedModule {
+		ShaderRecompiler::IR::ResourceSpecialization specialization; // compiled with
+		ShaderRecompiler::IR::CompiledShaderInfo     program;
+		uint64_t                                     spirv_offset = 0;
+		size_t                                       spirv_words  = 0;
+	};
+
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {}
@@ -285,6 +296,8 @@ struct PipelineCache::ProgramCache {
 		// Verified against live shader bytes on first use, then released. This
 		// also rejects warm records from a changed game with a reused shader hash.
 		std::vector<uint32_t> warm_code, warm_back_code;
+		// Prefetched permutations not used yet (AdoptPrefetchedModule).
+		std::vector<PrefetchedModule> prefetched;
 	};
 
 	struct ProgramKeyHash {
@@ -303,6 +316,193 @@ struct PipelineCache::ProgramCache {
 		}
 	};
 
+	// KYTY_SHADER_PREFETCH (default on; 0 off): the programs of the static precompile's inputs
+	// (StaticInputsPath: every shader the game ships, with the resource specialization it most likely
+	// gets) are translated on low-priority threads while the game runs, largest first, so a program
+	// met for the first time after the warmup needs only its shader module (Get). Their SPIR-V
+	// (gigabytes for the whole game) waits in a temporary file, the plans and infos in memory.
+	struct Prefetch {
+		enum State : uint8_t { Pending, Running, Done, Taken };
+		struct Group { // the inputs of one program
+			ProgramKey                                        key;
+			uint64_t                                          source = 0; // SourceDigest
+			size_t                                            code_words = 0;
+			std::vector<uint32_t>                             records;
+			std::atomic<uint8_t>                              state {Pending};
+			std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+			std::vector<PrefetchedModule>                     modules;
+		};
+		~Prefetch() {
+			stop.store(true, std::memory_order_relaxed);
+			if (loader.joinable()) loader.join();
+			for (auto& thread: threads) thread.join();
+			LocalPlatform::CloseScratchFile(spill);
+		}
+
+		LocalShaderWarmup::Cache                               inputs;
+		std::vector<std::unique_ptr<Group>>                    groups; // in translation order
+		std::unordered_map<ProgramKey, Group*, ProgramKeyHash> index;  // read-only once `ready`
+		std::atomic<bool>                                      ready {false}, stop {false};
+		std::atomic<size_t>                                    next {0}, finished {0};
+		std::atomic<uint64_t>                                  spill_end {0};
+		uint64_t                                               spill = 0;
+		std::thread                                            loader;
+		std::vector<std::thread>                               threads;
+		// Render thread: programs and modules taken over, programs translated there while pending.
+		size_t adopted = 0, adopted_modules = 0, claimed = 0;
+	};
+	std::unique_ptr<Prefetch> prefetch;
+
+	static uint64_t SourceDigest(std::span<const uint32_t> code, std::span<const uint32_t> back_code) {
+		return XXH3_64bits_withSeed(back_code.data(), back_code.size_bytes(), XXH3_64bits(code.data(), code.size_bytes()));
+	}
+
+	// Loads the inputs on a thread of its own, leaves out the programs the warmup holds (`warm`), and
+	// starts the translation.
+	void StartPrefetch(std::filesystem::path path, std::string identity, std::vector<ProgramKey> warm) {
+		prefetch         = std::make_unique<Prefetch>();
+		prefetch->loader = std::thread([this, path = std::move(path), identity = std::move(identity),
+		                                warm = std::move(warm)] {
+			LocalPlatform::SetThreadName("Kyty.Prefetch");
+			LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+			auto&      p     = *prefetch;
+			const auto begin = std::chrono::steady_clock::now();
+			if (!std::filesystem::exists(path) || !p.inputs.Open(path, identity) || p.inputs.records.empty()) {
+				PipelineCacheLog("Shader prefetch: no inputs for this GPU and driver in {} (precompile-windows.ps1 "
+				                 "writes them)", Common::PathToString(path));
+				return;
+			}
+			const std::unordered_set<ProgramKey, ProgramKeyHash> skip(warm.begin(), warm.end());
+			for (uint32_t i = 0; i < p.inputs.records.size() && !p.stop.load(std::memory_order_relaxed); ++i) {
+				LocalShaderWarmup::Record record;
+				LocalShaderWarmup::Reader reader {p.inputs.records[i]};
+				if (!LocalShaderWarmup::Visit(reader, record) || !LocalShaderWarmup::ValidKey(record)) continue;
+				ProgramKey key {record.stage, record.hash, record.user_data_count,
+				                static_cast<uint32_t>(record.code.size()), record.static_key};
+				if (skip.contains(key)) continue;
+				auto [found, inserted] = p.index.try_emplace(key, nullptr);
+				if (inserted) {
+					auto& group      = *p.groups.emplace_back(std::make_unique<Prefetch::Group>());
+					group.key        = std::move(key);
+					group.source     = SourceDigest(record.code, record.back_code);
+					group.code_words = record.code.size();
+					found->second    = &group;
+				}
+				found->second->records.push_back(i);
+			}
+			std::ranges::stable_sort(p.groups, std::ranges::greater {}, [](const auto& group) { return group->code_words; });
+			p.spill = LocalPlatform::OpenScratchFile();
+			if (p.spill == 0) {
+				PipelineCacheLog("Shader prefetch: no temporary file for the SPIR-V");
+				return;
+			}
+			uint32_t threads = std::max(2u, std::thread::hardware_concurrency() / 2u);
+			if (const char* value = std::getenv("KYTY_SHADER_PREFETCH_THREADS"); value != nullptr && *value != '\0')
+				threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
+			PipelineCacheLog("Shader prefetch: {} programs ({} inputs) to translate on {} threads, loaded in {} ms",
+			                 p.groups.size(), p.inputs.records.size(), threads,
+			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+			p.ready.store(true, std::memory_order_release);
+			for (uint32_t t = 0; t < threads; ++t) p.threads.emplace_back([this] { PrefetchWork(); });
+		});
+	}
+
+	void PrefetchWork() {
+		LocalPlatform::SetThreadName("Kyty.Prefetch");
+		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+		auto& p = *prefetch;
+		for (size_t n; !p.stop.load(std::memory_order_relaxed) &&
+		               (n = p.next.fetch_add(1, std::memory_order_relaxed)) < p.groups.size();) {
+			auto& group    = *p.groups[n];
+			auto  expected = static_cast<uint8_t>(Prefetch::Pending);
+			if (group.state.compare_exchange_strong(expected, Prefetch::Running, std::memory_order_acq_rel)) {
+				PrefetchTranslate(group);
+				group.state.store(Prefetch::Done, std::memory_order_release);
+				group.state.notify_all();
+			}
+			if (p.finished.fetch_add(1, std::memory_order_relaxed) + 1 == p.groups.size()) {
+				PipelineCacheLog("Shader prefetch: all {} programs translated, {} MiB of SPIR-V", p.groups.size(),
+				                 p.spill_end.load(std::memory_order_relaxed) >> 20u);
+				std::vector<std::vector<uint32_t>>().swap(p.inputs.records); // no longer read
+			}
+		}
+	}
+
+	// What PrepareWarmJob does for a recorded input, for each of the program's.
+	void PrefetchTranslate(Prefetch::Group& group) {
+		auto& p = *prefetch;
+		for (const auto index: group.records) {
+			LocalShaderWarmup::Record record;
+			LocalShaderWarmup::Reader reader {p.inputs.records[index]};
+			if (!LocalShaderWarmup::Visit(reader, record)) continue;
+			std::vector<uint32_t> user_data(record.user_data_count);
+			const auto            options = LocalShaderWarmup::Options(record, user_data);
+			try {
+				// Inputs the recompiler rejects (code the game never runs) are left out, as the precompile did.
+				Common::RecoverableExitScope recoverable;
+				auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
+				if (!group.plan) group.plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, record.specialization);
+				auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, record.specialization,
+				                                               record.push_cursor);
+				const auto bytes  = result.spirv.size() * sizeof(uint32_t);
+				const auto offset = p.spill_end.fetch_add(bytes, std::memory_order_relaxed);
+				if (!LocalPlatform::WriteScratchFile(p.spill, offset, result.spirv.data(), bytes)) continue;
+				group.modules.push_back({std::move(record.specialization), std::move(result.program).TakeCompiledInfo(),
+				                         offset, result.spirv.size()});
+			} catch (const Common::RecoverableExit&) {
+			}
+		}
+	}
+
+	// The prefetched translation of the program `lookup_key` names, met for the first time: taken over
+	// once done (waiting for it when a worker translates it now), else null and left to the caller.
+	Prefetch::Group* PrefetchedGroup(const ShaderParams& params) {
+		if (prefetch == nullptr || !prefetch->ready.load(std::memory_order_acquire)) return nullptr;
+		const auto found = prefetch->index.find(lookup_key);
+		if (found == prefetch->index.end()) return nullptr;
+		auto& group = *found->second;
+		auto  state = group.state.load(std::memory_order_acquire);
+		if (state == Prefetch::Pending &&
+		    group.state.compare_exchange_strong(state, Prefetch::Taken, std::memory_order_acq_rel)) {
+			prefetch->claimed++;
+			return nullptr;
+		}
+		for (; state == Prefetch::Running; state = group.state.load(std::memory_order_acquire))
+			group.state.wait(Prefetch::Running, std::memory_order_acquire);
+		if (state != Prefetch::Done || !group.plan || group.source != SourceDigest(params.code, params.back_code))
+			return nullptr;
+		group.state.store(Prefetch::Taken, std::memory_order_relaxed);
+		prefetch->adopted++;
+		return &group;
+	}
+
+	// A prefetched module of the source compiled with the specialization a translation would compile
+	// here (portable formats, see Get) and a push data start the cursor allows: its permutation.
+	const Permutation* AdoptPrefetchedModule(SourceEntry& source, const ShaderRecompiler::CompileOptions& options,
+	                                         ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                         uint32_t push_data_cursor) {
+		if (source.prefetched.empty() || prefetch == nullptr) return nullptr;
+		auto compiled = specialization;
+		(void)ShaderRecompiler::IR::PortableFormats(source.resource_plan.info, compiled);
+		const auto module = std::ranges::find_if(source.prefetched, [&](const PrefetchedModule& candidate) {
+			const auto& layout = candidate.program.bindings;
+			return candidate.specialization == compiled &&
+			       layout.push_data_start_dword ==
+			           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords());
+		});
+		if (module == source.prefetched.end()) return nullptr;
+		std::vector<uint32_t> spirv(module->spirv_words);
+		if (!LocalPlatform::ReadScratchFile(prefetch->spill, module->spirv_offset, spirv.data(),
+		                                    spirv.size() * sizeof(uint32_t)))
+			return nullptr;
+		source.permutations.push_back(
+		    ModulePermutation(options, spirv, std::move(module->program), std::move(specialization)));
+		source.prefetched.erase(module);
+		prefetch->adopted_modules++;
+		return &source.permutations.back();
+	}
+
 	static constexpr std::size_t MaxStaticKeyWords = 13 + ShaderVertexInputInfo::RES_MAX * 13;
 
 	Permutation CompilePermutation(const ShaderParams&                          params,
@@ -319,38 +519,9 @@ struct PipelineCache::ProgramCache {
 	Permutation FinishPermutation(const ShaderParams& params, const ShaderRecompiler::CompileOptions& options,
 	                              ShaderRecompiler::CompileResult              result,
 	                              ShaderRecompiler::IR::ResourceSpecialization specialization) {
-		const char* stage_name = nullptr;
-		switch (options.stage) {
-			case ShaderType::Vertex: stage_name = "vs"; break;
-			case ShaderType::Mesh: stage_name = "ms"; break;
-			case ShaderType::Pixel: stage_name = "ps"; break;
-			case ShaderType::Compute: stage_name = "cs"; break;
-			default: EXIT("invalid pipeline shader stage\n");
-		}
-		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
-			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
-			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
-			     options.shader_hash);
-		}
-		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
-		// With the slow-call log: each module's SPIR-V (what the driver and static caches are keyed by).
-		if (SlowLog::Threshold() > 0.0) {
-			std::printf("MODULE %s hash=0x%016llx spirv=%016llx\n", stage_name,
-			            static_cast<unsigned long long>(options.shader_hash),
-			            static_cast<unsigned long long>(
-			                XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t))));
-		}
-
-		vk::ShaderModuleCreateInfo create_info {};
-		create_info.codeSize    = result.spirv.size() * sizeof(uint32_t);
-		create_info.pCode       = result.spirv.data();
-		vk::ShaderModule module = nullptr;
-		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
-		                     "create recompiled shader module");
-		EXIT_IF(module == nullptr);
-		SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
-		                     options.shader_hash);
+		DumpShaderOriginal(StageName(options.stage), options.shader_hash, params.code, result.decoded_dump);
+		auto permutation = ModulePermutation(options, result.spirv, std::move(result.program).TakeCompiledInfo(),
+		                                     std::move(specialization));
 		if (options.dump_ir) {
 			if (!options.early_dump) {
 				LOGF("%s decoded RDNA2:\n%s", options.dump_label, result.decoded_dump.c_str());
@@ -359,9 +530,51 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
+		return permutation;
+	}
+
+	static const char* StageName(ShaderType stage) {
+		const char* name = nullptr;
+		switch (stage) {
+			case ShaderType::Vertex: name = "vs"; break;
+			case ShaderType::Mesh: name = "ms"; break;
+			case ShaderType::Pixel: name = "ps"; break;
+			case ShaderType::Compute: name = "cs"; break;
+			default: EXIT("invalid pipeline shader stage\n");
+		}
+		return name;
+	}
+
+	// The shader module of a program's SPIR-V (translated here, by a warmup worker or the prefetch).
+	Permutation ModulePermutation(const ShaderRecompiler::CompileOptions& options, const std::vector<uint32_t>& spirv,
+	                              ShaderRecompiler::IR::CompiledShaderInfo     program,
+	                              ShaderRecompiler::IR::ResourceSpecialization specialization) {
+		const char* stage_name = StageName(options.stage);
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, spirv)) {
+			DumpShaderSpirv(stage_name, options.shader_hash, spirv);
+			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
+			     options.shader_hash);
+		}
+		DumpShaderSpirv(stage_name, options.shader_hash, spirv);
+		// With the slow-call log: each module's SPIR-V (what the driver and static caches are keyed by).
+		if (SlowLog::Threshold() > 0.0) {
+			std::printf("MODULE %s hash=0x%016llx spirv=%016llx\n", stage_name,
+			            static_cast<unsigned long long>(options.shader_hash),
+			            static_cast<unsigned long long>(XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t))));
+		}
+
+		vk::ShaderModuleCreateInfo create_info {};
+		create_info.codeSize    = spirv.size() * sizeof(uint32_t);
+		create_info.pCode       = spirv.data();
+		vk::ShaderModule module = nullptr;
+		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
+		                     "create recompiled shader module");
+		EXIT_IF(module == nullptr);
+		SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
+		                     options.shader_hash);
 		return {
 		    .specialization = std::move(specialization),
-		    .program        = std::move(result.program).TakeCompiledInfo(),
+		    .program        = std::move(program),
 		    .handle         = {.id = ++next_shader_id, .module = module},
 		};
 	}
@@ -504,38 +717,53 @@ struct PipelineCache::ProgramCache {
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
 		}
-		// With the slow-call log: the translation's specialization-independent part (front) and
-		// whether the program had other permutations already.
-		const bool known_program = entry != programs.end();
-		const auto front_begin   = std::chrono::steady_clock::now();
-		double     front_ms      = 0.0;
-		SlowLog::Scope translate_slow([&](double ms) {
-			std::printf("SLOW TranslateProgram %.1f ms %s hash=0x%016llx front=%.1f ms %s\n", ms, label,
-			            static_cast<unsigned long long>(params.hash), front_ms,
-			            known_program ? "specialization" : "program");
-		});
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
-		front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
+		// A program met for the first time that the prefetch translated: its plan, materialized for
+		// this draw, and its modules are taken over.
 		if (entry == programs.end()) {
-			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			ReportMaterialization(label, stage, params.hash, report,
-			                      ShaderRecompiler::IR::MaterializeResources(
-			                          resource_plan, runtime, resources, specialization, &report));
-			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+			if (auto* group = PrefetchedGroup(params)) {
+				ReportMaterialization(label, stage, params.hash, report,
+				                      ShaderRecompiler::IR::MaterializeResources(*group->plan, runtime, resources,
+				                                                                 specialization, &report));
+				entry = programs.try_emplace(lookup_key, std::move(*group->plan)).first;
+				entry->second.prefetched = std::move(group->modules);
+				group->plan.reset();
+			}
 		}
-		// A specialization met for the first time whose formatted buffers can decode their formats at
-		// run time gets the portable module (IR::PortableFormats) under its own specialization: the
-		// static precompile (WarmSeeds) holds that module's pipelines, so no driver compilation holds
-		// up this draw. The warmup file records the exact specialization, and the next start compiles
-		// its specialized module.
-		auto portable = specialization;
-		if (ShaderRecompiler::IR::PortableFormats(entry->second.resource_plan.info, portable)) {
-			entry->second.permutations.push_back(CompilePermutation(
-			    params, options, std::move(translated), std::move(portable), push_data_cursor));
-			entry->second.permutations.back().specialization = std::move(specialization);
-		} else {
-			entry->second.permutations.push_back(CompilePermutation(
-			    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+		if (entry == programs.end() ||
+		    AdoptPrefetchedModule(entry->second, options, specialization, push_data_cursor) == nullptr) {
+			// With the slow-call log: the translation's specialization-independent part (front) and
+			// whether the program had other permutations already.
+			const bool known_program = entry != programs.end();
+			const auto front_begin   = std::chrono::steady_clock::now();
+			double     front_ms      = 0.0;
+			SlowLog::Scope translate_slow([&](double ms) {
+				std::printf("SLOW TranslateProgram %.1f ms %s hash=0x%016llx front=%.1f ms %s\n", ms, label,
+				            static_cast<unsigned long long>(params.hash), front_ms,
+				            known_program ? "specialization" : "program");
+			});
+			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
+			if (entry == programs.end()) {
+				auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+				ReportMaterialization(label, stage, params.hash, report,
+				                      ShaderRecompiler::IR::MaterializeResources(
+				                          resource_plan, runtime, resources, specialization, &report));
+				entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+			}
+			// A specialization met for the first time whose formatted buffers can decode their formats at
+			// run time gets the portable module (IR::PortableFormats) under its own specialization: the
+			// static precompile (WarmSeeds) holds that module's pipelines, so no driver compilation holds
+			// up this draw. The warmup file records the exact specialization, and the next start compiles
+			// its specialized module.
+			auto portable = specialization;
+			if (ShaderRecompiler::IR::PortableFormats(entry->second.resource_plan.info, portable)) {
+				entry->second.permutations.push_back(CompilePermutation(
+				    params, options, std::move(translated), std::move(portable), push_data_cursor));
+				entry->second.permutations.back().specialization = std::move(specialization);
+			} else {
+				entry->second.permutations.push_back(CompilePermutation(
+				    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+			}
 		}
 		const auto& permutation = entry->second.permutations.back();
 		if (warmup.Enabled()) {
@@ -692,6 +920,7 @@ struct PipelineCache::ProgramCache {
 		for (size_t remaining = warmup.records.size(); remaining != 0; --remaining) {
 			const size_t index = remaining - 1;
 			if (std::chrono::steady_clock::now() >= warm_deadline) break;
+			StartupProgress::Report("正在准备着色器", warmup.records.size() - remaining, warmup.records.size());
 			std::unique_ptr<WarmJob> job;
 			LocalShaderWarmup::Record parsed;
 			if (workers) {
@@ -900,6 +1129,14 @@ void PipelineCache::PromoteOptimized() {
 }
 
 void PipelineCache::FinishCompileWorkers() {
+	if (auto& prefetch = m_program_cache->prefetch; prefetch != nullptr) {
+		if (prefetch->ready.load(std::memory_order_acquire))
+			PipelineCacheLog("Shader prefetch: {} of {} programs translated; the game took over {} of them ({} modules) "
+			                 "and translated {} itself",
+			                 prefetch->finished.load(), prefetch->groups.size(), prefetch->adopted,
+			                 prefetch->adopted_modules, prefetch->claimed);
+		prefetch.reset();
+	}
 	m_stopping.store(true, std::memory_order_relaxed);
 	m_compile_workers.reset();
 	if (m_unoptimized_builds != 0) {
@@ -914,10 +1151,17 @@ void PipelineCache::FinishCompileWorkers() {
 	m_pending_graphics_pipelines.clear();
 }
 
+// The compiler inputs the static precompile compiled, as a warmup file: what the shader prefetch
+// translates (precompile-windows.ps1 writes it next to the static pipeline cache).
+static std::filesystem::path StaticInputsPath() {
+	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheTitleId() + ".shaders");
+}
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	StartupProgress::Report("正在载入管线缓存", 0, 0);
 	InitializeStaticCache(false);
 	const char* warmup = std::getenv("KYTY_SHADER_WARMUP");
 	if (warmup && IsBinaryDriverCacheKey(m_driver_cache_key) && m_driver_cache != nullptr &&
@@ -962,6 +1206,24 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			std::_Exit(0);
 		}
 	}
+#ifndef KYTY_STATIC_PRECOMPILE
+	if (const char* prefetch = std::getenv("KYTY_SHADER_PREFETCH");
+	    (prefetch == nullptr || std::string_view(prefetch) != "0") && KYTY_BUILD == KYTY_BUILD_RELEASE &&
+	    !PipelineCacheTitleId().empty()) {
+		std::vector<ProgramCache::ProgramKey> warm;
+		for (const auto& [key, source]: m_program_cache->programs) warm.push_back(key);
+		m_program_cache->StartPrefetch(
+		    StaticInputsPath(),
+		    PipelineCacheTitleId() + ShaderInputDeviceSignature(m_graphics.GetPhysicalDeviceProperties()), std::move(warm));
+	}
+#endif
+}
+
+PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
+	const auto* prefetch = m_program_cache->prefetch.get();
+	if (prefetch == nullptr || !prefetch->ready.load(std::memory_order_acquire)) return {};
+	const auto total = prefetch->groups.size();
+	return {std::min(prefetch->finished.load(std::memory_order_relaxed), total), total};
 }
 
 void PipelineCache::WarmPipelines() {
@@ -1033,6 +1295,7 @@ void PipelineCache::WarmPipelines() {
 			}
 			if (const auto done = compiled.fetch_add(1, std::memory_order_relaxed) + 1; done % 250 == 0)
 				PipelineCacheLog("Pipeline warmup: compiling {}/{}", done, jobs.size());
+			StartupProgress::Report("正在准备管线", n + 1, jobs.size()); // shown from the main thread only
 		}
 	};
 	const uint32_t threads = std::min<uint32_t>(ProgramCache::WarmupThreads(),

@@ -622,14 +622,24 @@ struct SystemOverlay::Impl {
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
-		// The default font first (dialogs); the KYTY_FPS_HUD panel's where Windows has it.
+		// The default font first (dialogs); the panels' where Windows has it, with Chinese glyphs
+		// (the progress line) merged in from Microsoft YaHei (loaded as the text needs them).
 		io.Fonts->AddFontDefault();
 #ifdef _WIN32
 		const char* windows = std::getenv("WINDIR");
-		const auto  path = std::string(windows != nullptr ? windows : "C:\\Windows") + "\\Fonts\\segoeuib.ttf";
-		if (FILE* file = std::fopen(path.c_str(), "rb"); file != nullptr) {
-			std::fclose(file);
-			hud_font = io.Fonts->AddFontFromFileTTF(path.c_str(), 32.0f);
+		const auto  fonts   = std::string(windows != nullptr ? windows : "C:\\Windows") + "\\Fonts\\";
+		const auto  exists  = [](const std::string& path) {
+			FILE* file = std::fopen(path.c_str(), "rb");
+			if (file != nullptr) std::fclose(file);
+			return file != nullptr;
+		};
+		if (exists(fonts + "segoeuib.ttf")) {
+			hud_font = io.Fonts->AddFontFromFileTTF((fonts + "segoeuib.ttf").c_str(), 32.0f);
+			if (exists(fonts + "msyhbd.ttc")) {
+				ImFontConfig merge;
+				merge.MergeMode = true;
+				io.Fonts->AddFontFromFileTTF((fonts + "msyhbd.ttc").c_str(), 32.0f, &merge);
+			}
 		}
 #endif
 		ImGui::StyleColorsDark();
@@ -954,14 +964,13 @@ struct SystemOverlay::Impl {
 		}
 	}
 
-	// KYTY_FPS_HUD: top right of the game image, below the game's own corner icon.
+	// Top right of the game image, below the game's own corner icon: the frame rate (KYTY_FPS_HUD)
+	// and under it the progress line.
 	void DrawHud(SystemOverlayHud& hud) {
 		const auto  region = hud.region;
 		const float unit   = std::max(static_cast<float>(region.extent.height) / 1080.0f, 0.5f);
-		ImGui::SetNextWindowPos({static_cast<float>(region.offset.x) + static_cast<float>(region.extent.width) - 28.0f * unit,
-		                         static_cast<float>(region.offset.y) + static_cast<float>(region.extent.height) * 0.10f},
-		                        ImGuiCond_Always, {1.0f, 0.0f});
-		ImGui::SetNextWindowBgAlpha(0.45f);
+		const float right  = static_cast<float>(region.offset.x) + static_cast<float>(region.extent.width) - 28.0f * unit;
+		float       top    = static_cast<float>(region.offset.y) + static_cast<float>(region.extent.height) * 0.10f;
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {16.0f * unit, 8.0f * unit});
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * unit);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
@@ -970,19 +979,45 @@ struct SystemOverlay::Impl {
 		                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
 		                                   ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
 		                                   ImGuiWindowFlags_NoFocusOnAppearing;
-		ImGui::Begin("##FpsHud", nullptr, flags);
-		ImGui::PushFont(hud_font, 46.0f * unit);
-		ImGui::TextColored({0.46f, 0.73f, 0.0f, 1.0f}, "%s", hud.title.c_str());
-		ImGui::PopFont();
-		ImGui::PushFont(hud_font, 21.0f * unit);
-		ImGui::TextUnformatted(hud.detail.c_str());
-		ImGui::PopFont();
-		const auto position = ImGui::GetWindowPos();
-		const auto size     = ImGui::GetWindowSize();
-		ImGui::End();
+		ImVec2 low {right, top}, high {right, top};
+		const auto panel = [&](const char* name, const auto& contents) {
+			ImGui::SetNextWindowPos({right, top}, ImGuiCond_Always, {1.0f, 0.0f});
+			ImGui::SetNextWindowBgAlpha(0.45f);
+			ImGui::Begin(name, nullptr, flags);
+			contents();
+			const auto position = ImGui::GetWindowPos();
+			const auto size     = ImGui::GetWindowSize();
+			ImGui::End();
+			low  = {std::min(low.x, position.x), std::min(low.y, position.y)};
+			high = {std::max(high.x, position.x + size.x), std::max(high.y, position.y + size.y)};
+			top  = position.y + size.y + 8.0f * unit;
+		};
+		if (!hud.title.empty()) {
+			panel("##FpsHud", [&] {
+				ImGui::PushFont(hud_font, 46.0f * unit);
+				ImGui::TextColored({0.46f, 0.73f, 0.0f, 1.0f}, "%s", hud.title.c_str());
+				ImGui::PopFont();
+				ImGui::PushFont(hud_font, 21.0f * unit);
+				ImGui::TextUnformatted(hud.detail.c_str());
+				ImGui::PopFont();
+			});
+		}
+		if (!hud.status.empty()) {
+			panel("##StatusHud", [&] {
+				ImGui::PushFont(hud_font, 21.0f * unit);
+				ImGui::TextUnformatted(hud.status.c_str());
+				const float width = std::max(ImGui::GetItemRectSize().x, 260.0f * unit);
+				ImGui::PopFont();
+				ImGui::Dummy({0.0f, 6.0f * unit});
+				ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4 {0.46f, 0.73f, 0.0f, 1.0f});
+				ImGui::ProgressBar(hud.status_fraction, {width, 6.0f * unit}, "");
+				ImGui::PopStyleColor();
+			});
+		}
 		ImGui::PopStyleVar(4);
-		hud.drawn = {{static_cast<int32_t>(position.x), static_cast<int32_t>(position.y)},
-		             {static_cast<uint32_t>(std::max(size.x, 0.0f)), static_cast<uint32_t>(std::max(size.y, 0.0f))}};
+		hud.drawn = {{static_cast<int32_t>(low.x), static_cast<int32_t>(low.y)},
+		             {static_cast<uint32_t>(std::max(high.x - low.x, 0.0f)),
+		              static_cast<uint32_t>(std::max(high.y - low.y, 0.0f))}};
 	}
 
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count,

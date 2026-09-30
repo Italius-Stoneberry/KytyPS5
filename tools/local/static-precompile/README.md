@@ -22,7 +22,11 @@
      `--shard i/n` 分成多个低优先级进程并行（`-Jobs`，默认每个允许的 CPU 一个），最后合并。
    - 重跑只编译缺的（静态缓存里有的直接命中）。各进程每 10 分钟存一次检查点，中断后重跑先合并这些检查点。
    - `-Coverage`：不建管线，只写出编译了什么（`<seeds>.compiled.shaders` 及 `.spirv.txt`/`.rejected.txt`）。
-   - 对比用：`KYTY_STATIC_PIPELINE_CACHE=0` 让游戏不加载静态缓存。
+   - 全量跑完最后再写 `_PipelineCache/static/PPSA01341.shaders`（编译用的输入，warmup 格式，136 MB），供游戏的
+     **后台预翻译**（`KYTY_SHADER_PREFETCH`，默认开）：游戏启动后低优先级线程把这些程序全部翻译好（约 60–100 s，
+     SPIR-V 放系统临时文件），第一次遇到时直接取用，不再现场翻译。`-InputsOnly` 只写这个文件（约 30 s）。
+     它存的是编译输入（翻译用当时的模拟器做），种子或特化推断（`SeedSpecializations`）变了才需要重写。
+   - 对比用：`KYTY_STATIC_PIPELINE_CACHE=0` 让游戏不加载静态缓存，`KYTY_SHADER_PREFETCH=0` 不做后台预翻译。
 3. `precompile.py coverage COMPILED --recorded-compiled R`：与录制缓存对比（SPIR-V 级＝驱动缓存能否命中）。
    `recorded-seeds` 把录制缓存转成种子，同样用 `-Coverage` 编译得到 R。
 4. `stalls.py LOG`：运行日志里的编译卡顿统计（`KYTY_SLOW_LOG_MS=30`）。
