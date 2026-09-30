@@ -95,24 +95,26 @@ bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out) {
 static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
-	// The thread's last lookups: draws repeat their stages' shaders (vertex, GS back half,
-	// pixel) and dispatches the previous compute shader most of the time.
+	// The thread's earlier lookups by address, two per set, the latest first: a frame's draws and
+	// dispatches use hundreds of shaders (the last four lookups held a fraction of them).
 	struct Recent {
 		uint64_t         addr = 0, generation = UINT64_MAX;
 		ShaderMappedData data {};
 	};
-	thread_local std::array<Recent, 4> recent {};
-	thread_local uint32_t              next_slot = 0;
+	thread_local std::array<std::array<Recent, 2>, 512> recent {};
 	const auto generation = g_shader_map_generation.load(std::memory_order_acquire);
-	for (const auto& entry: recent) {
-		if (entry.addr == addr && entry.generation == generation) return entry.data;
+	auto&      set        = recent[((addr >> 8u) * 0x9e3779b97f4a7c15ull) >> 55u];
+	if (set[0].addr == addr && set[0].generation == generation) return set[0].data;
+	if (set[1].addr == addr && set[1].generation == generation) {
+		std::swap(set[0], set[1]);
+		return set[0].data;
 	}
 
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
-		recent[next_slot] = {addr, generation, iter->second};
-		next_slot         = (next_slot + 1) % recent.size();
+		set[1] = set[0];
+		set[0] = {addr, generation, iter->second};
 		return iter->second;
 	}
 
