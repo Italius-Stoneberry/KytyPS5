@@ -74,7 +74,9 @@ public:
 	void SetDispatchIndirectArgsBaseAddress(uint64_t dispatch_indirect_args_base_addr);
 	void DispatchIndirectAddress(uint64_t args_address, uint32_t mode);
 	void SetNumInstances(uint32_t num_instances);
-	void DrawIndex(DrawIndexArgs args);
+	bool DrawIndex(DrawIndexArgs args);
+	// An indexed indirect draw whose arguments the GPU wrote, drawn from them on the GPU.
+	[[nodiscard]] bool TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
 	// Native XPR draws (kyty_local_native_xpr_mode): packets consumed, 0 = normal path.

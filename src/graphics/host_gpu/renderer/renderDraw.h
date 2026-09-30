@@ -36,6 +36,10 @@ struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex = 0;
 	uint32_t first_instance = 0;
+	// DrawIndexArgs::gpu_args: one indirect draw of these arguments.
+	uint64_t gpu_args        = 0;
+	uint32_t gpu_args_count  = 0;
+	uint32_t gpu_args_stride = 0;
 };
 
 struct DrawIndexBufferSource {

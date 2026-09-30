@@ -1050,7 +1050,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
-void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	CheckBuffer();
 
 	args.index_type_and_size = m_index_type_and_size;
@@ -1061,7 +1061,29 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	return m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+}
+
+bool CommandProcessor::TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride) {
+	// Reading GPU-written arguments on the CPU waits for the GPU to finish all work queued so
+	// far (0.1-0.3 ms). A triangle list over the whole index buffer draws from them directly,
+	// as native XPR runs do.
+	if (count == 0 || m_index_type_and_size > 1 || !m_index_base_addr || !m_index_buffer_size || (args & 3u) != 0 ||
+	    stride % 4u != 0 || stride < sizeof(DrawIndexedIndirectArgs) ||
+	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
+		return false;
+	const uint64_t bytes     = uint64_t {count - 1u} * stride + sizeof(DrawIndexedIndirectArgs);
+	auto&          resources = GetGpuResources();
+	if (!resources.IsMapped(args, bytes) || !resources.GetBufferCache().HasGpuDirtyBytes(args, bytes) ||
+	    resources.GetTextureCache().IsRegionGpuModified(args, bytes))
+		return false;
+	return DrawIndex({.index_count     = m_index_buffer_size,
+	                  .index_addr      = reinterpret_cast<const void*>(m_index_base_addr),
+	                  .instance_count  = 1,
+	                  .offset_source   = DrawOffsetSource::IndirectArgs,
+	                  .gpu_args        = args,
+	                  .gpu_args_count  = count,
+	                  .gpu_args_stride = stride});
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -1236,6 +1258,8 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+	if (indexed && TryGpuIndirectDraw(m_draw_indirect_args_base_addr + data_offset, 1, sizeof(DrawIndexedIndirectArgs)))
+		return;
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
 	        m_draw_indirect_args_base_addr + data_offset,
 	        indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs))) {
@@ -1345,6 +1369,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
+	if (indexed && TryGpuIndirectDraw(m_draw_indirect_args_base_addr + data_offset, draw_count, stride_in_bytes))
+		return;
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
 	        m_draw_indirect_args_base_addr + data_offset,
 	        static_cast<uint64_t>(draw_count - 1u) * stride_in_bytes + args_size)) {

@@ -64,6 +64,11 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Arguments the GPU reads (gpu_args_count DrawIndexedIndirectArgs at gpu_args, gpu_args_stride
+	// apart), not read on the CPU: index_count and index_addr then cover the whole index buffer.
+	uint64_t gpu_args        = 0;
+	uint32_t gpu_args_count  = 0;
+	uint32_t gpu_args_stride = 0;
 };
 
 struct DrawAutoArgs {
@@ -196,7 +201,9 @@ private:
 
 	bool TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer, std::span<const DrawIndexArgs> draws,
 	                     std::span<const uint64_t> argument_addresses);
-	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	// False only for GPU-read arguments this draw cannot use (a mesh draw): the caller reads
+	// them on the CPU and draws again.
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
