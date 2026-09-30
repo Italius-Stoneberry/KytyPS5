@@ -78,6 +78,10 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Arguments the GPU reads (DrawIndirectArgs), as in DrawIndexArgs.
+	uint64_t gpu_args        = 0;
+	uint32_t gpu_args_count  = 0;
+	uint32_t gpu_args_stride = 0;
 };
 
 struct SubmitInfo {
@@ -204,7 +208,7 @@ private:
 	// False only for GPU-read arguments this draw cannot use (a mesh draw): the caller reads
 	// them on the CPU and draws again.
 	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
-	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args); // as DrawIndex
 
 	struct GraphicsBindings {
 		PreparedBindings                vertex;

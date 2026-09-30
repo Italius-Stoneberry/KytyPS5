@@ -75,10 +75,10 @@ public:
 	void DispatchIndirectAddress(uint64_t args_address, uint32_t mode);
 	void SetNumInstances(uint32_t num_instances);
 	bool DrawIndex(DrawIndexArgs args);
-	// An indexed indirect draw whose arguments the GPU wrote, drawn from them on the GPU.
-	[[nodiscard]] bool TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride);
+	// An indirect draw whose arguments the GPU wrote, drawn from them on the GPU.
+	[[nodiscard]] bool TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride, bool indexed);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
-	void DrawIndexAuto(DrawAutoArgs args);
+	bool DrawIndexAuto(DrawAutoArgs args);
 	// Native XPR draws (kyty_local_native_xpr_mode): packets consumed, 0 = normal path.
 	[[nodiscard]] uint32_t TryNativeXprDraws(std::span<const uint32_t> packets, bool clean);
 	// A DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2 from a native record: the packet's dwords, or 0.

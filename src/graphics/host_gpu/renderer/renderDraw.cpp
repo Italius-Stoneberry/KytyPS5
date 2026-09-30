@@ -1410,9 +1410,9 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	std::pair<Buffer*, uint64_t> gpu_args {};
 	if (emit.gpu_args != 0) {
+		const uint64_t size = emit.indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
 		gpu_args = m_context.GetBufferCache().ObtainBuffer(
-		    emit.gpu_args, uint64_t {emit.gpu_args_count - 1u} * emit.gpu_args_stride + sizeof(vk::DrawIndexedIndirectCommand),
-		    false);
+		    emit.gpu_args, uint64_t {emit.gpu_args_count - 1u} * emit.gpu_args_stride + size, false);
 		EXIT_IF(gpu_args.first == nullptr);
 	}
 	if (!emit.direct_run.empty() &&
@@ -1511,9 +1511,12 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-		} else if (emit.gpu_args != 0) {
+		} else if (emit.gpu_args != 0 && emit.indexed) {
 			vk_buffer.drawIndexedIndirect(gpu_args.first->Handle(), gpu_args.second, emit.gpu_args_count,
 			                              emit.gpu_args_stride);
+		} else if (emit.gpu_args != 0) {
+			vk_buffer.drawIndirect(gpu_args.first->Handle(), gpu_args.second, emit.gpu_args_count,
+			                       emit.gpu_args_stride);
 		} else if (!emit.direct_run.empty()) {
 			for (const auto& item: emit.direct_run) {
 				vk_buffer.drawIndexed(item.indexCount, item.instanceCount, item.firstIndex,
@@ -2118,7 +2121,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
+bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	FrameCapture::Scope frame_capture("DrawAuto", false);
 
@@ -2136,17 +2139,17 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.vertex_count == 0 || args.instance_count == 0) {
-		return;
+		return true;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "metadata_or_depth_copy";
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
-		return;
+		return true;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -2174,15 +2177,19 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, false,
 	                            state)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, true, topology)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 	RefreshShaders(buffer, draw, false, state);
+	if (args.gpu_args != 0 && state.vs_input_info.stage.program->stage == ShaderType::Mesh) {
+		ResetBindings();
+		return false;
+	}
 
 	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&
@@ -2195,7 +2202,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, false,
@@ -2212,10 +2219,15 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	emit.first_instance =
 	    indirect ? args.first_instance : ResolveInstanceOffset(state.vs_input_info);
 
+	emit.gpu_args        = args.gpu_args;
+	emit.gpu_args_count  = args.gpu_args_count;
+	emit.gpu_args_stride = args.gpu_args_stride;
+
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false, false,
 	                    false, true);
 	ResetBindings();
+	return true;
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {
