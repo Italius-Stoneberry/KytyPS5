@@ -531,11 +531,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		m_command.EndRendering();
 		EXIT_IF(m_graphics.queue == nullptr);
 		DeferredSubmit deferred {};
-		{
-			Common::LockGuard lock(m_graphics.queue_mutex);
-			deferred.tick = m_master.NextTick();
-			submit.AddSignal(m_master.Handle(), deferred.tick);
-		}
+		// This thread alone allocates ticks and the worker submits them in stream order: no queue
+		// lock here (it only waited for the worker's vkQueueSubmit, 1.2% of the render thread).
+		deferred.tick = m_master.NextTick();
+		submit.AddSignal(m_master.Handle(), deferred.tick);
 		deferred.command         = m_command.m_buffer;
 		deferred.timestamp_slot  = m_command.m_timestamp_slot;
 		deferred.upload_sequence = AsyncUpload::SubmitSequence();
