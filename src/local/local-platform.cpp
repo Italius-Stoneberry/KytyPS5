@@ -62,6 +62,12 @@ void SetThreadName(const char* name) {
 	(void)SetThreadDescription(GetCurrentThread(), wide);
 }
 
+void ReleaseRedirectedConsole() {
+	if (GetConsoleWindow() != nullptr && GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) == FILE_TYPE_DISK &&
+	    GetFileType(GetStdHandle(STD_ERROR_HANDLE)) == FILE_TYPE_DISK)
+		(void)FreeConsole();
+}
+
 uint32_t ThreadId() {
 	return static_cast<uint32_t>(GetCurrentThreadId());
 }

@@ -185,12 +185,15 @@ config_compiler_and_linker()
 if(KYTY_CLANG_CL)
 	# The Linux release is built with -O3 -march=native, ThinLTO and a PGO profile; the same for
 	# Windows Release builds (clang-cl + lld-link + llvm-lib).
-	option(KYTY_NATIVE_OPT "Release: -O3 -march=native" ON)
+	option(KYTY_NATIVE_OPT "Release: -O3 -march=KYTY_MARCH" ON)
+	# A build for other PCs: x86-64-v3 (AVX2, FMA, BMI2). native also takes this CPU's newer
+	# extensions (GFNI, AVX-VNNI), which crash CPUs without them at the first use.
+	set(KYTY_MARCH "native" CACHE STRING "Release: the -march of KYTY_NATIVE_OPT (x86-64-v3 for other PCs)")
 	option(KYTY_THIN_LTO "Release: ThinLTO" ON)
 	option(KYTY_PGO_GENERATE "Instrumented build; the live command `pgo <file>` writes the profile" OFF)
 	set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (empty: none)")
 	if(KYTY_NATIVE_OPT)
-		add_compile_options("$<$<CONFIG:Release>:/clang:-O3>" "$<$<CONFIG:Release>:/clang:-march=native>")
+		add_compile_options("$<$<CONFIG:Release>:/clang:-O3>" "$<$<CONFIG:Release>:/clang:-march=${KYTY_MARCH}>")
 	endif()
 	if(KYTY_THIN_LTO)
 		add_compile_options("$<$<CONFIG:Release>:-flto=thin>")

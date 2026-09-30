@@ -12,32 +12,43 @@
 # into shards, a below-normal-priority process each (kyty_shader_precompile --shard i/n), whose caches
 # are merged into the static cache at the end. An interrupted run resumes: the shards' checkpoints
 # (every ten minutes) are merged first, and what the static cache holds is not compiled again. Build the
-# program with build-windows.cmd kyty_shader_precompile.
+# program with build-windows.cmd kyty_shader_precompile. A portable package (package-windows.ps1) has the
+# program, the seed file and launch.json next to this script (precompile.cmd).
 param(
-	[string]$Game = "$env:USERPROFILE\Documents\PPSA01341-app0",
-	[string]$Seeds = "$PSScriptRoot\_Build\static-precompile\seeds.seeds",
+	[string]$Game = '',
+	[string]$Seeds = $(if (Test-Path "$PSScriptRoot\seeds.seeds") { "$PSScriptRoot\seeds.seeds" } else { "$PSScriptRoot\_Build\static-precompile\seeds.seeds" }),
 	[int]$Jobs = 0,
 	[int]$Threads = 3,
-	[int64]$Affinity = 0xFFFFCF, # CPUs 4 and 5 left out: the compiler crashes on them on this machine
+	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
 	[switch]$Coverage,
 	[switch]$InputsOnly,
-	[string]$Exe = "$PSScriptRoot\_Build\windows\kyty_shader_precompile.exe"
+	[string]$Exe = $(if (Test-Path "$PSScriptRoot\kyty_shader_precompile.exe") { "$PSScriptRoot\kyty_shader_precompile.exe" } else { "$PSScriptRoot\_Build\windows\kyty_shader_precompile.exe" })
 )
 $ErrorActionPreference = 'Stop'
 if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd kyty_shader_precompile" }
-if (!(Test-Path "$Game\sce_sys\param.json")) { throw "no sce_sys\param.json in $Game" }
+# The game run-windows.ps1 was given last, else the default folder.
+if (!$Game -and (Test-Path "$PSScriptRoot\game-path.txt")) { $Game = (Get-Content "$PSScriptRoot\game-path.txt" -Raw).Trim() }
+if (!$Game) { $Game = "$env:USERPROFILE\Documents\PPSA01341-app0" }
+if (!(Test-Path "$Game\sce_sys\param.json")) { throw "no sce_sys\param.json in $Game (-Game <folder>, or start the game once to choose it)" }
 if (!(Test-Path $Seeds)) {
 	# Every shader the game ships, with the pipelines it draws them with (from the game files).
 	New-Item -ItemType Directory -Force (Split-Path $Seeds) | Out-Null
 	python "$PSScriptRoot\tools\local\static-precompile\precompile.py" --game $Game seeds $Seeds
 	if ($LASTEXITCODE) { throw 'precompile.py seeds failed' }
 }
-$mask = $Affinity -band ([int64][math]::Pow(2, [Environment]::ProcessorCount) - 1)
+if ($Affinity -eq 0) {
+	$config = if (Test-Path "$PSScriptRoot\launch.json") { "$PSScriptRoot\launch.json" } else { "$PSScriptRoot\_Build\release-stage1-20260927\launch.json" }
+	foreach ($cpu in (Get-Content $config -Raw | ConvertFrom-Json).cpu_affinity) { $Affinity = $Affinity -bor ([int64]1 -shl [int]$cpu) }
+}
+$all = if ([Environment]::ProcessorCount -ge 64) { [int64]-1 } else { ([int64]1 -shl [Environment]::ProcessorCount) - 1 }
+$mask = $Affinity -band $all
+if ($mask -eq 0) { $mask = $all }
 $cpus = 0
 for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $cpus++ } }
 # A process scales to a few threads (4: 85%), and each translates the programs its share needs.
 if ($Jobs -le 0) { $Jobs = [math]::Max(1, [math]::Ceiling($cpus / $Threads)) }
-$logs = "$PSScriptRoot\_Build\run-logs"
+$logs = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\run-logs" } else { "$PSScriptRoot\logs" }
+$logName = $logs.Substring($PSScriptRoot.Length + 1)
 New-Item -ItemType Directory -Force $logs | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $begin = Get-Date
@@ -60,10 +71,10 @@ function Wait-Precompile([System.Diagnostics.Process[]]$processes, [string]$what
 		Write-Host ("  {0:hh\:mm\:ss} {1}: {2} of {3} running" -f ((Get-Date) - $begin), $what, $left, $processes.Count)
 	}
 	$failed = @($processes | Where-Object { $_.ExitCode -ne 0 }).Count
-	if ($failed) { throw "$what`: $failed process(es) failed; logs: _Build\run-logs\$stamp-precompile-*" }
+	if ($failed) { throw "$what`: $failed process(es) failed; logs: $logName\$stamp-precompile-*" }
 }
 
-Write-Host "precompile: $Seeds, $Jobs shards, affinity 0x$('{0:X}' -f $mask); logs _Build\run-logs\$stamp-precompile-*"
+Write-Host "precompile: $Seeds, $Jobs shards, affinity 0x$('{0:X}' -f $mask); logs $logName\$stamp-precompile-*"
 if ($Coverage) {
 	$out = [IO.Path]::ChangeExtension($Seeds, '.compiled.shaders')
 	Wait-Precompile @(Start-Precompile 'coverage' @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$cpus",

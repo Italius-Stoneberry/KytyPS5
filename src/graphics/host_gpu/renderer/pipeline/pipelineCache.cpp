@@ -1163,6 +1163,8 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	InitializeDriverCache();
 	StartupProgress::Report("正在载入管线缓存", 0, 0);
 	InitializeStaticCache(false);
+	// Not in the static precompile: a shell that ran the game passes its KYTY_SHADER_WARMUP(_ONLY) on.
+#ifndef KYTY_STATIC_PRECOMPILE
 	const char* warmup = std::getenv("KYTY_SHADER_WARMUP");
 	if (warmup && IsBinaryDriverCacheKey(m_driver_cache_key) && m_driver_cache != nullptr &&
 	    (std::string_view(warmup) == "1" || std::string_view(warmup) == "record")) {
@@ -1206,7 +1208,6 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			std::_Exit(0);
 		}
 	}
-#ifndef KYTY_STATIC_PRECOMPILE
 	if (const char* prefetch = std::getenv("KYTY_SHADER_PREFETCH");
 	    (prefetch == nullptr || std::string_view(prefetch) != "0") && KYTY_BUILD == KYTY_BUILD_RELEASE &&
 	    !PipelineCacheTitleId().empty()) {

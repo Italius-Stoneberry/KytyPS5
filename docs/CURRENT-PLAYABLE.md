@@ -45,13 +45,23 @@ python3 tools/local/play-demons-souls.py --2k  # 带运行日志的同一正式�
 ```
 
 其他参数：`-Baseline`（不开性能开关）、`-NoAot`、`-NoRedZone`、`-Set KEY=VALUE`（覆盖配置里的开关，`KEY=` 删除）、
-`-Patch <cheat.json>`（etaHEN 格式补丁）、`-PresentMode`、`-Vblank`。
+`-Patch <cheat.json>`（etaHEN 格式补丁）、`-PresentMode`、`-Vblank`、`-Game <游戏目录>`（记在 `game-path.txt`，
+都找不到时弹出选择框）、`-Affinity <十六进制掩码>`。
 
 - 依赖：VS 2022（C++ 工作负载）、LLVM 19.1.7（`winget install LLVM.LLVM --version 19.1.7`）、Vulkan SDK（glslangValidator）。
   LLVM 23.1.2 编译 `agc.cpp` 时编译器自身崩溃，不要用。
-- 构建与运行都排除 CPU 4、5（亲和性 `0xFFFFCF`）：在这两个核上 clang 会随机崩溃，与 Linux 配置一致。
-- 渲染线程限定在 P 核 1,2,3,6,7（`KYTY_RENDER_CPUS`，非独占）：比自由调度快约 2.5%。**不要像 Linux 那样独占 CPU 0**：
+- 构建与运行都排除 CPU 4、5（亲和性 `0xFFFFCF`，来自配置的 `cpu_affinity`）：在这两个核上 clang 会随机崩溃，与 Linux 配置一致。
+- 渲染线程限定在 P 核 1,2,3,6,7（配置的 `KYTY_RECORDING_CPUS`，非独占）：比自由调度快约 2.5%。**不要像 Linux 那样独占 CPU 0**：
   Windows 的中断/DPC 集中在 CPU 0，帧率直接减半；用 CPU Set 把其他线程赶出某个 P 核也会大幅变慢。
+- 给其他电脑：`.\package-windows.ps1` 在 `_Build\windows-portable` 编 x86-64-v3 版（`-DKYTY_MARCH=x86-64-v3`；
+  `-march=native` 会用到本机的 GFNI，别的 CPU 上直接非法指令），再装配 `_Build\portable\KytyPS5`（约 135 MB）：
+  exe、VC++ 运行库 DLL（随包，不用装）、libwinpthread、`srt-aot.dll`、`run-windows.ps1`、双击用的 `run.cmd`，
+  以及去掉本机 CPU 设置和 Linux 路径的 `launch.json`（不绑核）；另有预编译程序、`seeds.seeds`、`precompile.cmd` 和
+  给测试者的 `README.md`（源文件 `docs/PORTABLE-README.md`）。不含游戏、存档、着色器缓存（按 GPU+驱动区分）和 Streamline。
+  窗口比屏幕大时模拟器按比例缩进可用区域。
+- 着色器准备：启动器每次先跑 `kyty_shader_precompile --status`（约 1 秒，报告预取输入和静态管线缓存是否属于当前
+  GPU+驱动），预取输入缺失或过期时自动生成（首次运行、更新驱动后）。`run.cmd` 带 `-Prompt`：静态缓存没做或游戏版本不是
+  PPSA01341 01.007.000 时先弹窗（先预编译 / 直接开始 / 退出，可勾选不再提示，记在 `no-precompile-prompt.txt`）。
 - PGO：`_Build\pgo\windows\kyty.profdata` 存在时自动使用。重新训练：`KYTY_BUILD_DIR=_Build\windows-pgo-gen`、
   `KYTY_CMAKE_ARGS=-DKYTY_PGO_GENERATE=ON -DKYTY_THIN_LTO=OFF` 编译插桩版，用它进游戏走固定场景，
   live 命令 `pgo <路径>` 导出 profraw（模拟器以 quick_exit 退出，不会自动写出），`llvm-profdata merge` 后 clean 重编正式版。

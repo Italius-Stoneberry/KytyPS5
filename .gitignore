@@ -6,3 +6,5 @@ _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
+/game-path.txt
+/no-precompile-prompt.txt

@@ -46,6 +46,10 @@ bool     ReadScratchFile(uint64_t file, uint64_t offset, void* data, size_t size
 void     CloseScratchFile(uint64_t file);
 
 #if defined(_WIN32)
+// With its output in files (run-windows.ps1's logs), the console window a launcher gave the process
+// stays empty, and closing it would end the game: the process leaves it (it closes).
+void ReleaseRedirectedConsole();
+
 // Collects the unwind tables of the loaded images for SampleThread (call before sampling).
 void PrepareSampling();
 

@@ -499,6 +499,25 @@ bool PipelineCache::Precompile(GraphicContext& graphics, const PrecompileOptions
 	return cache.WarmSeeds(options);
 }
 
+// Both files are saved whole (a temporary file renamed), so their first line tells the GPU and driver.
+bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics) {
+	const auto    signature = StaticCacheSignature(graphics.GetPhysicalDeviceProperties());
+	std::ifstream file(StaticCachePath(), std::ios::binary);
+	std::string   saved(signature.size(), '\0');
+	return file.read(saved.data(), static_cast<std::streamsize>(saved.size())) && saved == signature;
+}
+
+bool PipelineCache::StaticInputsCurrent(GraphicContext& graphics, const std::filesystem::path& seeds) {
+	const auto      path = StaticInputsPath();
+	std::error_code error;
+	const auto      written = std::filesystem::last_write_time(path, error);
+	if (error) return false;
+	const auto seeded = std::filesystem::last_write_time(seeds, error);
+	return !error && written >= seeded &&
+	       LocalShaderWarmup::Cache::FileIdentity(path) ==
+	           "KytyShaderWarmup2:" + PipelineCacheTitleId() + ShaderInputDeviceSignature(graphics.GetPhysicalDeviceProperties());
+}
+
 // The shard files are removed once merged.
 bool PipelineCache::MergePrecompileShards(GraphicContext& graphics) {
 	PipelineCache cache(graphics);

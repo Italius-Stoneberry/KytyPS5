@@ -136,6 +136,10 @@ public:
 		bool                  pipelines = true;
 	};
 	static bool Precompile(GraphicContext& graphics, const PrecompileOptions& options);
+	// The shader prefetch's inputs (--static-inputs) are this GPU's and driver's, newer than the seeds;
+	// the static pipeline cache is this GPU's and driver's.
+	static bool StaticInputsCurrent(GraphicContext& graphics, const std::filesystem::path& seeds);
+	static bool StaticCacheCurrent(GraphicContext& graphics);
 	// The caches the shards of a precompile saved next to the static cache, merged into it.
 	static bool MergePrecompileShards(GraphicContext& graphics);
 #endif

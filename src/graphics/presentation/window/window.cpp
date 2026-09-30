@@ -41,6 +41,7 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -829,6 +830,19 @@ static void WindowCreate(WindowContext& context) {
 	}
 	HostInputInit();
 	InitializeSystemOverlayInput();
+
+	// A window larger than the screen it opens on (2560x1440 on a 1080p or 1440p one) would hang
+	// off it, title bar included: the same shape scaled into the usable area, 5% of its height
+	// left for the title bar.
+	if (SDL_Rect usable {}; !Config::FullscreenEnabled() && SDL_GetDisplayUsableBounds(0, &usable) == 0) {
+		const double scale = std::min(usable.w / static_cast<double>(width), usable.h * 0.95 / height);
+		if (scale < 1.0) {
+			width                             = static_cast<int>(width * scale) & ~1;
+			height                            = static_cast<int>(height * scale) & ~1;
+			context.graphic_ctx.screen_width  = static_cast<uint32_t>(width);
+			context.graphic_ctx.screen_height = static_cast<uint32_t>(height);
+		}
+	}
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 

@@ -3,6 +3,7 @@
 //   kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] [--threads <n>]
 //                          [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]
 //   kyty_shader_precompile --game <dir> --merge
+//   kyty_shader_precompile --game <dir> --seeds <file> --status
 //
 // compiles the shaders and pipelines of a seed file on a headless Vulkan device (the one the emulator
 // creates, without a window) into the static pipeline cache _PipelineCache/static/<title>.bin, which
@@ -11,8 +12,10 @@
 // shares are processes (precompile-windows.ps1 runs them); --merge folds their files into the static
 // cache. --out writes what was compiled as a warmup file, for precompile.py coverage; --static-inputs
 // writes it where the emulator's shader prefetch reads it (_PipelineCache/static/<title>.shaders);
-// --timings each pipeline's compile time (ms, SPIR-V words, the seeds' hashes). Run it from the
-// directory the emulator runs in.
+// --timings each pipeline's compile time (ms, SPIR-V words, the seeds' hashes). --status prints
+// whether those inputs and the static cache are this GPU's and driver's ("inputs current|stale",
+// "static cache current|stale"; run-windows.ps1 asks before every launch). Run it from the directory
+// the emulator runs in.
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -33,13 +36,15 @@ using Libs::Graphics::PipelineCache;
 static int Usage() {
 	std::fprintf(stderr, "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] "
 	                     "[--threads <n>] [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]\n"
-	                     "       kyty_shader_precompile --game <dir> --merge\n");
+	                     "       kyty_shader_precompile --game <dir> --merge\n"
+	                     "       kyty_shader_precompile --game <dir> --seeds <file> --status\n");
 	return 2;
 }
 
 int main(int argc, char* argv[]) {
 	std::filesystem::path          game;
-	bool                           merge = false;
+	bool                           merge  = false;
+	bool                           status = false;
 	PipelineCache::PrecompileOptions options;
 	options.threads = std::max(1u, std::thread::hardware_concurrency());
 	for (int i = 1; i < argc; i++) {
@@ -47,6 +52,8 @@ int main(int argc, char* argv[]) {
 		const char*            value = i + 1 < argc ? argv[i + 1] : nullptr;
 		if (arg == "--merge") {
 			merge = true;
+		} else if (arg == "--status") {
+			status = true;
 		} else if (arg == "--no-pipelines") {
 			options.pipelines = false;
 		} else if (arg == "--static-inputs") {
@@ -92,6 +99,13 @@ int main(int argc, char* argv[]) {
 	if (!Libs::Graphics::CreateHeadlessGraphicContext(graphics)) {
 		std::fprintf(stderr, "no Vulkan device\n");
 		return 1;
+	}
+	if (status) {
+		std::printf("inputs %s\nstatic cache %s\n",
+		            PipelineCache::StaticInputsCurrent(graphics, options.seeds) ? "current" : "stale",
+		            PipelineCache::StaticCacheCurrent(graphics) ? "current" : "stale");
+		std::fflush(nullptr);
+		std::_Exit(0);
 	}
 	const bool done = merge ? PipelineCache::MergePrecompileShards(graphics) : PipelineCache::Precompile(graphics, options);
 	std::printf("Shader precompile: %s\n", done ? "complete" : "failed");

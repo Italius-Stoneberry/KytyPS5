@@ -13,11 +13,18 @@
 #                                            frame (2x); needs _Build\deps\streamline\sdk
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's;
 #                                            faster rates speed up the game's clock)
+#   .\run-windows.ps1 -Game <folder>         the game (the folder with eboot.bin); remembered in
+#                                            game-path.txt, a folder dialog when none is known
+#   .\run-windows.ps1 -Affinity FFFFCF       only these CPUs (hex mask; default: the config's list, else all)
+#   .\run-windows.ps1 -Prompt                a dialog first when the game version is untested or the
+#                                            shaders are not precompiled for this GPU (run.cmd)
 #   .\run-windows.ps1 -DryRun                print environment and command only
+# A portable package (package-windows.ps1) has its kyty_emulator.exe, launch.json and srt-aot.dll
+# next to this script: those are used instead of the build tree's.
 param(
-	[string]$Config = "$PSScriptRoot\_Build\release-stage1-20260927\launch.json",
-	[string]$Game = "$env:USERPROFILE\Documents\PPSA01341-app0",
-	[string]$Exe = "$PSScriptRoot\_Build\windows\kyty_emulator.exe",
+	[string]$Config = $(if (Test-Path "$PSScriptRoot\launch.json") { "$PSScriptRoot\launch.json" } else { "$PSScriptRoot\_Build\release-stage1-20260927\launch.json" }),
+	[string]$Game = '',
+	[string]$Exe = $(if (Test-Path "$PSScriptRoot\kyty_emulator.exe") { "$PSScriptRoot\kyty_emulator.exe" } else { "$PSScriptRoot\_Build\windows\kyty_emulator.exe" }),
 	[int]$Width = 0,
 	[int]$Height = 0,
 	[switch]$Fullscreen,
@@ -32,11 +39,65 @@ param(
 	[string]$Patch = '',
 	[switch]$AspectFit,
 	[int]$FrameGen = 0,
+	[string]$Affinity = '',
+	[switch]$Prompt,
 	[switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
 if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd" }
+
+# Dialogs: sharp on scaled displays (the process is DPI aware before its first window).
+function Initialize-Dialogs {
+	Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+	Add-Type -Namespace Kyty -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
+	[Kyty.Dpi]::SetProcessDPIAware() | Out-Null
+	[System.Windows.Forms.Application]::EnableVisualStyles()
+}
+# A message with a button per choice and an optional check box: the chosen index (-1: closed) and
+# whether the box was checked.
+function Show-Choice([string]$message, [string[]]$choices, [string]$checkbox = '') {
+	$form = New-Object System.Windows.Forms.Form -Property @{
+		Text = 'KytyPS5'; FormBorderStyle = 'FixedDialog'; MaximizeBox = $false; MinimizeBox = $false; StartPosition = 'CenterScreen'
+		AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; Padding = (New-Object System.Windows.Forms.Padding 16)
+		Font = (New-Object System.Drawing.Font 'Microsoft YaHei UI', 10); TopMost = $true; Tag = -1 }
+	$panel = New-Object System.Windows.Forms.FlowLayoutPanel -Property @{ FlowDirection = 'TopDown'; WrapContents = $false; AutoSize = $true }
+	# Lines of about 40 characters (the font's height follows the display's scale).
+	$panel.Controls.Add((New-Object System.Windows.Forms.Label -Property @{ Text = $message; AutoSize = $true
+		MaximumSize = (New-Object System.Drawing.Size ($form.Font.Height * 30), 0) }))
+	$check = New-Object System.Windows.Forms.CheckBox -Property @{ Text = $checkbox; AutoSize = $true; Visible = [bool]$checkbox }
+	$panel.Controls.Add($check)
+	$row = New-Object System.Windows.Forms.FlowLayoutPanel -Property @{ AutoSize = $true }
+	for ($i = 0; $i -lt $choices.Count; $i++) {
+		$button = New-Object System.Windows.Forms.Button -Property @{ Text = $choices[$i]; Tag = $i; AutoSize = $true; Padding = (New-Object System.Windows.Forms.Padding 8, 4, 8, 4) }
+		$button.Add_Click({ $form.Tag = $this.Tag; $form.Close() })
+		$row.Controls.Add($button)
+	}
+	$panel.Controls.Add($row)
+	$form.Controls.Add($panel)
+	[void]$form.ShowDialog()
+	return $form.Tag, $check.Checked
+}
+
+# The game: -Game, else the last one given, else the default folder; a folder dialog when that has
+# no eboot.bin (a portable package started by double-clicking run.cmd).
+$gameFile = "$PSScriptRoot\game-path.txt"
+$remember = [bool]$Game
+if (!$Game -and (Test-Path $gameFile)) { $Game = (Get-Content $gameFile -Raw).Trim() }
+if (!$Game) { $Game = "$env:USERPROFILE\Documents\PPSA01341-app0" }
+if ($Prompt -or (!$remember -and !(Test-Path "$Game\eboot.bin"))) { Initialize-Dialogs }
+if (!$remember -and !(Test-Path "$Game\eboot.bin")) {
+	$dialog = New-Object System.Windows.Forms.FolderBrowserDialog -Property @{ Description = '选择游戏文件夹（里面有 eboot.bin 和 sce_sys）' }
+	if ($dialog.ShowDialog() -eq 'OK') { $Game = $dialog.SelectedPath; $remember = $true }
+}
 if (!(Test-Path "$Game\eboot.bin")) { throw "no eboot.bin in $Game" }
+if ($remember) { Set-Content $gameFile $Game -Encoding UTF8 }
+# Its title and version (sce_sys\param.json): the emulator is tested with one of them.
+$testedVersion = 'PPSA01341 01.007.000'
+$param = if (Test-Path "$Game\sce_sys\param.json") { Get-Content "$Game\sce_sys\param.json" -Raw -Encoding UTF8 | ConvertFrom-Json }
+$titleId = if ($param) { $param.titleId } else { '' }
+$version = if ($param) { "$titleId $($param.contentVersion)" } else { 'unknown' }
+$titleName = if ($param) { $param.localizedParameters.($param.localizedParameters.defaultLanguage).titleName }
+$tested = $version -eq $testedVersion
 
 $launch = Get-Content $Config -Raw | ConvertFrom-Json
 
@@ -94,19 +155,21 @@ if (!$Baseline) {
 	}
 }
 
-# CPU affinity of the Linux config (it also leaves CPUs 4 and 5 out).
+# CPU affinity: -Affinity, else the config's list (this PC's leaves CPUs 4 and 5 out), else every
+# CPU; only CPUs this PC has.
+$all = if ([Environment]::ProcessorCount -ge 64) { [int64]-1 } else { ([int64]1 -shl [Environment]::ProcessorCount) - 1 }
 $mask = [int64]0
-foreach ($cpu in $launch.cpu_affinity) { $mask = $mask -bor ([int64]1 -shl [int]$cpu) }
-if ($mask -eq 0) { $mask = [int64]0xFFFFCF }
+if ($Affinity) { $mask = [Convert]::ToInt64(($Affinity -replace '^0x'), 16) } else { foreach ($cpu in $launch.cpu_affinity) { $mask = $mask -bor ([int64]1 -shl [int]$cpu) } }
+$mask = $mask -band $all
+if ($mask -eq 0) { $mask = $all }
 $cpus = 0
 for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $cpus++ } }
 
-# The render thread on the recording worker's P-cores (without CPU 0, which takes most
-# interrupts on Windows): +2.5% over free placement in the fixed scene. Pinning it to CPU 0
-# alone, as on Linux, halved the frame rate here.
-if (!$environment.Contains('KYTY_RENDER_CPUS')) {
-	$renderCpus = if ($environment.Contains('KYTY_RECORDING_CPUS')) { $environment['KYTY_RECORDING_CPUS'] } else { '1,2,3,6,7' }
-	$environment['KYTY_RENDER_CPUS'] = $renderCpus
+# The render thread on the recording worker's CPUs (this PC's P-cores without CPU 0, which takes
+# most interrupts on Windows): +2.5% over free placement in the fixed scene. Pinning it to CPU 0
+# alone, as on Linux, halved the frame rate here. A config without them leaves both to Windows.
+if (!$environment.Contains('KYTY_RENDER_CPUS') -and $environment.Contains('KYTY_RECORDING_CPUS')) {
+	$environment['KYTY_RENDER_CPUS'] = $environment['KYTY_RECORDING_CPUS']
 }
 
 # Image staging copies on the upload worker too (KYTY_ASYNC_UPLOAD=2): streamed textures were
@@ -153,22 +216,91 @@ foreach ($pair in ($Set | ForEach-Object { $_ -split ',(?=[A-Za-z_][A-Za-z0-9_]*
 }
 
 $quoted = @('--game', "`"$Game`"") + ($options | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } })
-$logDir = "$PSScriptRoot\_Build\run-logs"
+$logDir = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\run-logs" } else { "$PSScriptRoot\logs" }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+Write-Host "game:     $(if ($titleName) { "$titleName, " })$version$(if (!$tested) { " (untested: the emulator is tested with $testedVersion)" })"
 Write-Host "config:   $Config$(if ($Baseline) { ' (baseline: no switches)' })$(if ($Precompile) { ' (precompile)' })"
 Write-Host ("affinity: 0x{0:X} ({1} CPUs)" -f $mask, $cpus)
 Write-Host "switches: $($environment.Count)"
 Write-Host "command:  $Exe $($quoted -join ' ')"
 if ($DryRun) { $environment.GetEnumerator() | ForEach-Object { "  $($_.Key)=$($_.Value)" }; return }
 
+# Shaders, from the seed file (every shader of the game) by the precompile program: the shader
+# prefetch's inputs for this GPU and driver (_PipelineCache\static\<title>.shaders; new shaders are
+# then translated in the background while playing), made when they are missing or stale (the first
+# launch, a driver update: half a minute on 22 CPUs); and the static pipeline cache, the whole game
+# compiled ahead by precompile-windows.ps1 (44 minutes on 22 CPUs), offered by -Prompt.
+$tool = Join-Path (Split-Path $Exe) 'kyty_shader_precompile.exe'
+$seeds = @("$PSScriptRoot\seeds.seeds", "$PSScriptRoot\_Build\static-precompile\seeds.seeds") | Where-Object { Test-Path $_ } | Select-Object -First 1
+$shaders = !$Precompile -and $seeds -and (Test-Path $tool)
+# The precompile program on the launch's CPUs, its output in the console or a file: its exit code.
+function Invoke-Tool([string[]]$arguments, [string]$output = '') {
+	$parameters = @{ FilePath = $tool; WorkingDirectory = $PSScriptRoot; NoNewWindow = $true; PassThru = $true
+		ArgumentList = @('--game', "`"$Game`"", '--seeds', "`"$seeds`"") + $arguments }
+	if ($output) { $parameters['RedirectStandardOutput'] = $output }
+	$process = Start-Process @parameters
+	$null = $process.Handle # keeps the exit code readable
+	if ($mask -ne $all) { $process.ProcessorAffinity = [IntPtr]$mask }
+	$process.WaitForExit()
+	return $process.ExitCode
+}
+$inputsReady = $cacheReady = $false
+if ($shaders) {
+	$statusFile = [IO.Path]::GetTempFileName()
+	$shaders = (Invoke-Tool @('--status') $statusFile) -eq 0
+	$status = Get-Content $statusFile -Raw
+	Remove-Item $statusFile
+	$inputsReady = $status -match 'inputs current'
+	# A precompile that stopped before its last merge keeps its shards' checkpoints (small ones stay
+	# behind after a merge).
+	$cacheReady = $status -match 'static cache current' -and
+		!(Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.bin.shard*" -ErrorAction SilentlyContinue | Where-Object Length -gt 1MB)
+	Write-Host "shaders:  prefetch inputs $(if ($inputsReady) { 'ready' } else { 'to be made' }), static pipeline cache $(if ($cacheReady) { 'ready' } else { 'not made (precompile-windows.ps1)' })"
+}
+
+# -Prompt: the game version and the precompile, before anything starts.
+$noPrompt = "$PSScriptRoot\no-precompile-prompt.txt"
+$offer = $shaders -and !$cacheReady -and !(Test-Path $noPrompt)
+if ($Prompt -and ($offer -or !$tested)) {
+	$info = "游戏：$(if ($titleName) { $titleName } else { '未知' })（$version）"
+	$info += if ($tested) { '，已测试的版本。' } else { "`n⚠ 这个版本没有测试过（测试用的是 $testedVersion），可能无法运行或出错。" }
+	if ($offer) {
+		$minutes = [math]::Ceiling(44 * 22 / $cpus / 10) * 10
+		$time = if ($minutes -lt 90) { "约 $minutes 分钟" } else { '约 {0:N1} 小时' -f ($minutes / 60) }
+		$message = "$info`n`n着色器还没有为这块显卡预编译：游戏里第一次出现的场景和特效会卡顿（零点几秒到几秒）。`n" +
+			"预编译会把整个游戏的着色器一次编好，这台电脑$time（CPU 满载；关掉窗口可中断，下次接着编）。" +
+			"只需做一次，更新显卡驱动后要重做。"
+		$choice, $never = Show-Choice $message @('先预编译，完成后开始游戏', '直接开始游戏', '退出') '以后不再提示预编译'
+		if ($never) { Set-Content $noPrompt 'run-windows.ps1 -Prompt: no precompile dialog (delete this file to get it back)' }
+		if ($choice -ne 0 -and $choice -ne 1) { Write-Host 'cancelled'; return }
+		if ($choice -eq 0) {
+			try {
+				& "$PSScriptRoot\precompile-windows.ps1" -Game $Game -Affinity $mask
+				$inputsReady = $true # the full run ends with them
+			} catch {
+				Write-Host "预编译失败（$($_.Exception.Message)），游戏照常启动"
+			}
+		}
+	} else {
+		$choice, $never = Show-Choice $info @('开始游戏', '退出')
+		if ($choice -ne 0) { Write-Host 'cancelled'; return }
+	}
+}
+if ($shaders -and !$inputsReady) {
+	Write-Host '着色器：为这块显卡生成后台准备用的输入（第一次运行或更新显卡驱动后，约一分钟）'
+	if ((Invoke-Tool @('--no-pipelines', '--static-inputs', '--threads', "$cpus")) -ne 0) {
+		Write-Host '着色器：生成失败，这次没有后台着色器准备'
+	}
+}
+
 foreach ($entry in $environment.GetEnumerator()) { Set-Item "env:$($entry.Key)" $entry.Value }
 New-Item -ItemType Directory -Force $logDir | Out-Null
 $out = "$logDir\$stamp.out.log"
 $process = Start-Process -FilePath $Exe -ArgumentList $quoted -WorkingDirectory $PSScriptRoot -PassThru `
 	-RedirectStandardOutput $out -RedirectStandardError "$logDir\$stamp.err.log"
-$process.ProcessorAffinity = [IntPtr]$mask
+if ($mask -ne $all) { $process.ProcessorAffinity = [IntPtr]$mask }
 $null = $process.Handle # keeps the exit code readable after the process ends
-Write-Host "pid $($process.Id); logs: _Build\run-logs\$stamp.*.log"
+Write-Host "pid $($process.Id); logs: $($logDir.Substring($PSScriptRoot.Length + 1))\$stamp.*.log"
 if (!$Precompile) { return }
 
 # Precompile: follow the warmup progress until the emulator exits.
