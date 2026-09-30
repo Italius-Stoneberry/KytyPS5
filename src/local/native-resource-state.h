@@ -47,6 +47,10 @@ extern volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode;
 extern volatile std::atomic<uint32_t> kyty_local_image_granules_mode;
 // 1: cached texture resolutions survive registrations away from their range (textureCache.cpp).
 extern volatile std::atomic<uint32_t> kyty_local_texture_resolve_pages_mode;
+// 1: CPU writes into large images release and re-upload only the written part (textureCache.cpp);
+// 2: also checks every partial upload against guest data hashes of the untouched part.
+extern volatile std::atomic<uint32_t> kyty_local_partial_image_dirty_mode;
+extern volatile std::atomic<uint32_t> kyty_local_partial_row_bands_mode;
 // 1: write protection after uploads runs on the upload worker (memoryTracker.h).
 extern volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode;
 // 1: guest readbacks narrow a window that meets an image to the request's pages (bufferCache.cpp).

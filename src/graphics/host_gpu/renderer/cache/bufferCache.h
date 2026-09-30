@@ -74,6 +74,16 @@ public:
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// Guest ranges staged one after another in one staging allocation of `total` bytes, each
+	// at its `offset`. Returns nullptr (nothing staged) when a range starts in a cached buffer
+	// or holds GPU-written pages: the caller then uploads the whole image instead.
+	struct StagingPiece {
+		uint64_t vaddr  = 0;
+		uint64_t size   = 0;
+		uint64_t offset = 0;
+	};
+	[[nodiscard]] std::pair<Buffer*, uint64_t> StageImagePieces(const std::vector<StagingPiece>& pieces,
+	                                                            uint64_t total);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
@@ -216,12 +226,21 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
+	// ObtainBufferForImage (KYTY_ASYNC_UPLOAD=2): the backing pieces of an image upload.
+	std::vector<std::pair<const uint8_t*, uint64_t>>  m_backing_pieces;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_host_shader_upload;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	GpuResourceManager*                               m_resources = nullptr;
+
+public:
+	// The guest range is mapped for the GPU (not unmapped since): deferred work checks this
+	// before it creates buffers over ranges recorded earlier.
+	[[nodiscard]] bool IsGpuMapped(uint64_t vaddr, uint64_t size) const noexcept;
+
+private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
@@ -254,6 +273,7 @@ private:
 	std::array<std::unique_ptr<Buffer>, GuestReadbackSlots> m_verify_downloads {};
 	void VerifyReadback(uint64_t address, const uint8_t* fast, const uint8_t* reference, uint64_t size,
 	                    const char* path, uint64_t waited);
+
 	// Last member: destroyed (queue idle) before the buffers its copies use.
 	std::unique_ptr<ReadbackQueue::Queue> m_readback_queue;
 };

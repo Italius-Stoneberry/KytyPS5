@@ -59,6 +59,9 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 TileManager::~TileManager() {
+	for (const auto& pooled: m_scratch_pool) {
+		vmaDestroyBuffer(m_graphics.allocator, pooled.buffer, pooled.allocation);
+	}
 	for (auto pipeline: m_pipelines) {
 		if (pipeline != nullptr) {
 			m_graphics.device.destroyPipeline(pipeline, nullptr);
@@ -87,10 +90,28 @@ TileManager::~TileManager() {
 	}
 }
 
+// Scratch capacities are powers of two from 64 KiB, so buffers of similar requests are reused.
+static uint64_t ScratchCapacity(uint64_t size) {
+	return std::max<uint64_t>(uint64_t {1} << 16u, std::bit_ceil(size));
+}
+static constexpr uint64_t ScratchPoolBudget = 512ull << 20u;
+
 TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	EXIT_IF(size == 0);
+	const auto capacity = ScratchCapacity(size);
+	{
+		std::scoped_lock lock(m_scratch_mutex);
+		const auto it = std::ranges::find(m_scratch_pool, capacity, &PooledScratch::capacity);
+		if (it != m_scratch_pool.end()) {
+			const Scratch reused {it->buffer, it->allocation, size};
+			m_scratch_pool_bytes -= it->capacity;
+			*it = m_scratch_pool.back();
+			m_scratch_pool.pop_back();
+			return reused;
+		}
+	}
 	vk::BufferCreateInfo create {};
-	create.size  = size;
+	create.size  = capacity;
 	create.usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
 	               vk::BufferUsageFlagBits::eTransferDst;
 
@@ -105,10 +126,21 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	return {buffer, memory, size};
 }
 
+// Once the GPU is done with the current work the buffer goes back to the pool (or, past its
+// budget, is freed).
 void TileManager::DeferDestroy(Scratch scratch) {
-	auto allocator = m_graphics.allocator;
-	m_scheduler.DeferOperation(
-	    [allocator, scratch] { vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation); });
+	m_scheduler.DeferOperation([this, scratch] {
+		const auto capacity = ScratchCapacity(scratch.size);
+		{
+			std::scoped_lock lock(m_scratch_mutex);
+			if (m_scratch_pool_bytes + capacity <= ScratchPoolBudget) {
+				m_scratch_pool.push_back({scratch.buffer, scratch.allocation, capacity});
+				m_scratch_pool_bytes += capacity;
+				return;
+			}
+		}
+		vmaDestroyBuffer(m_graphics.allocator, scratch.buffer, scratch.allocation);
+	});
 }
 
 void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,

@@ -19,6 +19,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
@@ -64,6 +65,8 @@ struct ShaderBinaryInfo {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+// Bumped on every registration: invalidates the per-thread last lookup below.
+static std::atomic<uint64_t> g_shader_map_generation {0};
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -77,6 +80,7 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	(*g_shader_map)[addr] = data;
+	g_shader_map_generation.fetch_add(1, std::memory_order_release);
 }
 
 bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out) {
@@ -91,9 +95,24 @@ bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out) {
 static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
+	// The thread's last lookups: draws repeat their stages' shaders (vertex, GS back half,
+	// pixel) and dispatches the previous compute shader most of the time.
+	struct Recent {
+		uint64_t         addr = 0, generation = UINT64_MAX;
+		ShaderMappedData data {};
+	};
+	thread_local std::array<Recent, 4> recent {};
+	thread_local uint32_t              next_slot = 0;
+	const auto generation = g_shader_map_generation.load(std::memory_order_acquire);
+	for (const auto& entry: recent) {
+		if (entry.addr == addr && entry.generation == generation) return entry.data;
+	}
+
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+		recent[next_slot] = {addr, generation, iter->second};
+		next_slot         = (next_slot + 1) % recent.size();
 		return iter->second;
 	}
 
@@ -131,9 +150,10 @@ static uint64_t HashShaderCode(std::span<const uint32_t> code) {
 	return XXH3_64bits(code.data(), code.size_bytes());
 }
 
-static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
-	                                std::span<const uint32_t> user_data,
-	                                const ShaderMappedData& data) {
+// Fills `params` in place: its user-data vector keeps its capacity across calls.
+static void FillShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
+                             std::span<const uint32_t> user_data, const ShaderMappedData& data,
+                             ShaderParams& params) {
 	if (data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) {
 		EXIT("%s hash=0x%016" PRIx64 " shader=0x%016" PRIx64
 		     " has invalid AGC shader_size=0x%08" PRIx32 "\n",
@@ -141,11 +161,18 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	}
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
-	return {
-	    .code      = code,
-	    .user_data = std::vector<uint32_t>(user_data.begin(), user_data.end()),
-	    .hash      = declared_hash != 0 ? declared_hash : HashShaderCode(code),
-	};
+	params.code = code;
+	params.user_data.assign(user_data.begin(), user_data.end());
+	params.hash      = declared_hash != 0 ? declared_hash : HashShaderCode(code);
+	params.back_code = {};
+}
+
+static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
+                                    std::span<const uint32_t> user_data,
+                                    const ShaderMappedData& data) {
+	ShaderParams params;
+	FillShaderParams(shader_addr, label, declared_hash, user_data, data, params);
+	return params;
 }
 
 #if 0
@@ -244,7 +271,7 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 	EXIT_NOT_IMPLEMENTED(ps.rsrc2.wave_cnt_en != false);
 	if (ps.rsrc2.extra_lds_size != 0) {
 		static std::atomic_uint log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		if (log_count.load(std::memory_order_relaxed) < 32 && log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("\t PS extra LDS reservation = 0x%02" PRIx8 ", continuing\n",
 			     ps.rsrc2.extra_lds_size);
 		}
@@ -255,7 +282,7 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 	if (sh.shader_z_format != 0x00000000 && sh.shader_z_format != 0x00000001 &&
 	    !sh.db_shader_control.shader_z_export_enable) {
 		static std::atomic_uint log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		if (log_count.load(std::memory_order_relaxed) < 32 && log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("\t shader_z_format = 0x%08" PRIx32
 			     " with z export disabled, ignoring depth export format\n",
 			     sh.shader_z_format);
@@ -280,7 +307,7 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 	EXIT_NOT_IMPLEMENTED((sh.baryc_cntl & baryc_persp_mask) != 0);
 	if ((sh.ps_input_ena & ps_input_linear_center) == 0 && (sh.baryc_cntl & baryc_linear_mask) != 0) {
 		static std::atomic_uint log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		if (log_count.load(std::memory_order_relaxed) < 32 && log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("\t ignoring inactive linear SPI_BARYC_CNTL bits: 0x%08" PRIx32 "\n",
 			     sh.baryc_cntl & baryc_linear_mask);
 		}
@@ -307,7 +334,7 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 
 	if (sh.db_shader_control.other_bits != 0x00000000) {
 		static std::atomic_uint log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		if (log_count.load(std::memory_order_relaxed) < 32 && log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("\t temporary: ignoring unsupported DB_SHADER_CONTROL bits 0x%08" PRIx32 "\n",
 			     sh.db_shader_control.other_bits);
 		}
@@ -429,8 +456,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 		if (fetch_index != 0) {
 			static std::atomic<uint64_t> log_count = 0;
-			auto                         log_id    = log_count.fetch_add(1);
-			if (log_id < 64) {
+			const bool log_this = log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64;
+			if (log_this) {
 				LOGF("\t temporary: PS5 vertex attrib semantic %u uses fetch index %u, buffer "
 				     "index %zu\n",
 				     static_cast<uint32_t>(in.semantic), fetch_index, index);
@@ -458,8 +485,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			const auto                   buffer_format = format_raw >> 2u;
 			const auto                   channels      = (format_raw & 3u) + 1u;
 			static std::atomic<uint64_t> log_count      = 0;
-			auto                         log_id         = log_count.fetch_add(1);
-			if (log_id < 64) {
+			const bool log_this = log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64;
+			if (log_this) {
 				LOGF("\t PS5 vertex attrib semantic %u uses attrib format %u -> buffer "
 				     "format %u, offset %u, buffer index %zu\n",
 				     static_cast<uint32_t>(in.semantic), static_cast<uint32_t>(format),
@@ -768,17 +795,25 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
-	const auto& sh     = context.GetShaderRegisters();
-	const auto data = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
-	auto        params = GetShaderParams(
-	    regs.es_regs.data_addr, "ShaderRecompiler VS",
-	    GetDeclaredShaderHash(regs.es_regs.data_addr),
-	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data);
+	ShaderParams params;
+	PrepareProgramInto(regs, context, user_config, info, params);
+	return params;
+}
+
+void PrepareProgramInto(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                        const HW::UserConfig& user_config, ShaderVertexInputInfo& info,
+                        ShaderParams& params) {
+	const auto& sh   = context.GetShaderRegisters();
+	const auto  data = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
+	FillShaderParams(regs.es_regs.data_addr, "ShaderRecompiler VS",
+	                 GetDeclaredShaderHash(regs.es_regs.data_addr),
+	                 std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
+	                 params);
 	if ((context.GetShaderStages() & 0x20u) == 0) {
 		if (!ShaderGetStaticInputInfoVS(regs, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
 		}
-		return params;
+		return;
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
 	// its user-data pointer in s0:s1.
@@ -828,27 +863,43 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	mesh.threads_num[0] =
 	    ((mesh.max_vertices + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
-	return params;
 }
 
 ShaderParams PrepareProgram(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               ps_info) {
+	ShaderParams params;
+	PrepareProgramInto(regs, sh, target_export_mapping, ps_info, params);
+	return params;
+}
+
+void PrepareProgramInto(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+                        std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+                        ShaderPixelInputInfo& ps_info, ShaderParams& params) {
 	const auto data = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
-	return GetShaderParams(
-	    regs.ps_regs.data_addr, "ShaderRecompiler PS", GetDeclaredShaderHash(regs.ps_regs.data_addr),
-	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
+	FillShaderParams(regs.ps_regs.data_addr, "ShaderRecompiler PS",
+	                 GetDeclaredShaderHash(regs.ps_regs.data_addr),
+	                 std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data,
+	                 params);
 }
 
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                             ShaderComputeInputInfo& info) {
+	ShaderParams params;
+	PrepareProgramInto(regs, sh, info, params);
+	return params;
+}
+
+void PrepareProgramInto(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+                        ShaderComputeInputInfo& info, ShaderParams& params) {
 	const auto data = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, sh, data, info);
-	return GetShaderParams(
-	    regs.cs_regs.data_addr, "ShaderRecompiler CS", GetDeclaredShaderHash(regs.cs_regs.data_addr),
-	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
+	FillShaderParams(regs.cs_regs.data_addr, "ShaderRecompiler CS",
+	                 GetDeclaredShaderHash(regs.cs_regs.data_addr),
+	                 std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data,
+	                 params);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

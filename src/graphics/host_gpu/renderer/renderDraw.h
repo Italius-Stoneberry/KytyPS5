@@ -30,6 +30,9 @@ struct DrawEmitInfo {
 	std::span<const vk::DrawIndexedIndirectCommand> direct_run;
 	uint64_t run_mapping_epoch = 0, run_alias_epoch = 0;
 	bool     indexed = false;
+	// The offsets below come from the draw state (a direct DrawIndex), not from draw arguments:
+	// a native record stores them for its direct draws.
+	bool     state_offsets = false;
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex = 0;
 	uint32_t first_instance = 0;

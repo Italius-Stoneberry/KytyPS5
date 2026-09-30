@@ -21,11 +21,11 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
-#include "debug-delay.h"
 #include "live-trace.h"
 #include "live-trace-gpu.h"
 #include "live-census.h"
 #include "draw-state-observer.h"
+#include "frame-capture.h"
 #include "live-control.h"
 #include "performance-switches.h"
 #include "xpr-capture.h"
@@ -55,9 +55,6 @@ extern "C" {
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode {0};
 // 1: a full barrier with no recorded work since the previous one is skipped.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_global_barrier_dedupe {0};
-// Causal probe (debug-delay.h): ns spun per call at the sites in the mask. 0 = off.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_debug_delay_ns {0};
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_debug_delay_site {0};
 }
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
@@ -288,6 +285,8 @@ void CommandProcessor::Reset() {
 	m_dispatch_indirect_args_base_addr = 0;
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
+	// Every register changed: the native path's clean-draw shadow no longer matches.
+	DrawStateObserver::Invalidate();
 }
 
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
@@ -542,6 +541,7 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	LiveTrace::g_mark_thread = true;
 	InitializePerformanceSwitches();
 	LiveControl::Start();
 	XprCapture::Initialize();
@@ -743,6 +743,7 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		}
 		case SubmissionType::FlipPreparation:
+			m_renderer.GetGpuResources().AdvanceFrame();
 			m_renderer.GetGpuResources().RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
@@ -855,7 +856,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 #endif
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
 			static std::atomic<uint32_t> skip_log_count {0};
-			if (skip_log_count.fetch_add(1) < 2048) {
+			if (skip_log_count.load(std::memory_order_relaxed) < 2048 && skip_log_count.fetch_add(1, std::memory_order_relaxed) < 2048) {
 				LOGF("\t predicated skip: op=0x%02" PRIx32 ", r=0x%02" PRIx32 ", len=%" PRIu32
 				     ", packet=0x%016" PRIx64 ", cmd_id=0x%08" PRIx32 "\n",
 				     opcode, KYTY_PM4_R(packet_header), packet_dw,
@@ -864,7 +865,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			if (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_RELEASE_MEM &&
 			    packet_dw >= 7) {
 				static std::atomic<uint32_t> log_count {0};
-				if (log_count.fetch_add(1) < 128) {
+				if (log_count.load(std::memory_order_relaxed) < 128 && log_count.fetch_add(1, std::memory_order_relaxed) < 128) {
 					const auto dst = packet[3] | (static_cast<uint64_t>(packet[4]) << 32u);
 					const auto val = packet[5] | (static_cast<uint64_t>(packet[6]) << 32u);
 					LOGF("\t predicated skip: R_RELEASE_MEM dst=0x%016" PRIx64
@@ -879,7 +880,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
-		LiveCounters::g_pm4[opcode].fetch_add(1, std::memory_order_relaxed);
+		LiveCounters::AddPm4(opcode);
 		if (XprCapture::Enabled()) {
 			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT) {
 				XprCapture::ObserveDraw(m_draw_indirect_args_base_addr + packet[1]);
@@ -909,6 +910,25 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				    TryNativeXprDraws({packet, remaining_dw}, DrawStateObserver::g_shadow.last_clean);
 				if (consumed) {
 					m_draw_run_skip = 0;
+					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
+					execution.m_made_progress = true;
+					continue;
+				}
+				auto& executor            = m_renderer.GetRenderExecutor();
+				native_store_end.executor = &executor;
+				if (auto* log = executor.NativeXprReadLog()) {
+					native_reads.emplace(
+					    [](void* userdata, uint64_t address, uint64_t size) {
+						    static_cast<std::vector<std::pair<uint64_t, uint64_t>>*>(userdata)->emplace_back(
+						        address, size);
+					    },
+					    log);
+				}
+			} else if ((packet_header == 0xc0042700u || packet_header == 0xc0033500u) &&
+			           !GraphicsRunDebugDumpEnabled()) {
+				// Direct indexed draws from the same records (the normal path stores them).
+				const auto consumed = TryNativeDirectDraw({packet, remaining_dw});
+				if (consumed) {
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 					execution.m_made_progress = true;
 					continue;
@@ -1019,7 +1039,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
 			}
 			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 128) {
+			if (log_count.load(std::memory_order_relaxed) < 128 && log_count.fetch_add(1, std::memory_order_relaxed) < 128) {
 				LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
 				     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
 				     reinterpret_cast<uint64_t>(address), value, condition,
@@ -1063,10 +1083,13 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 0);
 	LiveTrace::MarkAfter gpu_mark {[&] { return GetScheduler().Current().RawHandle(); }, LiveTrace::MarkNativeXpr,
 	                               m_sh_ctx.GetPs().ps_regs.data_addr};
-	DebugDelay::At(DebugDelay::NativeXpr);
 	LiveCounters::g_last_dispatch_shader = 0;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	auto& executor = m_renderer.GetRenderExecutor();
+	if (FrameCapture::Active()) { // a recorded frame sees every draw on the normal path
+		executor.NativeXprForgetState();
+		return 0;
+	}
 	if (packets.size() < 5 || (packets[4] & ~0x20u) != 2u || m_index_type_and_size > 1 ||
 	    !m_index_base_addr || !m_index_buffer_size || !m_draw_indirect_args_base_addr ||
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList) {
@@ -1085,7 +1108,7 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 			break;
 		++count;
 	}
-	std::array<uint64_t, max_draws> commands {};
+	std::array<uint64_t, max_draws> commands; // the first `count` are written, only they are read
 	for (uint32_t i = 0; i < count; ++i) commands[i] = m_draw_indirect_args_base_addr + packets[i * 5u + 1u];
 	CheckBuffer();
 	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
@@ -1102,8 +1125,48 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 #endif
 }
 
+uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet) {
+	LiveCensus::Scope census(LiveCensus::NativeXpr, 1);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (FrameCapture::Active() || XprCapture::Enabled() || m_index_type_and_size > 1 ||
+	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
+		return 0;
+	// What CpOpDrawIndex / CpOpDrawIndexOffset accept (anything else takes them).
+	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
+	uint64_t       index_address = 0;
+	uint32_t       index_count = 0, size = 0;
+	if (packet.size() >= 6 && packet[0] == 0xc0042700u) {
+		index_address = packet[2] | (uint64_t {packet[3]} << 32u);
+		index_count   = packet[4];
+		size          = 6;
+		if (index_count > packet[1] || (packet[5] & ~0x20u) != 0) return 0;
+	} else if (packet.size() >= 5 && packet[0] == 0xc0033500u && m_index_base_addr != 0) {
+		index_address = m_index_base_addr + uint64_t {packet[2]} * element;
+		index_count   = packet[3];
+		size          = 5;
+		if (index_count > packet[1] || (packet[4] & ~0x20u) != 0) return 0;
+	} else {
+		return 0;
+	}
+	// A zero-sized draw draws nothing on the normal path either (it returns first).
+	if (index_count == 0 || index_address == 0 || index_address % element != 0) return 0;
+	CheckBuffer();
+	const RenderExecutor::NativeXprDirectDraw draw {index_address, index_count, m_num_instances};
+	// The state key is hashed again: the observer's chain covers indexed indirect draws only.
+	if (!m_renderer.GetRenderExecutor().NativeXprTry(
+	        CurrentBuffer(), false, {}, index_address, uint64_t {index_count} * element,
+	        m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32, &draw))
+		return 0;
+	return size;
+#else
+	(void)packet;
+	return 0;
+#endif
+}
+
 uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets) {
 	constexpr uint32_t max_draws = 64;
+	if (FrameCapture::Active()) return 0; // one record per draw while a frame is recorded
 	if (m_draw_run_skip) {
 		--m_draw_run_skip;
 		return 0;
@@ -1177,7 +1240,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	        m_draw_indirect_args_base_addr + data_offset,
 	        indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs))) {
 		static std::atomic<uint32_t> sync_fallback_logs {0};
-		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+		if (sync_fallback_logs.load(std::memory_order_relaxed) < 16 && sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
 			LOGF("DrawIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
 			     " (image-owned range, reading guest memory)\n",
 			     m_draw_indirect_args_base_addr + data_offset);
@@ -1190,7 +1253,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		if (args.instance_count != 1u || args.start_vertex_location != 0u ||
 		    args.start_instance_location != 0u) {
 			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 64) {
+			if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 				LOGF("\t warning: partial DrawIndirect args: vertex_count=%" PRIu32
 				     ", instance_count=%" PRIu32 ", start_vertex=%" PRIu32
 				     ", start_instance=%" PRIu32 "\n",
@@ -1211,7 +1274,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	std::memcpy(&args, args_addr, sizeof(args));
 	if (args.base_vertex_location != 0u || args.start_instance_location != 0u) {
 		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 64) {
+		if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 			LOGF("\t warning: partial DrawIndexIndirect args: index_count=%" PRIu32
 			     ", instance_count=%" PRIu32 ", start_index=%" PRIu32 ", base_vertex=%" PRIu32
 			     ", start_instance=%" PRIu32 "\n",
@@ -1236,7 +1299,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	                              : args.index_count_per_instance);
 	if (GraphicsRunDebugDumpEnabled() && index_count != args.index_count_per_instance) {
 		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+		if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 			LOGF("\t DrawIndexIndirect: clamped index_count from %" PRIu32 " to %" PRIu32
 			     " using INDEX_BUFFER_SIZE\n",
 			     args.index_count_per_instance, index_count);
@@ -1264,7 +1327,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(reinterpret_cast<uint64_t>(count_addr),
 		                                                  sizeof(uint32_t))) {
 			static std::atomic<uint32_t> sync_fallback_logs {0};
-			if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			if (sync_fallback_logs.load(std::memory_order_relaxed) < 16 && sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
 				LOGF("DrawIndirectMulti: failed to synchronise the draw count at 0x%016" PRIx64
 				     " (image-owned range, reading guest memory)\n",
 				     reinterpret_cast<uint64_t>(count_addr));
@@ -1286,7 +1349,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	        m_draw_indirect_args_base_addr + data_offset,
 	        static_cast<uint64_t>(draw_count - 1u) * stride_in_bytes + args_size)) {
 		static std::atomic<uint32_t> sync_fallback_logs {0};
-		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+		if (sync_fallback_logs.load(std::memory_order_relaxed) < 16 && sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
 			LOGF("DrawIndirectMulti: failed to synchronise indirect arguments at 0x%016" PRIx64
 			     " (image-owned range, reading guest memory)\n",
 			     m_draw_indirect_args_base_addr + data_offset);
@@ -1302,7 +1365,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			if (args->instance_count != 1u || args->start_vertex_location != 0u ||
 			    args->start_instance_location != 0u) {
 				static std::atomic<uint32_t> log_count {0};
-				if (log_count.fetch_add(1) < 64) {
+				if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 					LOGF("\t warning: partial DrawIndirectMulti args[%u]: vertex_count=%" PRIu32
 					     ", instance_count=%" PRIu32 ", start_vertex=%" PRIu32
 					     ", start_instance=%" PRIu32 "\n",
@@ -1322,7 +1385,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
 		if (args->base_vertex_location != 0u || args->start_instance_location != 0u) {
 			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 64) {
+			if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 				LOGF("\t warning: partial DrawIndexIndirectMulti args[%u]: index_count=%" PRIu32
 				     ", instance_count=%" PRIu32 ", start_index=%" PRIu32 ", base_vertex=%" PRIu32
 				     ", start_instance=%" PRIu32 "\n",
@@ -1349,7 +1412,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		         : args->index_count_per_instance);
 		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
 			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 				LOGF("\t DrawIndexIndirectMulti: clamped index_count from %" PRIu32 " to %" PRIu32
 				     " using INDEX_BUFFER_SIZE\n",
 				     args->index_count_per_instance, index_count);
@@ -1370,7 +1433,6 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
                                       uint32_t thread_group_z, uint32_t mode,
                                       uint64_t indirect_args) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
-	DebugDelay::At(IsAsyncComputeQueue() ? DebugDelay::ComputeDispatch : DebugDelay::GraphicsDispatch);
 
 	uint32_t frame_num = 0;
 	// uint32_t local_x   = 1;
@@ -1382,7 +1444,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		frame_num = m_renderer.GetGpu().GetFrameNum();
 		if (GraphicsRunDebugDumpEnabled()) {
 			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
+			if (log_count.load(std::memory_order_relaxed) < 1024 && log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
 				const auto& cs = m_sh_ctx.GetCs().cs_regs;
 				const auto& oa = m_ucfg.GetGdsOaCounter(m_ucfg.GetGdsOaState().GetIndex());
 				LOGF("QueuePoint DispatchDirect: frame=%u submit=%" PRIu64
@@ -1463,7 +1525,7 @@ void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode
 	}
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
 		static std::atomic<uint32_t> sync_fallback_logs {0};
-		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+		if (sync_fallback_logs.load(std::memory_order_relaxed) < 16 && sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
 			LOGF("DispatchIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
 			     " (image-owned range, reading guest memory)\n",
 			     args_addr);
@@ -1872,6 +1934,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 
 void CommandProcessor::Flip() {
 	LiveControl::Flip();
+	FrameCapture::OnFlip();
 	CheckBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {

@@ -1,5 +1,8 @@
 #include "vulkan-recording.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "live-trace-gpu.h"
+#include "local-platform.h"
+#include "time-census.h"
 
 #include <array>
 #include <atomic>
@@ -7,11 +10,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <limits>
 #include <memory>
 #include <new>
-#include <pthread.h>
-#include <sched.h>
 #include <thread>
 #include <type_traits>
 
@@ -21,6 +23,13 @@ extern "C" {
 volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode {0};
 // 1: queue command-buffer begin/end/submit instead of draining (DeferredSubmitEnabled).
 volatile std::atomic<uint32_t> kyty_local_deferred_submit_mode {0};
+// Pauses the idle worker spins before it blocks (a blocked worker costs the render thread a
+// wake-up system call per publish on Windows).
+#if defined(_WIN32)
+volatile std::atomic<uint32_t> kyty_local_recording_spin {4000};
+#else
+volatile std::atomic<uint32_t> kyty_local_recording_spin {0};
+#endif
 }
 
 namespace LocalVulkanRecording {
@@ -185,6 +194,10 @@ public:
         return false;
     }
     void Flush() { Publish(); }
+    // Packets recorded or published and not yet replayed (a direct call would wait for them).
+    [[nodiscard]] bool Pending() const {
+        return chunks[sequence % ChunkCount].count != 0 || completed.load(std::memory_order_acquire) != sequence;
+    }
     void Drain() {
         Publish();
         if (completed.load(std::memory_order_acquire) == sequence) return;
@@ -198,6 +211,7 @@ private:
     uint64_t sequence = 0;
     alignas(64) std::atomic<uint64_t> published {0};
     alignas(64) std::atomic<uint64_t> completed {0};
+    alignas(64) std::atomic<bool> sleeping {false};
     std::atomic<bool> stopping {false};
     std::thread worker;
 
@@ -209,37 +223,38 @@ private:
         WaitForRoom();
         auto& chunk = chunks[sequence % ChunkCount];
         if (chunk.count == 0) return;
-        published.store(++sequence, std::memory_order_release);
-        published.notify_one();
+        published.store(++sequence, std::memory_order_seq_cst);
+        // Wake the worker only when it said it blocks (both sides seq_cst): a wake-up is a
+        // system call on Windows, and the worker is usually busy or still spinning.
+        if (sleeping.load(std::memory_order_seq_cst)) published.notify_one();
     }
     // The replay thread must not land on an efficiency core: every GPU wait includes its
     // latency.  KYTY_RECORDING_CPUS (e.g. "1,2,3,6,7") restricts it; re-applied now and
     // then because the launcher assigns one mask to every game thread at startup.
     static void KeepAffinity() {
         static const char* const list = std::getenv("KYTY_RECORDING_CPUS");
-        if (!list) return;
-        cpu_set_t wanted;
-        CPU_ZERO(&wanted);
-        for (const char* p = list; *p;) {
-            char* end = nullptr;
-            const long cpu = std::strtol(p, &end, 10);
-            if (end == p) break;
-            if (cpu >= 0 && cpu < CPU_SETSIZE) CPU_SET(cpu, &wanted);
-            p = *end == ',' ? end + 1 : end;
-        }
-        cpu_set_t current;
-        if (pthread_getaffinity_np(pthread_self(), sizeof(current), &current) == 0 && CPU_EQUAL(&current, &wanted)) return;
-        pthread_setaffinity_np(pthread_self(), sizeof(wanted), &wanted);
+        if (list) LocalPlatform::PinThreadToCpuList(list);
     }
     void Run() {
         executing = this;
-        pthread_setname_np(pthread_self(), "Kyty.Record");
+        LocalPlatform::SetThreadName("Kyty.Record");
         KeepAffinity();
         uint64_t current = 0;
         for (;;) {
             if ((current & 4095u) == 0) KeepAffinity();
             for (auto ready = published.load(std::memory_order_acquire); current == ready;
-                 ready = published.load(std::memory_order_acquire)) published.wait(ready, std::memory_order_acquire);
+                 ready = published.load(std::memory_order_acquire)) {
+                const uint32_t spins = kyty_local_recording_spin.load(std::memory_order_relaxed);
+                for (uint32_t spin = 0; spin < spins && ready == current; ++spin) {
+                    _mm_pause();
+                    ready = published.load(std::memory_order_acquire);
+                }
+                if (ready != current) break;
+                sleeping.store(true, std::memory_order_seq_cst);
+                if (published.load(std::memory_order_seq_cst) == current)
+                    published.wait(current, std::memory_order_seq_cst);
+                sleeping.store(false, std::memory_order_relaxed);
+            }
             if (stopping.load(std::memory_order_acquire)) return;
             auto& chunk = chunks[current % ChunkCount];
             for (auto offset = chunk.first; offset != End;) {
@@ -268,8 +283,12 @@ Stream* RecordingStream() {
 void InvalidateRawState() {
     if (executing) executing->state_epoch.fetch_add(1, std::memory_order_relaxed);
 }
-void BeforeDirect() {
-    if (producer) producer->BeforeDirect();
+[[gnu::noinline]] void BeforeDirect() {
+    if (producer) {
+        // Diagnostic (live timecensus, source DirectDrain): direct calls made while packets are pending.
+        if (producer->Pending()) KYTY_TIME_CENSUS(DirectDrain, 0);
+        producer->BeforeDirect();
+    }
 }
 
 std::atomic<uint64_t> g_work_calls {0};
@@ -318,6 +337,20 @@ bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, boo
     });
     if (queued && publish) stream->Flush();
     return queued;
+}
+namespace {
+std::atomic<uint64_t> g_deferred_queued {0};
+std::atomic<uint64_t> g_deferred_done {0};
+} // namespace
+void NoteDeferredSubmitQueued() { g_deferred_queued.fetch_add(1, std::memory_order_release); }
+void NoteDeferredSubmitDone() {
+    g_deferred_done.fetch_add(1, std::memory_order_release);
+    g_deferred_done.notify_all();
+}
+void WaitDeferredSubmits() {
+    const auto target = g_deferred_queued.load(std::memory_order_acquire);
+    for (auto done = g_deferred_done.load(std::memory_order_acquire); done < target;
+         done = g_deferred_done.load(std::memory_order_acquire)) g_deferred_done.wait(done, std::memory_order_acquire);
 }
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments) {
     if (producer) producer->BeforeDirect();

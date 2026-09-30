@@ -6,19 +6,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <sys/syscall.h>
-#include <unistd.h>
+#include "local-platform.h"
+
 #include <x86intrin.h>
 
 namespace LiveTrace {
 
+// Values 3-6 and 15-18 belonged to events no longer recorded; they are not reused.
 enum Type : uint32_t {
 	Submit        = 1,  // a: queue | type << 8, b: dwords
 	GuestDone     = 2,  // a: submitted frame
-	FrontIdle     = 3,  // a: 1 begin / 0 end, b: 0 empty, 1 blocked
-	BackIdle      = 4,  // a: 1 begin / 0 end
-	BackFrame     = 5,  // a: consumed frame
-	Interrupt     = 6,  // a: event id, b: context id
 	EqueueWait    = 7,  // a: 1 begin / 0 end, b: events received
 	FlipSubmit    = 8,  // a: request id
 	FlipComplete  = 9,  // a: request id
@@ -26,14 +23,10 @@ enum Type : uint32_t {
 	GpuSubmit     = 11, // a: tick
 	GpuDone       = 12, // a: tick
 	GuestReadback = 13, // a: 1 begin / 0 end, b: address
-	RenderIdle    = 14, // combined mode: a: 1 begin / 0 end, b: 0 empty, 1 blocked
-	BackItem      = 15, // a: 1 begin / 0 end, b: sequence
-	FrontItem     = 16, // a: sequence, b: queue
-	SemaWait      = 17, // a: 1 begin / 0 end
-	CondWait      = 18, // a: 1 begin / 0 end
+	RenderIdle    = 14, // a: 1 begin / 0 end, b: 0 empty, 1 blocked
 	ReadbackTicks = 19, // a: read address, b: size | tick the copy is recorded in << 32
 	TickDone      = 20, // a: tick the GPU completed (monitor thread)
-	RenderSlice   = 21, // combined mode: a: queue | type << 8 | complete << 16 | begin << 17, b: epoch
+	RenderSlice   = 21, // a: queue | type << 8 | complete << 16 | begin << 17, b: epoch
 	GpuSpan       = 22, // a: tick, b: GPU nanoseconds begin << 32... see GpuSpanNs
 	GpuSpanNs     = 23, // a: GPU begin timestamp (ns), b: GPU end timestamp (ns); follows GpuSpan
 	GpuMark       = 24, // a: mark slot, b: tag (shader address of the draw/dispatch recorded)
@@ -44,6 +37,17 @@ enum Type : uint32_t {
 	RbMismatch    = 29, // a: address, b: size | tick the copy engine waited for << 32 (KYTY_READBACK_QUEUE=3)
 	RbFast        = 30, // a: window address, b: size | tick the copy engine waits for << 32
 	BufferUse     = 31, // a: address, b: size | 1 << 63 when written (every ObtainBuffer, `tracew`)
+	FaultSite     = 32, // a: faulting guest instruction, b: fault address | 1 << 63 for a write (tracked pages)
+	FaultCaller   = 33, // follows FaultSite for host code: a: the qword at the stack top, b: faulting instruction
+	ImageUse      = 34, // a: image address, b: size (low 32 bits) | layout << 32 | 1 << 63 when written (`tracew`)
+	SlowOsCall    = 35, // a: address, b: call << 56 | TSC ticks / 1024 (24 bits) << 32 | size in 4 KiB pages
+	FaultDone     = 36, // the handled fault of the thread's last FaultSite: a: 1 write / 0 read, b: fault address
+};
+
+// SlowOsCall ids: address-space calls that hold the process's memory locks (a page fault anywhere
+// in the process waits for them) and the guest address space's own lock.
+enum OsCall : uint64_t {
+	OsMapView = 1, OsUnmapView = 2, OsProtect = 3, OsFree = 4, OsAlloc = 5, OsUnmapBacking = 6, OsMapBacking = 7,
 };
 
 struct Record {
@@ -87,7 +91,7 @@ inline void Append(uint32_t type, uint64_t a, uint64_t b) {
 }
 
 inline uint32_t ThreadId() {
-	static thread_local uint32_t tid = static_cast<uint32_t>(syscall(SYS_gettid));
+	static thread_local uint32_t tid = LocalPlatform::ThreadId();
 	return tid;
 }
 
@@ -97,6 +101,18 @@ inline void Event(uint32_t type, uint64_t a = 0, uint64_t b = 0) {
 	if (index >= Capacity) return;
 	g_records[index] = {__rdtsc(), ThreadId(), type, a, b};
 }
+
+// Records the call when it took at least ~0.25 ms (and tracing is on).
+struct SlowOsCallScope {
+	uint64_t call, address, size, start;
+	SlowOsCallScope(uint64_t c, uint64_t a, uint64_t s): call(c), address(a), size(s), start(__rdtsc()) {}
+	~SlowOsCallScope() {
+		const uint64_t ticks = __rdtsc() - start;
+		if (ticks < 800000 || !g_on.load(std::memory_order_relaxed)) return;
+		const uint64_t units = std::min<uint64_t>(ticks >> 10u, 0xffffff);
+		Event(SlowOsCall, address, call << 56u | units << 32u | std::min<uint64_t>(size >> 12u, 0xffffffffu));
+	}
+};
 
 // Called by the live thread.
 inline void Dump(const char* path) {

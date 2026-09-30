@@ -59,6 +59,11 @@ endif()
 
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
+if(WIN32)
+	# xbyak.h includes <windows.h> itself; keep its min/max macros away from std::min/std::max.
+	add_compile_definitions(NOMINMAX)
+endif()
+
 include(TestBigEndian)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -176,6 +181,36 @@ endif()
 option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
 config_compiler_and_linker()
+
+if(KYTY_CLANG_CL)
+	# The Linux release is built with -O3 -march=native, ThinLTO and a PGO profile; the same for
+	# Windows Release builds (clang-cl + lld-link + llvm-lib).
+	option(KYTY_NATIVE_OPT "Release: -O3 -march=native" ON)
+	option(KYTY_THIN_LTO "Release: ThinLTO" ON)
+	option(KYTY_PGO_GENERATE "Instrumented build; the live command `pgo <file>` writes the profile" OFF)
+	set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (empty: none)")
+	if(KYTY_NATIVE_OPT)
+		add_compile_options("$<$<CONFIG:Release>:/clang:-O3>" "$<$<CONFIG:Release>:/clang:-march=native>")
+	endif()
+	if(KYTY_THIN_LTO)
+		add_compile_options("$<$<CONFIG:Release>:-flto=thin>")
+		add_link_options("$<$<CONFIG:Release>:/opt:lldltojobs=all>")
+	endif()
+	if(KYTY_PGO_GENERATE)
+		cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH kyty_llvm_bin)
+		file(GLOB kyty_profile_runtime "${kyty_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+		if(NOT kyty_profile_runtime)
+			message(FATAL_ERROR "KYTY_PGO_GENERATE: clang_rt.profile-x86_64.lib not found next to ${CMAKE_CXX_COMPILER}")
+		endif()
+		list(GET kyty_profile_runtime 0 kyty_profile_runtime)
+		add_compile_options(-fprofile-instr-generate)
+		add_compile_definitions(KYTY_PGO_GENERATE=1)
+		link_libraries("${kyty_profile_runtime}")
+	elseif(KYTY_PGO_USE)
+		add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+		                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+	endif()
+endif()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
@@ -324,6 +359,10 @@ list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
+	"${KYTY_SOURCE_DIR}/local/local-platform.h"
+	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
+	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
+	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
@@ -405,6 +444,13 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 add_kyty_full_emulator_test(xpr_replay_tests "${KYTY_TESTS_DIR}/XprReplayTests.cpp")
+# The static shader precompile, a program of its own (src/local/shader-precompile.cpp): the emulator's
+# sources, built like the emulator (the same SPIR-V), with the precompile code of pipelineCache.cpp.
+add_kyty_full_emulator_test(kyty_shader_precompile "${KYTY_SOURCE_DIR}/local/shader-precompile.cpp")
+target_compile_definitions(kyty_shader_precompile PRIVATE KYTY_STATIC_PRECOMPILE=1)
+if (WIN32)
+	target_link_libraries(kyty_shader_precompile opengl32 setupapi ws2_32)
+endif()
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -565,6 +611,7 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
+	find_package(Threads REQUIRED)
 	add_executable(atrac9_initialization_tests EXCLUDE_FROM_ALL tests/Atrac9InitializationTests.cpp)
 	target_link_libraries(atrac9_initialization_tests PRIVATE LibAtrac9 Threads::Threads)
 	add_test(NAME atrac9_initialization COMMAND $<TARGET_FILE:atrac9_initialization_tests>)
@@ -700,6 +747,19 @@ endif()
 target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
 
+# Local frame generation experiments (src/local/frame-gen.cpp): the NVIDIA Streamline SDK when it
+# was unpacked under _Build/deps (never part of the repository). Its DLLs are loaded at run time.
+if (WIN32)
+	set(KYTY_STREAMLINE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/streamline/sdk" CACHE PATH
+	    "NVIDIA Streamline SDK for KYTY_FRAMEGEN (local only)")
+	if (EXISTS "${KYTY_STREAMLINE_SDK}/include/sl.h")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
+		             INCLUDE_DIRECTORIES "${KYTY_STREAMLINE_SDK}/include")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
+		             COMPILE_DEFINITIONS KYTY_FRAMEGEN_STREAMLINE=1)
+	endif()
+endif()
+
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")
 
 include_what_you_use(kyty_emulator "${inc_headers}")
@@ -735,10 +795,10 @@ endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
 
-# Linux x86_64 only: the Vulkan recording worker (KYTY_VULKAN_RECORDING, with the
+# x86_64 Linux and Windows: the Vulkan recording worker (KYTY_VULKAN_RECORDING, with the
 # native XPR draws built on it) and the native resource preparation tests (the
-# ahead-of-time SRT library is loaded with dlopen).
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+# ahead-of-time SRT library is loaded with dlopen on Linux, LoadLibrary on Windows).
+if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	find_package(Python3 REQUIRED COMPONENTS Interpreter)
 	set(recording_generated "${CMAKE_CURRENT_BINARY_DIR}/local-vulkan-recording.inc")
 	set(recording_generator "${KYTY_SOURCE_DIR}/local/generate-vulkan-recording.py")
@@ -749,7 +809,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
 			"${recording_generated}"
 		DEPENDS "${recording_generator}" "${vulkan_registry}" "${vulkan_hpp}"
 		VERBATIM)
-	foreach(recording_target kyty_emulator shader_recompiler_compute_tests xpr_replay_tests)
+	foreach(recording_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests xpr_replay_tests)
 		target_sources(${recording_target} PRIVATE
 			"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
 		target_include_directories(${recording_target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -761,7 +821,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
 	target_include_directories(vulkan_recording_tests PRIVATE ${inc_headers} "${CMAKE_CURRENT_BINARY_DIR}")
 	target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers)
 
-	foreach(native_resource_target kyty_emulator shader_recompiler_compute_tests shader_cfg_tests
+	foreach(native_resource_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests shader_cfg_tests
 			resource_tracking_tests resource_materialization_tests)
 		target_sources(${native_resource_target} PRIVATE "${lod_stats_pack_header}")
 		target_compile_definitions(${native_resource_target} PRIVATE KYTY_LOCAL_NATIVE_RESOURCES=1)
@@ -785,6 +845,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
 			COMMAND shader_recompiler_compute_tests --native-pipeline-index-only)
 		add_test(NAME draw_run_ranges COMMAND shader_recompiler_compute_tests --draw-run-ranges-only)
 		add_test(NAME binding_scratch COMMAND shader_recompiler_compute_tests --binding-scratch-only)
+		add_test(NAME portable_formats_emission COMMAND shader_recompiler_compute_tests --portable-formats-emission-only)
+		add_test(NAME portable_formats COMMAND shader_recompiler_compute_tests --portable-formats-only)
 		add_test(NAME shader_upload_ring COMMAND shader_recompiler_compute_tests --shader-upload-ring-only)
 		add_test(NAME host_backing_read COMMAND shader_recompiler_compute_tests --host-backing-read-only)
 		add_test(NAME buffer_cache_guest_readback

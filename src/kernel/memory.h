@@ -5,6 +5,9 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 class GpuResourceManager;
 enum class PageFaultAccess;
@@ -115,14 +118,23 @@ bool                   TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t
 // The backing bytes of a guest range inside one mapping (readable regardless of the guest
 // range's protection), or null.
 const uint8_t*         TryGetBackingPointer(uint64_t vaddr, uint64_t size);
-bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// The same for a range that spans mappings: one (pointer, bytes) piece per mapping, in order.
+bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
 bool                   TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size);
 // Avoid false-sharing read faults only when exact ownership proves clean.
 bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size);
 bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean);
 bool                   SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// The shader whose resources the GPU thread evaluates (KYTY_SYNC_LOG names it on a drain).
+extern thread_local uint64_t g_srt_shader_hash;
 bool                   IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size);
 // On failure, optionally return a static diagnostic string (no allocation).
+// The mapped parts of a guest range as they are, unmapped parts as zeros (a texture pool span
+// whose memory the game released). False when the backing store is unavailable.
+bool                   TryReadMappedOrZero(uint64_t vaddr, void* data, uint64_t size);
+// A page no GPU watcher holds that still faults on writes: back to the guest's own writable
+// protection. False when the guest itself made the range read-only (or it is unknown).
+bool                   RestoreGuestWritable(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size,
                                          const char** failure_reason = nullptr);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

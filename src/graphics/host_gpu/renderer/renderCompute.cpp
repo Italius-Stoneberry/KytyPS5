@@ -25,7 +25,13 @@
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "frame-capture.h"
+#include "frame-gen.h"
 #include "native-preparation-state.h"
+#include "live-counters.h"
+
+#include <unordered_map>
+#include <xxhash.h>
 #include "xpr-capture.h"
 #include "live-census.h"
 #include "live-counters.h"
@@ -75,13 +81,28 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
+	// Only a written buffer can be consumed as a clear: without one this is always false (and
+	// it ran a texture-cache lookup per buffer on every dispatch).
+	if (std::none_of(program.info.buffers.begin(), program.info.buffers.end(),
+	                 [](const auto& resource) { return resource.written; })) {
+		return false;
+	}
 	auto& cache = buffer.GetContext().GetTextureCache();
+	// Consuming takes ClearMeta of a written buffer, which holds only for a metadata surface
+	// (IsMeta): without one, the read checks and the fill evaluation below cannot change the answer.
+	bool written_meta = false;
+	for (uint32_t i = 0; i < program.info.buffers.size() && !written_meta; i++)
+		written_meta = program.info.buffers[i].written &&
+		               cache.IsMeta(DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]).Base48());
+	if (!written_meta) {
+		return false;
+	}
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 		// A metadata resource that is also read is not proven to be a full overwrite. Execute it
 		// conservatively instead of replacing the dispatch with a coarse full-surface clear.
-		if (cache.IsMeta(descriptor.Base48()) && (!resource.written || resource.read)) {
+		if ((!resource.written || resource.read) && cache.IsMeta(descriptor.Base48())) {
 			return false;
 		}
 	}
@@ -295,10 +316,18 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode,
                                     uint64_t indirect_args) {
+	FrameCapture::Scope frame_capture("Dispatch", true);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
+	if (FrameCapture::Active()) {
+		FrameCapture::g_call.cs_address = sh_ctx.GetCs().cs_regs.data_addr;
+		FrameCapture::g_call.indirect   = indirect_args;
+		FrameCapture::g_call.groups[0]  = thread_group_x;
+		FrameCapture::g_call.groups[1]  = thread_group_y;
+		FrameCapture::g_call.groups[2]  = thread_group_z;
+	}
 	LiveCensus::Scope census(LiveCensus::Dispatch, sh_ctx.GetCs().cs_regs.data_addr, indirect_args != 0);
 	LiveTrace::MarkAfter gpu_mark {[&] { return m_context.GetCommandScheduler().Current().RawHandle(); },
 	                               LiveTrace::MarkDispatch, sh_ctx.GetCs().cs_regs.data_addr};
@@ -368,30 +397,60 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
+	if (LiveCounters::g_dispatch_keys_on.load(std::memory_order_relaxed)) {
+		// Local diagnostic: is a dispatch (shader, user data, groups) repeated from last frame, and
+		// with the same materialized resources? (What a per-object native dispatch record could reuse.)
+		static std::unordered_map<uint64_t, uint64_t> previous, current;
+		static uint32_t                               keys_frame = 0;
+		if (frame_num != keys_frame) {
+			previous.swap(current);
+			current.clear();
+			keys_frame = frame_num;
+		}
+		const uint32_t groups[3] {thread_group_x, thread_group_y, thread_group_z};
+		uint64_t key = XXH3_64bits_withSeed(resources.user_data.data(), resources.user_data.size() * 4u, program.shader_hash);
+		key          = XXH3_64bits_withSeed(groups, sizeof(groups), key ^ indirect_args);
+		uint64_t value = XXH3_64bits(resources.flattened_srt.data(), resources.flattened_srt.size() * 4u);
+		for (const auto* list: {&resources.buffers, &resources.images, &resources.samplers})
+			value = XXH3_64bits_withSeed(list->data(), list->size() * sizeof(ShaderRecompiler::IR::DescriptorValue), value);
+		current[key] = value;
+		const auto found = previous.find(key);
+		LiveCounters::Add(found == previous.end() ? LiveCounters::DispatchKeyNew
+		                  : found->second == value ? LiveCounters::DispatchKeySame
+		                                           : LiveCounters::DispatchKeyChanged);
+	}
+	if (FrameCapture::Active()) {
+		FrameCapture::g_call.cs = program.shader_hash;
+		for (size_t i = 0; i < 3; ++i) FrameCapture::g_call.local[i] = input_info.threads_num[i];
+	}
 	if (indirect_args == 0 && DemonsSouls::TryLinearCopy(input_info, m_context.GetBufferCache(),
 	                                                     thread_group_x, thread_group_y,
 	                                                     thread_group_z, mode)) {
+		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "linear_copy";
 		ResetBindings();
 		return;
 	}
 	if (indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
 	                                                     thread_group_y, thread_group_z, mode)) {
+		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "meta_clear";
 		ResetBindings();
 		return;
 	}
 	if (indirect_args == 0 && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
 	                                                      thread_group_y, thread_group_z, mode)) {
+		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "image_clear";
 		ResetBindings();
 		return;
 	}
-	const auto sampled_images = std::count_if(
-	    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
-	    });
 	const bool                   has_sampler = !program.info.samplers.empty();
 	static std::atomic<uint32_t> dispatch_log_count {0};
-	if ((large_workgroup || has_sampler) &&
+	// The limit is checked before counting: past it, no dispatch pays a locked increment.
+	if ((large_workgroup || has_sampler) && dispatch_log_count.load(std::memory_order_relaxed) < 512 &&
 	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
+		const auto sampled_images = std::count_if(
+		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
+		    });
 		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
@@ -511,6 +570,46 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 7);
 	RebindImages(bindings);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 8);
+	if (FrameGen::Enabled() && program.shader_hash == FrameGen::TaaShader &&
+	    bindings.images.size() > 3) {
+		// TAA inputs (docs/RE-DEMONS-SOULS.md): slot 1 depth, slot 3 motion vectors.
+		FrameGen::OnDispatch(program.shader_hash, bindings.images[1].image_id,
+		                     bindings.images[1].desc.info.data.address, bindings.images[3].image_id,
+		                     bindings.images[3].desc.info.data.address);
+	}
+	if (FrameCapture::Active()) {
+		auto& call     = FrameCapture::g_call;
+		call.prepared  = true;
+		call.indirect  = indirect_args;
+		call.groups[0] = thread_group_x;
+		call.groups[1] = thread_group_y;
+		call.groups[2] = thread_group_z;
+		for (uint32_t i = 0; i < bindings.images.size(); ++i) {
+			auto image = FrameCapture::FromInfo(bindings.images[i].desc.info, FrameCapture::Texture,
+			                                    FrameCapture::StageCs, i);
+			if (i < program.info.images.size()) {
+				image.storage = program.info.images[i].resource_class ==
+				                ShaderRecompiler::IR::ImageResourceClass::Storage;
+				image.written = program.info.images[i].written ? 1 : 0;
+			}
+			call.images.push_back(image);
+		}
+		for (uint32_t i = 0; i < bindings.buffer_sources.size(); ++i) {
+			FrameCapture::Buffer source;
+			source.address = bindings.buffer_sources[i].address;
+			source.size    = bindings.buffer_sources[i].size;
+			source.written = i < program.info.buffers.size() && program.info.buffers[i].written;
+			call.buffers.push_back(source);
+		}
+		if (FrameCapture::WantsData(program.shader_hash)) {
+			FrameCapture::AddWords("cs.user", 0, resources.user_data);
+			FrameCapture::AddWords("cs.srt", 0, resources.flattened_srt);
+			for (uint32_t i = 0; i < bindings.buffer_sources.size(); ++i) {
+				FrameCapture::AddGuest("cs.buf" + std::to_string(i), bindings.buffer_sources[i].address,
+				                       bindings.buffer_sources[i].size);
+			}
+		}
+	}
 	if (XprCapture::Enabled() && XprCapture::IsCullProgram(program.shader_hash)) {
 		for (size_t i = 0; i < program.info.buffers.size(); ++i) {
 			if (program.info.buffers[i].written) {

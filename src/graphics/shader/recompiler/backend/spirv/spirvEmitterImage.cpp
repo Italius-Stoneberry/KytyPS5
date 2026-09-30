@@ -895,11 +895,67 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
 			return value;
 		};
+		auto selected = ConstantU32(state, 0u);
+		if (image.indirect_search_iterations == IR::ImageResource::RuntimeIndirectSearch) {
+			// A portable table: the key mapping's offset from its flattened-SRT word, and the steps
+			// of the unrolled search below in a loop run while the range is non-empty (the same
+			// steps: the unrolled search idles once its range is empty).
+			const auto mapping    = LoadMapping(ConstantU32(state, image.indirect_mapping_offset));
+			const auto count      = LoadMapping(mapping);
+			const auto preheader  = state.builder.AllocateId();
+			const auto header     = state.builder.AllocateId();
+			const auto body       = state.builder.AllocateId();
+			const auto cont       = state.builder.AllocateId();
+			const auto merge      = state.builder.AllocateId();
+			const auto low        = state.builder.AllocateId();
+			const auto high       = state.builder.AllocateId();
+			const auto found      = state.builder.AllocateId();
+			const auto next_low   = state.builder.AllocateId();
+			const auto next_high  = state.builder.AllocateId();
+			const auto next_found = state.builder.AllocateId();
+			state.builder.AddFunction({OpBranch, preheader});
+			EmitLabel(state, preheader);
+			state.builder.AddFunction({OpBranch, header});
+			EmitLabel(state, header);
+			state.builder.AddFunction(
+			    {OpPhi, TypeU32(state), low, ConstantU32(state, 0u), preheader, next_low, cont});
+			state.builder.AddFunction({OpPhi, TypeU32(state), high, count, preheader, next_high, cont});
+			state.builder.AddFunction(
+			    {OpPhi, TypeU32(state), found, ConstantU32(state, 0u), preheader, next_found, cont});
+			const auto active = Binary(state, OpULessThan, TypeBool(state), low, high);
+			state.builder.AddFunction({OpLoopMerge, merge, cont, LoopControlNone});
+			state.builder.AddFunction({OpBranchConditional, active, body, merge});
+			EmitLabel(state, body);
+			const auto mid = Binary(state, OpShiftRightLogical, TypeU32(state),
+			                        Binary(state, OpIAdd, TypeU32(state), low, high), ConstantU32(state, 1u));
+			const auto entry = Binary(
+			    state, OpIAdd, TypeU32(state), mapping,
+			    Binary(state, OpIAdd, TypeU32(state),
+			           Binary(state, OpShiftLeftLogical, TypeU32(state), mid, ConstantU32(state, 1u)),
+			           ConstantU32(state, 1u)));
+			const auto mapped_key = LoadMapping(entry);
+			const auto candidate =
+			    LoadMapping(Binary(state, OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
+			const auto equal = Binary(state, OpIEqual, TypeBool(state), mapped_key, key);
+			state.builder.AddFunction({OpSelect, TypeU32(state), next_found, equal, candidate, found});
+			const auto less = Binary(state, OpULessThan, TypeBool(state), mapped_key, key);
+			state.builder.AddFunction({OpSelect, TypeU32(state), next_low, less,
+			                           Binary(state, OpIAdd, TypeU32(state), mid, ConstantU32(state, 1u)), low});
+			state.builder.AddFunction({OpSelect, TypeU32(state), next_high, less, high, mid});
+			state.builder.AddFunction({OpBranch, cont});
+			EmitLabel(state, cont);
+			state.builder.AddFunction({OpBranch, header});
+			EmitLabel(state, merge);
+			selected = found;
+		}
 		const auto mapping  = ConstantU32(state, image.indirect_mapping_offset);
 		auto       low      = ConstantU32(state, 0u);
-		auto       high     = LoadMapping(mapping);
-		auto       selected = ConstantU32(state, 0u);
-		for (uint32_t iteration = 0; iteration < image.indirect_search_iterations;
+		auto       high     = image.indirect_search_iterations != IR::ImageResource::RuntimeIndirectSearch
+		                          ? LoadMapping(mapping)
+		                          : low;
+		for (uint32_t iteration = 0;
+		     image.indirect_search_iterations != IR::ImageResource::RuntimeIndirectSearch &&
+		     iteration < image.indirect_search_iterations;
 		     iteration++) {
 			const auto active = Binary(state, OpULessThan, TypeBool(state), low, high);
 			const auto mid =

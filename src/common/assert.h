@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 
 #include <cstdlib>
+#include <string>
 #include <string_view>
 
 namespace Common {
@@ -26,6 +27,19 @@ int  DbgExitIfHandler(char const* expr, char const* file, int line);
 int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
+
+// While one is alive, EXIT on this thread throws RecoverableExit instead of ending the process: a
+// precompile tool (PipelineCache::WarmSeeds) compiling inputs the game may never use skips them.
+struct RecoverableExit {
+	std::string message;
+};
+class RecoverableExitScope {
+public:
+	RecoverableExitScope();
+	~RecoverableExitScope();
+	RecoverableExitScope(const RecoverableExitScope&)            = delete;
+	RecoverableExitScope& operator=(const RecoverableExitScope&) = delete;
+};
 
 } // namespace Common
 

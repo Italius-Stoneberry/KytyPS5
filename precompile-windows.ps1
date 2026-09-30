@@ -1,0 +1,78 @@
+# Static shader and pipeline precompile (tools\local\static-precompile), a program of its own:
+#   .\precompile-windows.ps1              every shader and pipeline of the game into the static pipeline
+#                                         cache _PipelineCache\static\<title>.bin, which the emulator looks
+#                                         up before compiling (hours the first time: run it overnight)
+#   .\precompile-windows.ps1 -Jobs 8      with 8 processes (default: 3 threads each on the allowed CPUs)
+#   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
+#                                         tools\local\static-precompile\precompile.py coverage
+# The NVIDIA driver compiles big compute shaders nearly one at a time per process, so the work is split
+# into shards, a below-normal-priority process each (kyty_shader_precompile --shard i/n), whose caches
+# are merged into the static cache at the end. An interrupted run resumes: the shards' checkpoints
+# (every ten minutes) are merged first, and what the static cache holds is not compiled again. Build the
+# program with build-windows.cmd kyty_shader_precompile.
+param(
+	[string]$Game = "$env:USERPROFILE\Documents\PPSA01341-app0",
+	[string]$Seeds = "$PSScriptRoot\_Build\static-precompile\seeds.seeds",
+	[int]$Jobs = 0,
+	[int]$Threads = 3,
+	[int64]$Affinity = 0xFFFFCF, # CPUs 4 and 5 left out: the compiler crashes on them on this machine
+	[switch]$Coverage,
+	[string]$Exe = "$PSScriptRoot\_Build\windows\kyty_shader_precompile.exe"
+)
+$ErrorActionPreference = 'Stop'
+if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd kyty_shader_precompile" }
+if (!(Test-Path "$Game\sce_sys\param.json")) { throw "no sce_sys\param.json in $Game" }
+if (!(Test-Path $Seeds)) {
+	# Every shader the game ships, with the pipelines it draws them with (from the game files).
+	New-Item -ItemType Directory -Force (Split-Path $Seeds) | Out-Null
+	python "$PSScriptRoot\tools\local\static-precompile\precompile.py" --game $Game seeds $Seeds
+	if ($LASTEXITCODE) { throw 'precompile.py seeds failed' }
+}
+$mask = $Affinity -band ([int64][math]::Pow(2, [Environment]::ProcessorCount) - 1)
+$cpus = 0
+for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $cpus++ } }
+# A process scales to a few threads (4: 85%), and each translates the programs its share needs.
+if ($Jobs -le 0) { $Jobs = [math]::Max(1, [math]::Ceiling($cpus / $Threads)) }
+$logs = "$PSScriptRoot\_Build\run-logs"
+New-Item -ItemType Directory -Force $logs | Out-Null
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$begin = Get-Date
+
+function Start-Precompile([string]$name, [string[]]$arguments) {
+	$process = Start-Process -FilePath $Exe -ArgumentList (@('--game', "`"$Game`"") + $arguments) -NoNewWindow -PassThru `
+		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$stamp-precompile-$name.out.log" `
+		-RedirectStandardError "$logs\$stamp-precompile-$name.err.log"
+	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+	$process.ProcessorAffinity = [IntPtr]$mask
+	$null = $process.Handle # keeps the exit code readable after the process ends
+	$process
+}
+function Wait-Precompile([System.Diagnostics.Process[]]$processes, [string]$what) {
+	$shown = Get-Date
+	while (($left = @($processes | Where-Object { !$_.HasExited }).Count)) {
+		Start-Sleep -Seconds 1
+		if (((Get-Date) - $shown).TotalSeconds -lt 60) { continue }
+		$shown = Get-Date
+		Write-Host ("  {0:hh\:mm\:ss} {1}: {2} of {3} running" -f ((Get-Date) - $begin), $what, $left, $processes.Count)
+	}
+	$failed = @($processes | Where-Object { $_.ExitCode -ne 0 }).Count
+	if ($failed) { throw "$what`: $failed process(es) failed; logs: _Build\run-logs\$stamp-precompile-*" }
+}
+
+Write-Host "precompile: $Seeds, $Jobs shards, affinity 0x$('{0:X}' -f $mask); logs _Build\run-logs\$stamp-precompile-*"
+if ($Coverage) {
+	$out = [IO.Path]::ChangeExtension($Seeds, '.compiled.shaders')
+	Wait-Precompile @(Start-Precompile 'coverage' @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$cpus",
+		'--out', "`"$out`"")) 'coverage'
+	Write-Host "wrote $out"
+	return
+}
+# Checkpoints of an interrupted run first: what they hold is not compiled again.
+Wait-Precompile @(Start-Precompile 'merge-before' @('--merge')) 'merge'
+$workers = for ($i = 0; $i -lt $Jobs; $i++) {
+	Start-Precompile "shard$i" @('--seeds', "`"$Seeds`"", '--shard', "$i/$Jobs", '--threads', "$Threads")
+}
+Wait-Precompile $workers 'shards'
+Wait-Precompile @(Start-Precompile 'merge' @('--merge')) 'merge'
+$cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.bin" | Sort-Object LastWriteTime | Select-Object -Last 1
+Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB)" -f ((Get-Date) - $begin), $cache.FullName, ($cache.Length / 1MB))

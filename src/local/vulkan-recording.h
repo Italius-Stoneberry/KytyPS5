@@ -36,6 +36,14 @@ void ReplayInline(ReplayPacket replay, std::span<const Segment> segments);
 // A submit packet is published at once: other threads may wait on its tick.
 bool DeferredSubmitEnabled();
 bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, bool publish);
+// Deferred queue submissions: counted when queued and when the worker has handed them to
+// the driver. WaitDeferredSubmits blocks until every submission queued so far reached the
+// driver (not the GPU). A present must not depend on a signal still in the worker's queue:
+// the Windows driver then blocks inside vkQueuePresentKHR, holding the queue lock the
+// worker needs for that very submission.
+void NoteDeferredSubmitQueued();
+void NoteDeferredSubmitDone();
+void WaitDeferredSubmits();
 uint64_t StateEpoch();
 // Recorded commands that do GPU work or synchronize (draws, dispatches, copies, clears,
 // rendering scopes, barriers): unchanged between two barriers = no work in between.

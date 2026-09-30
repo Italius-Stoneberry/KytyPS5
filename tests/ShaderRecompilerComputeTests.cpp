@@ -54,6 +54,7 @@ extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -120,6 +121,8 @@ extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
 #include <windows.h>
 #undef min
 #undef max
+// winnt.h: MemoryBarrier is __faststorefence, which breaks vk::MemoryBarrier.
+#undef MemoryBarrier
 #endif
 
 namespace Libs::Graphics {
@@ -268,14 +271,14 @@ struct TextureCacheTestAccess {
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
       if (image.registered) {
-        image.tick_accessed_last = cache.m_scheduler.CurrentTick();
+        image.frame_accessed_last = cache.CurrentFrame();
         live.push_back(id);
       }
     });
     for (const auto id : oldest) {
       const auto owner = cache.m_slot_images.try_get(id);
       if (owner != nullptr && owner->registered) {
-        owner->tick_accessed_last = 0;
+        owner->frame_accessed_last = 0;
         owner->lru_id = cache.m_lru_cache.Insert(id, 0);
       }
     }
@@ -1422,7 +1425,8 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
-CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
+CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
+                           bool portable_formats = false) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1466,6 +1470,12 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           ShaderRecompiler::IR::MaterializeResources(
               resource_plan, runtime, resources, specialization),
           "translated resources could not be materialized");
+  if (portable_formats) {
+    Require(test.name, "portable formats",
+            ShaderRecompiler::IR::PortableFormats(translated.program.info,
+                                                    specialization),
+            "fixture did not select runtime format decoding");
+  }
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
   for (const auto &[text, expected] : test.decoded_counts) {
@@ -1548,6 +1558,10 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
             "storage buffer offset is not representable");
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
+  }
+  for (u32 i = 0; i < result.program.bindings.buffer_word_count; i++) {
+    packed_user_data[result.program.bindings.BufferWordDword() + i] =
+        ShaderRecompiler::IR::BufferDescriptorWord(resources.buffers[i]);
   }
   return {std::move(result.spirv), std::move(result.program),
           std::move(resources), std::move(packed_user_data)};
@@ -10690,32 +10704,37 @@ public:
       auto cached_blocks = resolve_block_alias(true);
       cached_blocks = resolve_block_alias(true);
       cached_blocks = resolve_block_alias(true);
+      auto proof_epoch = texture_cache.ResolutionEpoch();
       Require(name, "sampled identity proof",
               texture_cache.TryReuseSampledImage(cached_blocks.image_id, cached_blocks.desc,
-                                                texture_cache.ResolutionEpoch()),
+                                                proof_epoch),
               "ordinary sampled-color identity could not be reused");
       auto rejected_desc = cached_blocks.desc;
       rejected_desc.type = TextureCache::BindingType::Storage;
+      proof_epoch = texture_cache.ResolutionEpoch();
       Require(name, "storage excluded",
               !texture_cache.TryReuseSampledImage(cached_blocks.image_id, rejected_desc,
-                                                 texture_cache.ResolutionEpoch()),
+                                                 proof_epoch),
               "sampled identity proof accepted a storage binding");
       rejected_desc = cached_blocks.desc;
       rejected_desc.info.metadata.kind = ImageMetadataKind::Dcc;
+      proof_epoch = texture_cache.ResolutionEpoch();
       Require(name, "metadata excluded",
               !texture_cache.TryReuseSampledImage(cached_blocks.image_id, rejected_desc,
-                                                 texture_cache.ResolutionEpoch()),
+                                                 proof_epoch),
               "sampled identity proof accepted metadata");
       rejected_desc = cached_blocks.desc;
       ++rejected_desc.info.resources.levels;
+      proof_epoch = texture_cache.ResolutionEpoch();
       Require(name, "subresource shape excluded",
               !texture_cache.TryReuseSampledImage(cached_blocks.image_id, rejected_desc,
-                                                 texture_cache.ResolutionEpoch()),
+                                                 proof_epoch),
               "sampled identity proof accepted a changed resource shape");
       texture_cache.GetImage(cached_blocks.image_id).binding.needs_rebind = true;
+      proof_epoch = texture_cache.ResolutionEpoch();
       Require(name, "pending rebind excluded",
               !texture_cache.TryReuseSampledImage(cached_blocks.image_id, cached_blocks.desc,
-                                                 texture_cache.ResolutionEpoch()),
+                                                 proof_epoch),
               "sampled identity proof ignored pending rediscovery");
       texture_cache.GetImage(cached_blocks.image_id).binding.needs_rebind = false;
       (void)resources.InvalidateMemory(block_alias_address, 0x10000);
@@ -10728,7 +10747,7 @@ public:
                   std::vector<u32>(4, 0x11111111u),
               "cached sampled identity skipped fresh CPU contents");
 
-      const auto before_alias_epoch = texture_cache.ResolutionEpoch();
+      auto before_alias_epoch = texture_cache.ResolutionEpoch();
       const auto alias_info = texture_cache.GetImage(cached_blocks.image_id).info;
       const auto alias = TextureCacheTestAccess::InsertImage(texture_cache, alias_info);
       Require(name, "new compatible owner invalidates prior identity",
@@ -13186,6 +13205,10 @@ public:
 
   std::vector<u32> ReadBuffer(const char *shader_name, const Buffer &buffer,
                               size_t dword_count) {
+    void *data = nullptr;
+    RequireVk(shader_name, "readback",
+              m_device.mapMemory(buffer.memory, 0, VK_WHOLE_SIZE, {}, &data),
+              "vkMapMemory");
     if (!buffer.coherent) {
       vk::MappedMemoryRange range{};
       range.sType = vk::StructureType::eMappedMemoryRange;
@@ -13197,10 +13220,6 @@ public:
                 "vkInvalidateMappedMemoryRanges");
     }
 
-    void *data = nullptr;
-    RequireVk(shader_name, "readback",
-              m_device.mapMemory(buffer.memory, 0, buffer.size, {}, &data),
-              "vkMapMemory");
     std::vector<u32> ret(dword_count, 0);
     std::memcpy(ret.data(), data, dword_count * sizeof(u32));
     m_device.unmapMemory(buffer.memory);
@@ -14904,6 +14923,45 @@ OpFunctionEnd
         };
         compare(family_label("detile bytes").c_str(), cpu, gpu);
 
+        // Row bands (KYTY_PARTIAL_ROW_BANDS): rows of blocks [first, last) detiled as a shorter
+        // surface of the same width starting at the band's first block row must equal those
+        // rows of the whole surface. Render-target and depth blocks XOR the block row's parity
+        // into the in-block offset, so the texture cache keeps them whole (not tested here).
+        const bool bandable =
+            family.family == TileBlockFamily::Standard256B ||
+            family.family == TileBlockFamily::Standard4KB ||
+            family.family == TileBlockFamily::Standard64KB ||
+            family.family == TileBlockFamily::Prt64KB;
+        if (bandable && !volume) {
+          const uint64_t row_bytes = block_columns * block.block_size;
+          const uint64_t row_linear = uint64_t{pitch} * bpe;
+          for (const auto [first_row, last_row] :
+               {std::pair<u32, u32>{1, 3}, std::pair<u32, u32>{2, 4},
+                std::pair<u32, u32>{1, 2}, std::pair<u32, u32>{0, 4}}) {
+            const u32 first = first_row * block.block_height;
+            const u32 count = std::min((last_row - first_row) * block.block_height,
+                                       height - first);
+            GpuTileInfo band = info;
+            band.tiled_offset = first_row * row_bytes;
+            band.tiled_size = (last_row - first_row) * row_bytes;
+            band.tiled_width = pitch;
+            band.tiled_height = (last_row - first_row) * block.block_height;
+            band.height = count;
+            band.linear_offset = 0;
+            band.linear_size = row_linear * count;
+            std::vector<uint8_t> band_gpu(band.linear_size, 0xab);
+            gpu_detile(tiled, &band_gpu, storage_size, band.linear_size,
+                       std::span<const GpuTileInfo>(&band, 1));
+            const std::vector<uint8_t> expected(
+                gpu.begin() + static_cast<ptrdiff_t>(row_linear * first),
+                gpu.begin() + static_cast<ptrdiff_t>(row_linear * (first + count)));
+            std::ostringstream label;
+            label << "row band [" << first_row << "," << last_row << ") family="
+                  << static_cast<u32>(family.family) << " bpe=" << bpe;
+            compare(label.str().c_str(), expected, band_gpu);
+          }
+        }
+
         {
           std::vector<uint8_t> linear(storage_size);
           std::vector<uint8_t> cpu_tiled(storage_size, 0xab);
@@ -16126,7 +16184,7 @@ private:
                    const std::vector<u32> &contents) {
     void *data = nullptr;
     RequireVk(shader_name, "dispatch",
-              m_device.mapMemory(buffer.memory, 0, buffer.size, {}, &data),
+              m_device.mapMemory(buffer.memory, 0, VK_WHOLE_SIZE, {}, &data),
               "vkMapMemory");
     std::memcpy(data, contents.data(), contents.size() * sizeof(u32));
     if (!buffer.coherent) {
@@ -16165,15 +16223,13 @@ void CompareWords(const TestCase &test, const char *stage,
     return;
   }
   std::ostringstream out;
-  out << "expected [";
-  for (size_t i = 0; i < expected.size(); i++) {
-    out << (i == 0 ? "" : ", ") << Hex(expected[i]);
+  if (actual.size() != expected.size()) {
+    out << "word count expected=" << expected.size() << " actual=" << actual.size();
+  } else {
+    const auto mismatch = std::mismatch(expected.begin(), expected.end(), actual.begin());
+    out << "word[" << (mismatch.first - expected.begin()) << "] expected="
+        << Hex(*mismatch.first) << " actual=" << Hex(*mismatch.second);
   }
-  out << "] actual [";
-  for (size_t i = 0; i < actual.size(); i++) {
-    out << (i == 0 ? "" : ", ") << Hex(actual[i]);
-  }
-  out << "]";
   Fail(test.name, stage, out.str());
 }
 
@@ -22639,6 +22695,117 @@ TestCase BufferFormatVariants() {
                   O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   return load;
+}
+
+// The runtime (portable) format decode against the descriptor-specialized one, for every format:
+// each load precedes every store, so both executions see the same source bytes.
+void CheckPortableFormatDecoder(bool emission_only, bool strict_specialization = false) {
+  namespace IR = ShaderRecompiler::IR;
+  namespace Format = ShaderRecompiler::Format;
+  Require("PortableFormatDecoder", "configuration", IR::PortableShaders(),
+          "this test requires KYTY_PORTABLE_SHADERS=1");
+  std::unique_ptr<VulkanHarness> vulkan;
+  if (!emission_only) vulkan = std::make_unique<VulkanHarness>();
+  const u32 subgroup = vulkan ? vulkan->SubgroupSize() : 32;
+  size_t cases = 0, normalized_difference_cases = 0, normalized_difference_words = 0;
+  u32 normalized_max_ulp = 0;
+  std::string first_normalized_difference;
+  constexpr std::array<u32, 16> source = {
+      0x00000000u, 0xffffffffu, 0x80000000u, 0x7fffffffu,
+      0x3c003800u, 0xbc00b800u, 0x00010001u, 0x7c007bffu,
+      0xfc00fbffu, 0x7e017c01u, 0x80017fffu, 0x80ff007fu,
+      0x001ffc00u, 0xffe003ffu, 0x55555555u, 0xaaaaaaaau};
+  for (const u32 wave : {32u, 64u}) {
+    for (u32 encoded = 0; encoded < 128; encoded++) {
+      const auto format = static_cast<Prospero::BufferFormat>(encoded);
+      if (encoded != 0 && Format::GetFormatInfo(format).type == Format::ComponentType::Unknown)
+        continue;
+      if (emission_only && format != Prospero::BufferFormat::k32Float) continue;
+      const std::string name = "PortableFormatDecoder_" + std::to_string(encoded) +
+                               "_wave" + std::to_string(wave);
+      TestCase test;
+      test.name = name.c_str();
+      test.initial.assign(16 + 30 * wave + 1, 0xdeadbeefu);
+      std::copy(source.begin(), source.end(), test.initial.begin());
+      test.initial.back() = 0x80ff7f01u;
+      test.user_data = MakeStructuredStorageBufferData(
+          0, static_cast<u32>(test.initial.size() * sizeof(u32)), false, encoded);
+      test.user_data[3] = (test.user_data[3] & ~0xfffu) | DstSel(7, 6, 5, 4);
+      test.has_user_data = true;
+      test.compute_info.wave_size = wave;
+      test.compute_info.threads_num[0] = wave;
+      test.compute_info.threads_num[1] = 1;
+      test.compute_info.threads_num[2] = 1;
+      test.compute_info.thread_ids_num = 1;
+      test.has_compute_info = true;
+      for (u32 value = 1; value <= 30; value++) {
+        AppendVMovLiteral(&test.code, value, 0xdeadbeefu);
+      }
+      // Different low/high masks exercise the second emulated wave64 half and preservation
+      // of inactive destinations without letting lanes race on the output buffer.
+      AppendSMovLiteral(&test.code, 126, 0x55555555u);
+      AppendSMovLiteral(&test.code, 127, wave == 64 ? 0xaaaaaaaau : 0u);
+      const u32 bytes = static_cast<u32>(test.initial.size() * sizeof(u32));
+      const std::array<u32, 6> addresses = {0, 16, 32, 48, bytes - 4, bytes + 16};
+      for (u32 read = 0; read < addresses.size(); read++) {
+        AppendVMovU32(&test.code, 40, addresses[read]);
+        AppendBufferLoadOpcode(&test.code, 0x00, 1 + read * 5, 40);
+        AppendBufferLoadOpcode(&test.code, 0x03, 2 + read * 5, 40);
+      }
+      test.code.push_back(EncodeSop1(0x04, 126, 193u)); // restore all lanes
+      for (u32 value = 0; value < 30; value++) {
+        AppendStoreVgprAtLaneDwordOffset(&test.code, 1 + value, 0, 16 + value * wave);
+      }
+      AppendEnd(&test.code);
+
+      // Variant 0: the descriptor's format specialized; 1: the portable (runtime) decode.
+      std::vector<u32> specialized;
+      for (u32 variant = 0; variant < 2; variant++) {
+        auto compiled = CompileCase(test, subgroup, variant != 0);
+        if (!vulkan) continue;
+        auto buffer = vulkan->CreateStorageBuffer(test.name, test.initial, test.initial.size());
+        vulkan->Dispatch(test, compiled, buffer);
+        auto actual = vulkan->ReadBuffer(test.name, buffer, test.initial.size());
+        vulkan->DestroyBuffer(&buffer);
+        if (variant == 0) {
+          specialized = std::move(actual);
+          continue;
+        }
+        const auto component_type = Format::GetFormatInfo(format).type;
+        const bool normalized = component_type == Format::ComponentType::Unorm ||
+                                component_type == Format::ComponentType::Snorm;
+        if (strict_specialization || !normalized) {
+          CompareWords(test, "strict specialized/portable parity", specialized, actual);
+        }
+        size_t differences = 0;
+        for (size_t word = 0; word < actual.size(); word++) {
+          if (specialized[word] == actual[word]) continue;
+          const auto distance = specialized[word] > actual[word]
+              ? specialized[word] - actual[word] : actual[word] - specialized[word];
+          // Known NVIDIA dynamic FDiv vs constant FDiv rounding: reported, not a passing
+          // tolerance (--portable-specialization-parity-only fails on the first differing bit).
+          normalized_max_ulp = std::max(normalized_max_ulp, distance);
+          if (first_normalized_difference.empty()) {
+            first_normalized_difference = name + " word[" + std::to_string(word) +
+                "] specialized=" + Hex(specialized[word]) + " portable=" + Hex(actual[word]);
+          }
+          differences++;
+        }
+        normalized_difference_cases += differences != 0;
+        normalized_difference_words += differences;
+      }
+      cases++;
+    }
+  }
+  std::printf("[compute] PortableFormatDecoder: %zu cases%s\n", cases,
+              emission_only ? " compiled (no GPU value checks)" : " checked on the GPU");
+  if (normalized_difference_words != 0) {
+    std::printf("[known] specialized/portable normalized differences: %zu cases, %zu words, "
+                "max ULP=%u; first %s. This is not a passing tolerance.\n",
+                normalized_difference_cases, normalized_difference_words,
+                normalized_max_ulp,
+                first_normalized_difference.c_str());
+  }
 }
 
 TestCase BufferLoadFormatXyzwSnapshotsOverlappingAddress() {
@@ -31756,6 +31923,18 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--portable-formats-only") == 0) {
+    CheckPortableFormatDecoder(false);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--portable-formats-emission-only") == 0) {
+    CheckPortableFormatDecoder(true);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--portable-specialization-parity-only") == 0) {
+    CheckPortableFormatDecoder(false, true);
+    return 0;
+  }
   CheckLeastRecentlyUsedCacheOrdering();
   CheckDrawRunArguments();
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES

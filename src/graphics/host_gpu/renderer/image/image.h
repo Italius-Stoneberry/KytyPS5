@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <algorithm>
 #include <compare>
 #include <limits>
 #include <optional>
@@ -85,14 +86,64 @@ public:
 	void CopyImageWithBuffer(Image& source, Buffer& buffer);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
+	// Moves whenever an image becomes (maybe) CPU-dirty: a proof that bound images were clean
+	// holds while it stays (native XPR records used again within a frame).
+	[[nodiscard]] static uint64_t CpuDirtyEpoch() noexcept { return s_cpu_dirty_epoch.load(std::memory_order_acquire); }
+
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
 			m_cpu_dirty        = true;
 			m_maybe_cpu_dirty  = false;
 			m_maybe_hash_valid = false;
+			DropPartialDirty();
+			NoteCpuDirty();
 		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
 			m_maybe_cpu_dirty = true;
+			NoteCpuDirty();
 		}
+	}
+
+	// Partial CPU writes (KYTY_PARTIAL_IMAGE_DIRTY): while the image is dirty only in the
+	// recorded guest ranges, it keeps watching its other pages, so a refresh uploads just the
+	// subresources over those ranges. A clean image or one already dirty this way can take one.
+	[[nodiscard]] bool CanTakePartialDirty() const noexcept {
+		return !m_maybe_cpu_dirty && (!m_cpu_dirty || m_partial_dirty);
+	}
+	void InvalidateCpuWritePartial(uint64_t begin, uint64_t end) {
+		if (!CanTakePartialDirty() || begin >= end) {
+			EXIT("image cannot take a partial CPU write\n");
+		}
+		if (!m_cpu_dirty) {
+			m_cpu_dirty        = true;
+			m_partial_dirty    = true;
+			m_maybe_hash_valid = false;
+			m_dirty_ranges.clear();
+		}
+		AddRange(m_dirty_ranges, begin, end);
+		NoteCpuDirty();
+	}
+	[[nodiscard]] bool IsPartiallyCpuDirty() const noexcept { return m_cpu_dirty && m_partial_dirty; }
+	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& CpuDirtyRanges() const noexcept {
+		return m_dirty_ranges;
+	}
+	// The whole image must be uploaded again (the image stopped watching all of its pages).
+	void DropPartialDirty() noexcept {
+		m_partial_dirty = false;
+		m_dirty_ranges.clear();
+	}
+	// Sorted, disjoint [begin, end) ranges; merges adjacent and overlapping ones.
+	static void AddRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin,
+	                     uint64_t end) {
+		auto at = ranges.begin();
+		while (at != ranges.end() && at->second < begin) ++at;
+		auto last = at;
+		while (last != ranges.end() && last->first <= end) {
+			begin = std::min(begin, last->first);
+			end   = std::max(end, last->second);
+			++last;
+		}
+		at = ranges.erase(at, last);
+		ranges.insert(at, {begin, end});
 	}
 
 	[[nodiscard]] bool IsCpuDirty() const { return m_cpu_dirty || m_maybe_cpu_dirty; }
@@ -101,6 +152,7 @@ public:
 	void               MarkMaybeCpuDirty() {
 		if (!m_cpu_dirty) {
 			m_maybe_cpu_dirty = true;
+			NoteCpuDirty();
 		}
 	}
 	[[nodiscard]] bool NeedsMaybeCpuHash() const {
@@ -130,6 +182,7 @@ public:
 		m_cpu_dirty        = false;
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
+		DropPartialDirty();
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
@@ -167,8 +220,13 @@ public:
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
+	// Page-aligned ranges inside the tracked pages the image stopped watching after partial
+	// CPU writes; always inside CpuDirtyRanges while the image is partially dirty.
+	std::vector<std::pair<uint64_t, uint64_t>> untracked_holes;
+	// KYTY_PARTIAL_IMAGE_DIRTY=2: guest data hashes per partial-dirty granule at the last upload.
+	std::vector<uint64_t> partial_hashes;
 	ImageId          depth_id {};
-	uint64_t         tick_accessed_last = 0;
+	uint64_t         frame_accessed_last = 0; // TextureCache::AdvanceFrame count at the last use
 	size_t           lru_id             = 0;
 	// Transit group that last set the whole-image state; see BeginTransitGroup.
 	uint64_t         transit_group      = 0;
@@ -189,12 +247,16 @@ private:
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash   = 0;
+	static void NoteCpuDirty() noexcept { s_cpu_dirty_epoch.fetch_add(1, std::memory_order_release); }
+	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {1};
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
 	bool              m_stencil_modified  = false;
+	bool              m_partial_dirty     = false;
+	std::vector<std::pair<uint64_t, uint64_t>> m_dirty_ranges;
 };
 
 namespace ImageOps {

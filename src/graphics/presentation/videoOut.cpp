@@ -1,5 +1,7 @@
 #include "graphics/presentation/videoOut.h"
+#include "live-counters.h"
 #include "live-trace.h"
+#include "time-census.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -24,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <list>
 #include <thread>
 #include <vector>
@@ -182,6 +185,7 @@ struct VideoOutConfig {
 	bool                                opened      = false;
 	bool                                closing     = false;
 	int                                 flip_rate   = 0;
+	uint64_t                            last_flip_vblank = 0; // vblank_status.count at the last flip
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -476,9 +480,26 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
 
-static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
+// KYTY_FLIP_RATE=1 or 2: at least 2 or 3 vblanks between flips (30 or 20 fps at 60 Hz), a steady
+// frame rate, e.g. for recordings with frame generation. The vblanks keep their rate, and so does
+// the game's clock in play. Unlike the game's own sceVideoOutSetFlipRate (flips only on every 2nd
+// vblank), a late frame waits for the next vblank, not for the next even one (50 ms, not 67).
+// Movies advance a frame per flip (the intro played at half speed): with frame generation only
+// frames of the game's 3D view are capped (Presenter::FlipRateApplies).
+static int FlipRateFloor() {
+	static const int floor = [] {
+		const char* value = std::getenv("KYTY_FLIP_RATE");
+		return std::clamp(value != nullptr ? std::atoi(value) : 0, 0, 2);
+	}();
+	return floor;
+}
+
+static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, bool capped) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
+	}
+	if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) {
+		return cfg.vblank_status.count - cfg.last_flip_vblank >= static_cast<uint64_t>(floor) + 1u;
 	}
 	const int interval = cfg.flip_rate + 1;
 
@@ -648,6 +669,7 @@ int VideoOutDriver::Impl::Open(int bus_type) {
 	config.flip_status.count         = 0;
 	config.pre_vblank_status         = VideoOutVblankStatus();
 	config.vblank_status             = VideoOutVblankStatus();
+	config.last_flip_vblank          = 0;
 
 	return handle;
 }
@@ -758,6 +780,7 @@ void VideoOutDriver::Impl::VblankBegin() {
 
 void VideoOutDriver::Impl::VblankEnd() {
 	Common::LockGuard lock(m_mutex);
+	LiveCounters::Add(LiveCounters::Vblanks);
 
 	for (int i = 1; i < VIDEO_OUT_NUM_MAX; i++) {
 		auto& ctx = m_video_out_ctx[i];
@@ -1107,7 +1130,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 
 	r.cfg->mutex.Lock();
-	if (!IsFlipDueLocked(*r.cfg, r.generation)) {
+	const bool capped = r.frame != nullptr && Graphics::Presenter::FlipRateApplies(*r.frame);
+	if (!IsFlipDueLocked(*r.cfg, r.generation, capped)) {
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
 		m_processing = false;
@@ -1133,6 +1157,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_requests.pop_front();
 
 	r.cfg->flip_status.count++;
+	r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
 	r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 	r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
 	r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1509,6 +1534,7 @@ void VideoOutDriver::WaitFlipDone(int handle, int index) {
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(FlipStatus, 0);
 
 	if (status == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
@@ -1554,6 +1580,7 @@ KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 
 KYTY_SYSV_ABI int VideoOutGetVblankStatus(int handle, VideoOutVblankStatus* status) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(VblankStatus, 0);
 
 	if (status == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
@@ -1634,6 +1661,7 @@ KYTY_SYSV_ABI int VideoOutGetEventCount(const EventQueue::KernelEvent* ev) {
 
 KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(WaitVblank, 0);
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {

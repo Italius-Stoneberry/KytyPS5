@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
+#include "live-trace.h"
 
 #include <algorithm>
 #include <array>
@@ -222,6 +223,16 @@ void EndTransitGroup() noexcept {
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+	if (LiveTrace::WriteTicks()) {
+		constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+		                        vk::AccessFlagBits2::eColorAttachmentWrite |
+		                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+		                        vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite;
+		LiveTrace::Event(LiveTrace::ImageUse, info.data.address,
+		                 (info.data.size & 0xffffffffu) |
+		                     (static_cast<bool>(destination_access & writes) ? uint64_t {1} << 63u : 0) |
+		                     static_cast<uint64_t>(destination_layout) << 32u);
+	}
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};

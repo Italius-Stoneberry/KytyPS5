@@ -1,0 +1,97 @@
+// The static shader and pipeline precompile, a program of its own (tools/local/static-precompile):
+//
+//   kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] [--threads <n>]
+//                          [--out <file>] [--timings <file>] [--no-pipelines]
+//   kyty_shader_precompile --game <dir> --merge
+//
+// compiles the shaders and pipelines of a seed file on a headless Vulkan device (the one the emulator
+// creates, without a window) into the static pipeline cache _PipelineCache/static/<title>.bin, which
+// the emulator looks up before compiling. With --shard, the i-th of n shares goes into a cache file of
+// its own next to it: the NVIDIA driver compiles big shaders nearly one at a time per process, so the
+// shares are processes (precompile-windows.ps1 runs them); --merge folds their files into the static
+// cache. --out writes what was compiled as a warmup file, for precompile.py coverage; --timings each
+// pipeline's compile time (ms, SPIR-V words, the seeds' hashes). Run it from the directory the emulator
+// runs in.
+#include "common/emulatorConfig.h"
+#include "common/logging/log.h"
+#include "common/subsystems.h"
+#include "common/threads.h"
+#include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "loader/systemContent.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <string_view>
+#include <thread>
+
+using Libs::Graphics::PipelineCache;
+
+static int Usage() {
+	std::fprintf(stderr, "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] "
+	                     "[--threads <n>] [--out <file>] [--timings <file>] [--no-pipelines]\n"
+	                     "       kyty_shader_precompile --game <dir> --merge\n");
+	return 2;
+}
+
+int main(int argc, char* argv[]) {
+	std::filesystem::path          game;
+	bool                           merge = false;
+	PipelineCache::PrecompileOptions options;
+	options.threads = std::max(1u, std::thread::hardware_concurrency());
+	for (int i = 1; i < argc; i++) {
+		const std::string_view arg   = argv[i];
+		const char*            value = i + 1 < argc ? argv[i + 1] : nullptr;
+		if (arg == "--merge") {
+			merge = true;
+		} else if (arg == "--no-pipelines") {
+			options.pipelines = false;
+		} else if (value == nullptr) {
+			return Usage();
+		} else if (arg == "--game") {
+			game = argv[++i];
+		} else if (arg == "--seeds") {
+			options.seeds = argv[++i];
+		} else if (arg == "--out") {
+			options.out = argv[++i];
+		} else if (arg == "--timings") {
+			options.timings = argv[++i];
+		} else if (arg == "--threads") {
+			options.threads = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+		} else if (arg == "--shard") {
+			if (std::sscanf(argv[++i], "%u/%u", &options.shard, &options.shards) != 2) return Usage();
+		} else {
+			return Usage();
+		}
+	}
+	if (game.empty() || (!merge && options.seeds.empty()) || options.threads == 0 || options.shards == 0 ||
+	    options.shard >= options.shards)
+		return Usage();
+
+	static Common::Subsystems subsystems;
+	Common::InitializeThreads();
+	subsystems.Initialize<Config::Lifecycle>();
+	Config::ConfigOptions config;
+	config.printf_direction = Config::OutputDirection::Silent;
+	Config::Load(config);
+	subsystems.Initialize<Log::Lifecycle>();
+	// The title the caches are named after.
+	const auto param_json = game / "sce_sys" / "param.json";
+	if (!std::filesystem::is_regular_file(param_json)) {
+		std::fprintf(stderr, "no %s\n", param_json.string().c_str());
+		return 1;
+	}
+	Loader::SystemContentLoadParamSfo(param_json);
+
+	static Libs::Graphics::GraphicContext graphics;
+	if (!Libs::Graphics::CreateHeadlessGraphicContext(graphics)) {
+		std::fprintf(stderr, "no Vulkan device\n");
+		return 1;
+	}
+	const bool done = merge ? PipelineCache::MergePrecompileShards(graphics) : PipelineCache::Precompile(graphics, options);
+	std::printf("Shader precompile: %s\n", done ? "complete" : "failed");
+	std::fflush(nullptr);
+	std::_Exit(done ? 0 : 1);
+}

@@ -4,6 +4,7 @@
 // once, before it consumes commands. Values outside a switch's range abort.
 
 #include "native-buffer-residency.h"
+#include "local-platform.h"
 #include "native-resource-state.h"
 
 #include <array>
@@ -11,7 +12,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <pthread.h>
 #include <string>
 
 extern "C" {
@@ -25,12 +25,16 @@ extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
 extern volatile std::atomic_uint32_t kyty_local_pending_drain_mode;
 extern volatile std::atomic_uint32_t kyty_local_dispatch_batch;
 extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
+extern volatile std::atomic<uint32_t> kyty_local_buffer_reclaim_mode;
+extern volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode;
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 extern volatile std::atomic_uint32_t kyty_local_vulkan_recording_mode;
 extern volatile std::atomic_uint32_t kyty_local_deferred_submit_mode;
 extern volatile std::atomic_uint32_t kyty_local_native_xpr_mode;
+extern volatile std::atomic_uint32_t kyty_local_draw_packets_mode;
 extern volatile std::atomic_uint32_t kyty_local_native_xpr_predict_mode;
 extern volatile std::atomic_uint32_t kyty_local_native_image_proof_mode;
+extern volatile std::atomic_uint32_t kyty_local_async_xpr_pipelines_mode;
 #endif
 }
 
@@ -63,12 +67,17 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_READBACK_DETACH", &kyty_local_readback_detach_mode},
 	    Switch {"KYTY_ASYNC_WRITE_READBACK", &kyty_local_async_write_readback_mode},
 	    Switch {"KYTY_READBACK_SLOTS", &kyty_local_readback_slots_mode},
-	    Switch {"KYTY_ASYNC_UPLOAD", &kyty_local_async_upload_mode},
+	    // 1: buffer upload copies on the upload worker; 2: image staging copies as well.
+	    Switch {"KYTY_ASYNC_UPLOAD", &kyty_local_async_upload_mode, 0, 2},
+	    Switch {"KYTY_BUFFER_RECLAIM", &kyty_local_buffer_reclaim_mode},
+	    Switch {"KYTY_UNMAP_PROTECT_SKIP", &kyty_local_unmap_protect_skip_mode},
 	    Switch {"KYTY_BDA_DIRTY_REGIONS", &kyty_local_bda_dirty_regions_mode},
 	    Switch {"KYTY_GLOBAL_BARRIER_DEDUPE", &kyty_local_global_barrier_dedupe},
 	    Switch {"KYTY_RANGE_SET_FAST", &kyty_local_range_set_fast_mode},
 	    Switch {"KYTY_IMAGE_GRANULES", &kyty_local_image_granules_mode, 0, 2},
 	    Switch {"KYTY_TEXTURE_RESOLVE_PAGES", &kyty_local_texture_resolve_pages_mode},
+	    Switch {"KYTY_PARTIAL_IMAGE_DIRTY", &kyty_local_partial_image_dirty_mode, 0, 2},
+	    Switch {"KYTY_PARTIAL_ROW_BANDS", &kyty_local_partial_row_bands_mode},
 	    Switch {"KYTY_ASYNC_REPROTECT", &kyty_local_async_reprotect_mode},
 	    Switch {"KYTY_READBACK_NARROW", &kyty_local_readback_narrow_mode},
 	    // Also creates the transfer queue at device creation (vulkanWindow.cpp).
@@ -84,8 +93,10 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_DEFERRED_SUBMIT", &kyty_local_deferred_submit_mode},
 	    // 1: native XPR draws; 2: verification (the normal path draws and is compared).
 	    Switch {"KYTY_NATIVE_XPR", &kyty_local_native_xpr_mode, 0, 2},
+	    Switch {"KYTY_DRAW_PACKETS", &kyty_local_draw_packets_mode},
 	    Switch {"KYTY_NATIVE_XPR_PREDICT", &kyty_local_native_xpr_predict_mode},
 	    Switch {"KYTY_NATIVE_IMAGE_PROOF", &kyty_local_native_image_proof_mode},
+	    Switch {"KYTY_ASYNC_XPR_PIPELINES", &kyty_local_async_xpr_pipelines_mode},
 #endif
 	};
 	std::string enabled;
@@ -105,7 +116,14 @@ inline void InitializePerformanceSwitches() {
 		enabled += std::string(enabled.empty() ? "" : " ") + setting.environment + "=" + text;
 	}
 	// External tools find the render thread by this name (for example to pin it).
-	(void)pthread_setname_np(pthread_self(), "Kyty.Gpu");
+	LocalPlatform::SetThreadName("Kyty.Gpu");
+	// KYTY_RENDER_CPUS (e.g. "1,2,3,6,7"): the CPUs this thread may run on; other threads are
+	// not kept off them. On Windows the P-cores without CPU 0 (which takes most interrupts)
+	// measured best; a dedicated core made the whole process slower there.
+	if (const char* cpus = std::getenv("KYTY_RENDER_CPUS"); cpus != nullptr && *cpus != '\0') {
+		LocalPlatform::PinThreadToCpuList(cpus);
+		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_CPUS=" + cpus;
+	}
 	if (!enabled.empty()) {
 		std::printf("Performance switches: %s\n", enabled.c_str());
 		std::fflush(stdout);

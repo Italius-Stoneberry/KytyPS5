@@ -21,7 +21,9 @@ enum Kind : uint32_t {
 	NativeGather  = 8, // native XPR record word gather
 	QueueRun      = 9, // a: queue (interrupt event id; 0 graphics), whole PM4 run
 	SrtInterpreter = 10, // a: shader hash, b: 1 no linear plan, 2 other sources, 3 other clean slots
-	Kinds         = 11
+	CommandSync   = 11, // GPU-written command memory check before parsing (indirect tables)
+	DrawPhase     = 12, // a: pixel shader, b: phase (LogDrawPhase marks; DrawPhases below)
+	Kinds         = 13
 };
 
 struct Entry {
@@ -30,7 +32,7 @@ struct Entry {
 	bool     used = false;
 };
 
-constexpr size_t      TableSize = 8192;
+constexpr size_t      TableSize = 32768;
 inline std::atomic_bool g_on {false};
 // Set on the render thread: other threads never touch the table.
 inline thread_local bool g_render = false;
@@ -75,6 +77,41 @@ private:
 	bool     m_on;
 	uint32_t m_kind  = 0;
 	uint64_t m_a     = 0, m_b = 0, m_start = 0;
+};
+
+// Phases of one normal-path draw: the draw's scope starts phase 0, every LogDrawPhase marker
+// (renderer/debug.cpp) closes the running phase and starts the next, the scope closes the last.
+inline thread_local bool     g_draw_phases  = false;
+inline thread_local uint64_t g_draw_shader  = 0, g_draw_phase_start = 0;
+inline thread_local uint32_t g_draw_phase   = 0;
+inline void MarkDrawPhase(uint32_t next) {
+	if (!g_draw_phases) return;
+	const auto now = __rdtsc();
+	Add(DrawPhase, g_draw_shader, g_draw_phase | g_queue, now - g_draw_phase_start);
+	g_draw_phase       = next;
+	g_draw_phase_start = now;
+}
+class DrawPhases {
+public:
+	explicit DrawPhases(uint64_t shader): m_on(g_on.load(std::memory_order_relaxed) && g_render && !g_draw_phases) {
+		if (m_on) {
+			g_draw_phases      = true;
+			g_draw_shader      = shader;
+			g_draw_phase       = 0;
+			g_draw_phase_start = __rdtsc();
+		}
+	}
+	~DrawPhases() {
+		if (m_on) {
+			MarkDrawPhase(0);
+			g_draw_phases = false;
+		}
+	}
+	DrawPhases(const DrawPhases&)            = delete;
+	DrawPhases& operator=(const DrawPhases&) = delete;
+
+private:
+	bool m_on;
 };
 
 } // namespace LiveCensus

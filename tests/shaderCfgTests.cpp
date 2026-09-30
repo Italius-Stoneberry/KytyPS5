@@ -12723,12 +12723,13 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeMubuf1(0, 0, 1), // buffer_store_dwordx4 v[0:3]
       EncodeSopp(0x01),
   };
+  // Portable shaders read the stride from the buffer word (one more load).
   const auto wide_result = compile("wide-buffer", wide_buffer,
-                                   {.words = 807,
-                                    .instructions = 211,
+                                   {.words = 941,
+                                    .instructions = 237,
                                     .runtime_arrays = 1,
                                     .variables = 2,
-                                    .loads = 9,
+                                    .loads = 10,
                                     .stores = 4,
                                     .array_lengths = 2,
                                     .phis = 5,

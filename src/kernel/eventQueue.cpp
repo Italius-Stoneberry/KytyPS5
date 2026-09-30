@@ -1,5 +1,6 @@
 #include "kernel/eventQueue.h"
 #include "live-trace.h"
+#include "time-census.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -387,6 +388,7 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(WaitEqueue, timo != nullptr ? static_cast<uint64_t>(*timo) : ~uint64_t {0});
 
 	auto owner = KernelPinEqueue(eq);
 	if (!owner) {

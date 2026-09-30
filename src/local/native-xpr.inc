@@ -45,6 +45,9 @@ extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_predict_mode {0};
 // 1: native image proofs check the image's own registration (see NativeXprValidateResources).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_image_proof_mode {0};
+// 1: a store whose pipeline variant is not compiled yet hands it to the compile workers and
+// is skipped; the draw takes the normal path until a later store finds the variant ready.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_xpr_pipelines_mode {0};
 }
 namespace {
 // word_patch value of a logged word whose change reaches nothing the evaluation produces.
@@ -161,7 +164,7 @@ struct RenderExecutor::NativeXprRecord {
 		// SRT evaluation inputs, for re-evaluation when read words changed.
 		std::vector<uint32_t> user_data;
 		uint64_t              shader_base = 0;
-		// What the set holds for this stage, for verification (mode 3).
+		// What the set holds for this stage, for verification (mode 2).
 		std::vector<vk::ImageView> views;
 		std::vector<vk::Sampler>   samplers;
 		// Resolved images and, per image, its (position in set_images, mip element);
@@ -177,16 +180,25 @@ struct RenderExecutor::NativeXprRecord {
 		bool       texel  = false;
 		uint32_t   stage = 0, slot = 0;
 	};
+	// The fields every use reads come first (one cache line); the descriptor, read only
+	// when the proof is redone, last.
 	struct ImageDep {
 		ImageId               id;
-		TextureCache::ImageDesc desc;
 		vk::ImageLayout       layout = vk::ImageLayout::eUndefined;
 		ImageSubresourceRange range;
 		// The image object the set's views belong to: a deleted image's slot can
 		// hold another image with the same backing, which IsSampledImageCurrent accepts.
 		uint64_t              serial = 0;
 		uint32_t              registration = 0; // the image's registration the proof saw
+		TextureCache::ImageDesc desc;
 	};
+	// The images' ids alone, contiguous: every use checks them against the draw's targets
+	// (an ImageDep holds a whole ImageDesc, a cache line or more apart from the next id).
+	std::vector<ImageId> image_ids;
+	void                 IndexImages() {
+		image_ids.clear();
+		for (const auto& dep: images) image_ids.push_back(dep.id);
+	}
 	std::vector<uint32_t> key;
 	// The first key words again, inline: a lookup compares most keys without
 	// the vector's cache miss.
@@ -214,6 +226,15 @@ struct RenderExecutor::NativeXprRecord {
 	bool                  has_push = false;
 	// Native pipeline variant per draw state this object was drawn under.
 	std::vector<std::pair<uint64_t, const PipelineCache::Pipeline*>> pipelines;
+	// Direct draws (DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2): the vertex and instance offsets the
+	// normal path resolved under a draw state. Both come from the index-offset register or the
+	// vertex shader's offset user-data SGPRs, which the state and object keys cover.
+	struct DirectOffsets {
+		uint64_t state    = 0;
+		int32_t  vertex   = 0;
+		uint32_t instance = 0;
+	};
+	std::vector<DirectOffsets> direct_offsets;
 	// Validation (runtime).
 	std::vector<std::pair<uint64_t, uint32_t>> reads; // (address, words)
 	std::vector<uint32_t>  words;
@@ -230,6 +251,8 @@ struct RenderExecutor::NativeXprRecord {
 	uint64_t used_frame         = 0; // last frame a draw used the record
 	uint64_t uses               = 0;
 	uint64_t next_hash          = 0; // key hash of the record the next native draw used
+	uint64_t next2_hash         = 0; // ... the one after it (its index slot is fetched a draw ahead)
+	uint64_t image_dirty_epoch  = 0;     // Image::CpuDirtyEpoch() when the images were proven clean
 	// The payload the set was written with; an identical rebind keeps the set.
 	std::vector<vk::DescriptorBufferInfo> set_buffers;
 	std::vector<vk::DescriptorImageInfo>  set_images;
@@ -331,7 +354,9 @@ void NativeXprPrefetchArrays(const Record& record) {
 	NativeXprPrefetch(gather.feeds.data(), std::min<size_t>(gather.feeds.size() * 4, 256));
 	NativeXprPrefetch(gather.value_word.data(), std::min<size_t>(gather.value_word.size() * 4, 256));
 	NativeXprPrefetch(record.pipelines);
-	NativeXprPrefetch(record.images);
+	// An image dependency is large (its descriptor): the first line of each holds what a use reads.
+	NativeXprPrefetch(record.image_ids);
+	for (size_t i = 0; i < record.images.size() && i < 16; ++i) __builtin_prefetch(&record.images[i]);
 	NativeXprPrefetch(record.buffers);
 	if (!gather.traced) {
 		NativeXprPrefetch(record.reads);
@@ -357,6 +382,10 @@ struct RenderExecutor::NativeXprCache {
 	std::vector<IndexSlot> index = std::vector<IndexSlot>(8192);
 	size_t                 index_count = 0;
 	static uint64_t        IndexHash(uint64_t hash) { return hash != 0 ? hash : 1; }
+	// Where a lookup of `hash` starts probing (to fetch that line ahead of the lookup).
+	[[nodiscard]] const void* IndexSlotOf(uint64_t hash) const {
+		return &index[IndexHash(hash) & (index.size() - 1)];
+	}
 	[[nodiscard]] NativeXprRecord* IndexFind(uint64_t hash) const {
 		hash            = IndexHash(hash);
 		const auto mask = index.size() - 1;
@@ -450,13 +479,41 @@ struct RenderExecutor::NativeXprCache {
 	struct PairStats {
 		uint64_t stored = 0, wasted = 0;
 		bool     blocked = false;
+		bool     unstorable = false; // a program writes memory or uses DMA/GDS (NativeXprStore)
 	};
 	std::unordered_map<uint64_t, PairStats> pairs;
+	// Keys that missed, with the frame of their latest miss. A record pays off only
+	// when its key comes again, so it is stored at the second sighting within the
+	// frames a record outlives unused: keys new every frame (user data pointing at
+	// per-frame allocations) are never stored, even in pairs whose other objects are.
+	struct SeenKey {
+		uint64_t hash = 0, frame = 0;
+	};
+	std::vector<SeenKey> seen = std::vector<SeenKey>(8192);
+	bool SeenAgain(uint64_t hash, uint64_t frame) {
+		hash             = IndexHash(hash);
+		const auto mask  = seen.size() - 1;
+		SeenKey*   empty = nullptr;
+		for (uint64_t i = 0, at = hash & mask; i < 8; ++i, at = (at + 1) & mask) {
+			auto& entry = seen[at];
+			if (entry.hash == hash) {
+				const bool again = entry.frame + 2 >= frame;
+				entry.frame      = frame;
+				return again;
+			}
+			if (empty == nullptr && (entry.hash == 0 || entry.frame + 2 < frame)) empty = &entry;
+		}
+		*(empty != nullptr ? empty : &seen[hash & mask]) = {hash, frame};
+		return false;
+	}
 	uint64_t                                swept_frame = UINT64_MAX;
 	// Draw-state key of the latest draw (native or normal), for clean draws.
 	uint64_t state_key       = 0;
 	bool     state_key_valid = false;
 	uint64_t last_hash       = 0; // key hash of the previous native draw's record
+	uint64_t last2_hash      = 0; // ... and of the one before it
+	uint64_t                  last_state_key = 0; // the latest states lookup (entries never move)
+	const NativeXprDrawState* last_state     = nullptr;
 	uint64_t collected_frame = UINT64_MAX;
 	~NativeXprCache() {
 		for (auto pool: pools) device.destroyDescriptorPool(pool);
@@ -793,10 +850,10 @@ const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
 				if (image.desc.info.data.Empty()) continue;
 				if (!textures.IsSampledImageCurrent(image.image_id, image.desc)) return "image_not_current";
 				const auto& view = image.desc.view_info;
-				image_deps.push_back({image.image_id, image.desc, image.layout,
+				image_deps.push_back({image.image_id, image.layout,
 				                      {view.base_level, view.level_count, view.base_layer, view.layer_count},
 				                      textures.m_slot_images[image.image_id].serial,
-				                      textures.m_slot_images[image.image_id].registrations});
+				                      textures.m_slot_images[image.image_id].registrations, image.desc});
 			}
 		}
 	}
@@ -920,6 +977,7 @@ const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
 	if (runtime) {
 		record.buffers            = std::move(buffer_deps);
 		record.images             = std::move(image_deps);
+		record.IndexImages();
 		record.mapping_epoch      = resources.MappingEpoch();
 		record.registration_epoch = buffers.RegistrationEpoch();
 		record.resolution_epoch   = textures.ResolutionEpoch();
@@ -993,6 +1051,7 @@ bool RenderExecutor::NativeXprSwitchVariant(NativeXprRecord& record, uint64_t si
 	std::swap(variant.pool, record.pool);
 	std::swap(variant.set_images, record.set_images);
 	std::swap(variant.images, record.images);
+	record.IndexImages();
 	for (uint32_t st = 0; st < record.stage_count; ++st) {
 		std::swap(variant.textures[st], record.stages[st].textures);
 		std::swap(variant.views[st], record.stages[st].views);
@@ -1128,11 +1187,12 @@ bool RenderExecutor::NativeXprRebindSlots(NativeXprRecord& record,
 			for (const auto& image: record.stages[st].textures) {
 				if (image.desc.info.data.Empty()) continue;
 				const auto& view = image.desc.view_info;
-				record.images.push_back({image.image_id, image.desc, image.layout,
+				record.images.push_back({image.image_id, image.layout,
 				                         {view.base_level, view.level_count, view.base_layer, view.layer_count},
 				                         textures.m_slot_images[image.image_id].serial,
-				                         textures.m_slot_images[image.image_id].registrations});
+				                         textures.m_slot_images[image.image_id].registrations, image.desc});
 			}
+		record.IndexImages();
 		record.resolution_epoch = textures.ResolutionEpoch();
 	}
 	// New buffer dependencies are proven again before the draw.
@@ -1217,41 +1277,65 @@ bool RenderExecutor::NativeXprRebind(NativeXprRecord&                           
 void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState& state,
                                     vk::PrimitiveTopology topology, bool primitive_restart_enable,
                                     const RenderState& rendering,
-                                    std::span<PreparedBindings* const> stages) {
+                                    std::span<PreparedBindings* const> stages, const DrawEmitInfo& emit) {
+	LiveCounters::Add(LiveCounters::XprStores);
 	auto&      cache   = NativeXprState();
 	const bool runtime = cache.logging;
-	if (stages.empty() || stages.size() > 2 || (stages.size() == 2) != state.ps_active) return;
+	// What the programs are (stage layout, DMA/GDS, written resources) never changes for
+	// the shader pair: it stops asking for stores (every request logs the draw's reads).
+	const auto refuse_program = [&] {
+		LiveCounters::Add(LiveCounters::XprRefuseProgram);
+		std::vector<uint32_t> key;
+		NativeXprKey(buffer, key);
+		auto& pair = cache.pairs[NativeXprPairKey(key)];
+		pair.unstorable = true;
+	};
+	if (stages.empty() || stages.size() > 2 || (stages.size() == 2) != state.ps_active) return refuse_program();
 	auto& textures = m_context.GetTextureCache();
 	// Only stages without DMA, GDS or any written resource are recorded.
 	for (const auto* prepared: stages) {
 		const auto& program = *prepared->runtime->program;
-		if (program.info.uses_dma || prepared->gds.buffer != nullptr) return;
+		if (program.info.uses_dma || prepared->gds.buffer != nullptr) return refuse_program();
 		for (const auto& resource: program.info.buffers)
-			if (resource.written || resource.atomic) return;
+			if (resource.written || resource.atomic) return refuse_program();
 		for (const auto& image: program.info.images)
-			if (image.written || image.atomic) return;
+			if (image.written || image.atomic) return refuse_program();
 		for (const auto& image: prepared->images)
-			if (image.desc.type == TextureCache::BindingType::Storage) return;
+			if (image.desc.type == TextureCache::BindingType::Storage) return refuse_program();
 	}
 
 	auto       record    = std::make_unique<NativeXprRecord>();
 	const auto state_key = NativeXprStateKey(buffer);
-	auto&      pipeline  = m_context.GetPipelineCache().CreateGraphicsPipeline(
-        std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
-        state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-        state.programs.vertex, state.programs.pixel, true);
+	auto&      pipelines = m_context.GetPipelineCache();
+	const auto colors    = std::span {state.color_info, state.color_count};
+	const auto* pixel    = state.ps_active ? &state.ps_input_info : nullptr;
+	auto* const variant  = kyty_local_async_xpr_pipelines_mode.load(std::memory_order_relaxed) != 0
+	                          ? pipelines.TryCreateGraphicsPipeline(colors, state.depth_info, state.vs_input_info,
+	                                                                buffer, pixel, topology, primitive_restart_enable,
+	                                                                state.programs.vertex, state.programs.pixel, true)
+	                          : &pipelines.CreateGraphicsPipeline(colors, state.depth_info, state.vs_input_info,
+	                                                              buffer, pixel, topology, primitive_restart_enable,
+	                                                              state.programs.vertex, state.programs.pixel, true);
+	if (variant == nullptr) {
+		LiveCounters::Add(LiveCounters::XprStorePending);
+		return;
+	}
+	auto& pipeline = *variant;
 	EXIT_IF(!pipeline.native_bindings || pipeline.uses_push_descriptors);
 	record->vertex_program = state.programs.vertex.id;
 	record->pixel_program  = state.ps_active ? state.programs.pixel.id : 0;
 	record->pipelines.emplace_back(state_key, &pipeline);
+	if (emit.state_offsets)
+		record->direct_offsets.push_back({state_key, emit.vertex_offset, emit.first_instance});
 	record->stage_count = static_cast<uint32_t>(stages.size());
 	if (runtime) {
 		uint64_t total_words = 0;
 		for (const auto& [address, size]: cache.reads) {
-			if (address % 4 != 0 || size % 4 != 0 || size == 0 || size > 4096) return;
+			if (address % 4 != 0 || size % 4 != 0 || size == 0 || size > 4096)
+				return LiveCounters::Add(LiveCounters::XprRefuseReads);
 			total_words += size / 4;
 		}
-		if (total_words > 2048) return;
+		if (total_words > 2048) return LiveCounters::Add(LiveCounters::XprRefuseReads);
 		record->reads.reserve(cache.reads.size());
 		record->words.reserve(total_words);
 		for (const auto& [address, size]: cache.reads) {
@@ -1278,7 +1362,8 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 			record->stages[1].shader_base = pixel_params.Base();
 		}
 	}
-	if (NativeXprBindResources(*record, stages, pipeline.descriptor_set_layout, runtime) != nullptr) return;
+	if (NativeXprBindResources(*record, stages, pipeline.descriptor_set_layout, runtime) != nullptr)
+		return LiveCounters::Add(LiveCounters::XprRefuseBind);
 	if (runtime) NativeXprRetrace(*record);
 
 	// Render targets as this draw left them; a reopened rendering loads.
@@ -1330,13 +1415,18 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 	record->HoldKey();
 	const auto hash    = XXH3_64bits(record->key.data(), record->key.size() * sizeof(uint32_t));
 	record->used_frame = m_context.FrameNumber();
-	++cache.pairs[NativeXprPairKey(record->key)].stored;
+	auto& pair_stats   = cache.pairs[NativeXprPairKey(record->key)];
+	++pair_stats.stored;
 	if (auto old = cache.records.find(hash); old != cache.records.end()) {
-		// Pipelines depend on the programs and the draw state only.
+		// Pipelines depend on the programs and the draw state only; direct-draw offsets also on
+		// the user data, which the equal key holds.
 		if (old->second->vertex_program == record->vertex_program &&
-		    old->second->pixel_program == record->pixel_program)
+		    old->second->pixel_program == record->pixel_program) {
 			for (const auto& entry: old->second->pipelines)
 				if (entry.first != state_key) record->pipelines.push_back(entry);
+			for (const auto& entry: old->second->direct_offsets)
+				if (entry.state != state_key) record->direct_offsets.push_back(entry);
+		}
 		cache.IndexErase(hash);
 		NativeXprRetire(std::move(old->second), false);
 		cache.records.erase(old);
@@ -1346,12 +1436,17 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 			if (stale->second->key == record->key) {
 				NativeXprLearn(*stale->second, *record);
 				if (stale->second->vertex_program == record->vertex_program &&
-				    stale->second->pixel_program == record->pixel_program)
+				    stale->second->pixel_program == record->pixel_program) {
 					for (const auto& entry: stale->second->pipelines)
 						if (std::ranges::find(record->pipelines, entry.first,
 						                      &std::pair<uint64_t, const PipelineCache::Pipeline*>::first) ==
 						    record->pipelines.end())
 							record->pipelines.push_back(entry);
+					for (const auto& entry: stale->second->direct_offsets)
+						if (std::ranges::find(record->direct_offsets, entry.state, &NativeXprRecord::DirectOffsets::state) ==
+						    record->direct_offsets.end())
+							record->direct_offsets.push_back(entry);
+				}
 			}
 			cache.stale.erase(stale);
 		}
@@ -1366,6 +1461,7 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 	}
 	cache.IndexInsert(hash, record.get());
 	cache.records[hash] = std::move(record);
+	LiveCounters::Add(LiveCounters::XprStored);
 }
 
 // The way the SRT evaluation reads a range: spans through the watched-page aware
@@ -1406,16 +1502,36 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 		uint8_t  use;
 		bool     operator<(const StructuralRead& other) const { return address < other.address; }
 	};
-	std::vector<StructuralRead>                structural, clean;
-	std::vector<std::pair<uint64_t, uint32_t>> feeds; // (address, packed feed)
-	std::vector<std::pair<uint64_t, uint32_t>> data;       // (address, stage << 24 | flat)
+	// Spans over the non-clean structural words and the data words.
+	struct Word {
+		uint64_t address;
+		int32_t  value;
+		int32_t  data;
+	};
+	// Scratch kept across calls (a retrace per stored record: tens to hundreds a frame
+	// while walking, each with some twenty temporary vectors otherwise).
+	thread_local struct {
+		std::vector<StructuralRead>                structural, clean, unique;
+		std::vector<std::pair<uint64_t, uint32_t>> feeds, data, index_of;
+		std::vector<uint32_t>                      feed_value, cursor;
+		std::vector<Word>                          words;
+		ShaderRecompiler::IR::SrtReadTrace         trace;
+	} scratch;
+	auto& structural = scratch.structural;
+	auto& clean      = scratch.clean;
+	auto& feeds      = scratch.feeds; // (address, packed feed)
+	auto& data       = scratch.data;  // (address, stage << 24 | flat)
+	structural.clear();
+	clean.clear();
+	feeds.clear();
+	data.clear();
 	auto& pipelines   = m_context.GetPipelineCache();
 	auto& untraceable = m_native_xpr->untraceable;
 	for (uint32_t st = 0; st < record.stage_count; ++st)
 		if (untraceable.contains(record.stages[st].program)) return;
 	for (uint32_t st = 0; st < record.stage_count; ++st) {
-		const auto&                        stage = record.stages[st];
-		ShaderRecompiler::IR::SrtReadTrace trace;
+		const auto& stage = record.stages[st];
+		auto&       trace = scratch.trace;
 		if (!pipelines.TraceStage(*stage.program, stage.user_data, stage.shader_base, trace)) {
 			untraceable.insert(stage.program);
 			return;
@@ -1440,7 +1556,8 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 	const auto runs_of = [&](std::vector<StructuralRead>& reads, bool is_clean) {
 		std::sort(reads.begin(), reads.end());
 		// One entry per address, with the union of its uses.
-		std::vector<StructuralRead> unique;
+		auto& unique = scratch.unique;
+		unique.clear();
 		for (const auto& read: reads) {
 			if (!unique.empty() && unique.back().address == read.address) unique.back().use |= read.use;
 			else unique.push_back(read);
@@ -1468,8 +1585,9 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 			const auto address = run.address + 4ull * i;
 			auto*      span    = gather.clean_spans.empty() ? nullptr : &gather.clean_spans.back();
 			const auto end     = span != nullptr ? span->address + 4ull * span->count : 0;
+			// The gap words count too: a span never exceeds NativeXprSpanWords (the gather's buffer).
 			if (span == nullptr || address < end || address - end > 32 || address / 4096 != span->address / 4096 ||
-			    span->count >= NativeXprSpanWords) {
+			    span->count + (address - end) / 4 + 1 > NativeXprSpanWords) {
 				gather.clean_spans.push_back({address, 0, static_cast<uint32_t>(gather.clean_value.size())});
 				span = &gather.clean_spans.back();
 			}
@@ -1479,25 +1597,32 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 		}
 	}
 	// Feeds per structural value (clean values never feed a patch).
-	std::vector<std::pair<uint64_t, uint32_t>> index_of; // (address, value index), non-clean runs
+	auto& index_of = scratch.index_of; // (address, value index), non-clean runs
+	index_of.clear();
 	for (const auto& run: gather.structural)
 		if (!run.clean)
 			for (uint32_t i = 0; i < run.count; ++i) index_of.emplace_back(run.address + 4ull * i, run.first + i);
 	std::ranges::sort(index_of);
 	std::ranges::sort(feeds);
-	gather.feeds_at.assign(gather.values.size() + 1, 0);
-	gather.feeds.clear();
 	{
-		std::vector<std::vector<uint32_t>> per_value(gather.values.size());
+		// Grouped by value in feed order: a count per value, its prefix sums as the
+		// starts, then the feeds placed at their value's cursor.
+		const auto values_count = gather.values.size();
+		auto&      feed_value   = scratch.feed_value;
+		feed_value.clear();
+		gather.feeds_at.assign(values_count + 1, 0);
 		for (const auto& [address, packed]: feeds) {
-			const auto it = std::ranges::lower_bound(index_of, std::pair {address, 0u});
-			if (it != index_of.end() && it->first == address) per_value[it->second].push_back(packed);
+			const auto     it    = std::ranges::lower_bound(index_of, std::pair {address, 0u});
+			const uint32_t value = it != index_of.end() && it->first == address ? it->second : UINT32_MAX;
+			feed_value.push_back(value);
+			if (value != UINT32_MAX) ++gather.feeds_at[value + 1];
 		}
-		for (size_t v = 0; v < per_value.size(); ++v) {
-			gather.feeds_at[v] = static_cast<uint32_t>(gather.feeds.size());
-			gather.feeds.insert(gather.feeds.end(), per_value[v].begin(), per_value[v].end());
-		}
-		gather.feeds_at[per_value.size()] = static_cast<uint32_t>(gather.feeds.size());
+		for (size_t v = 0; v < values_count; ++v) gather.feeds_at[v + 1] += gather.feeds_at[v];
+		gather.feeds.resize(gather.feeds_at[values_count]);
+		auto& cursor = scratch.cursor;
+		cursor.assign(gather.feeds_at.begin(), gather.feeds_at.end() - 1);
+		for (size_t f = 0; f < feeds.size(); ++f)
+			if (feed_value[f] != UINT32_MAX) gather.feeds[cursor[feed_value[f]]++] = feeds[f].second;
 	}
 	std::ranges::sort(data);
 	gather.data.clear();
@@ -1514,13 +1639,8 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 	}
 	gather.targets_at.push_back(static_cast<uint32_t>(gather.targets.size()));
 
-	// Spans over the non-clean structural words and the data words.
-	struct Word {
-		uint64_t address;
-		int32_t  value;
-		int32_t  data;
-	};
-	std::vector<Word> words;
+	auto& words = scratch.words;
+	words.clear();
 	for (const auto& run: gather.structural)
 		if (!run.clean)
 			for (uint32_t i = 0; i < run.count; ++i)
@@ -1544,8 +1664,9 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 			if (word.data >= 0) gather.word_data[at] = word.data;
 			continue;
 		}
+		// The gap words count too: a span never exceeds NativeXprSpanWords (the gather's buffer).
 		if (span == nullptr || word.address - end > Gap || word.address / Page != span->address / Page ||
-		    span->count >= NativeXprSpanWords) {
+		    span->count + (word.address - end) / 4 + 1 > NativeXprSpanWords) {
 			gather.spans.push_back({word.address, 0, static_cast<uint32_t>(gather.words.size())});
 			span = &gather.spans.back();
 		}
@@ -1718,6 +1839,7 @@ bool RenderExecutor::NativeXprGather(NativeXprRecord& record) {
 	// it) are never patched.
 	std::array<uint32_t, NativeXprSpanWords> fresh;
 	for (const auto& item: gather.clean_spans) {
+		if (item.count > fresh.size()) return false; // never past the buffer: evaluate again
 		const auto* values = gather.clean_value.data() + item.first;
 		// A span that reads clean has clean words; otherwise each word is read
 		// as the evaluation reads it.
@@ -1739,6 +1861,7 @@ bool RenderExecutor::NativeXprGather(NativeXprRecord& record) {
 		for (uint64_t line = item.address & ~63ull; line < item.address + 4ull * item.count; line += 64)
 			__builtin_prefetch(reinterpret_cast<const void*>(line));
 	for (const auto& item: gather.spans) {
+		if (item.count > fresh.size()) return false; // never past the buffer: evaluate again
 		reader.Read(item.address, item.count, fresh.data());
 		auto* held = gather.words.data() + item.first;
 		if (std::memcmp(fresh.data(), held, item.count * 4ull) == 0) continue;
@@ -1987,11 +2110,39 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 	auto& buffers   = m_context.GetBufferCache();
 	auto& textures  = m_context.GetTextureCache();
 	auto& resources = m_context.GetGpuResources();
-	// The rest holds for the whole frame unless the live-object epochs move.
+	// The rest holds for the whole frame unless the live-object epochs move, or the guest
+	// wrote a bound buffer since the proof (its region's CPU epoch moved).
 	if (!mapping_moved && record.validated_frame == frame &&
 	    record.registration_epoch == buffers.RegistrationEpoch() &&
-	    record.resolution_epoch == textures.ResolutionEpoch())
-		return true;
+	    record.resolution_epoch == textures.ResolutionEpoch()) {
+		uint64_t cpu_epoch = 0;
+		for (const auto& dep: record.buffers) {
+			const auto epoch = buffers.CpuModificationEpoch(dep.address, dep.size);
+			if (epoch == 0) {
+				cpu_epoch = 0;
+				break;
+			}
+			cpu_epoch += epoch;
+		}
+		// The epochs cannot prove it: the ranges themselves (what the normal path's
+		// ObtainBuffer checks per draw).
+		const bool buffers_clean = record.buffers.empty() || (cpu_epoch != 0 && cpu_epoch == record.cpu_epoch) ||
+		                           std::ranges::none_of(record.buffers, [&](const auto& dep) {
+			                           return buffers.IsRegionCpuModified(dep.address, dep.size);
+		                           });
+		// Images: no image became CPU-dirty since the proof, or none of these did.
+		const auto image_epoch  = Image::CpuDirtyEpoch();
+		bool       images_clean = image_epoch == record.image_dirty_epoch;
+		if (buffers_clean && !images_clean) {
+			images_clean = std::ranges::none_of(record.images, [&](const auto& dep) {
+				const auto* image = textures.m_slot_images.try_get(dep.id);
+				return image == nullptr || image->serial != dep.serial || image->IsCpuDirty();
+			});
+			if (images_clean) record.image_dirty_epoch = image_epoch;
+		}
+		if (buffers_clean && images_clean) return true;
+	}
+	const auto image_epoch_at_proof = Image::CpuDirtyEpoch();
 	// Buffers: live owners, CPU-clean. The region epochs prove both unchanged
 	// cheaply; when they moved, check each range.
 	uint64_t cpu_epoch = 0;
@@ -2044,7 +2195,7 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 		if (registrations_moved) {
 			if (per_image && image->registered && image->registrations == dep.registration &&
 			    !image->depth_id && !image->binding.needs_rebind) {
-				image->tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
+				image->frame_accessed_last = textures.CurrentFrame();
 			} else if (!textures.IsSampledImageCurrent(dep.id, dep.desc)) {
 				return false;
 			}
@@ -2054,16 +2205,24 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 	record.resolution_epoch = textures.ResolutionEpoch();
 	record.mapping_epoch    = resources.MappingEpoch();
 	record.validated_frame  = frame;
+	record.image_dirty_epoch = image_epoch_at_proof;
 	return true;
 }
 
 // Emits the draws of one record under one draw state. `commands` are the
 // GPU-side DrawIndexedIndirectCommand addresses, all drawn with the same bindings.
+struct RenderExecutor::NativeXprDirect {
+	NativeXprDirectDraw draw;
+	int32_t             vertex_offset  = 0;
+	uint32_t            first_instance = 0;
+};
+
 bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& record,
                                    const NativeXprDrawState& draw_state,
                                    const PipelineCache::Pipeline& pipeline,
                                    std::span<const uint64_t> commands, uint64_t index_base,
-                                   uint64_t index_bytes, vk::IndexType index_type, bool keep_clears) {
+                                   uint64_t index_bytes, vk::IndexType index_type, bool keep_clears,
+                                   const NativeXprDirect* direct) {
 	auto&           cache = *m_native_xpr;
 	auto& upload = m_context.GetBufferCache().GetShaderUploadBuffer();
 	if (upload.Handle() != record.upload) {
@@ -2101,10 +2260,11 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	// One lookup per group of consecutive arguments: the same range the draws
 	// read, synchronized as the per-draw lookups would.
 	constexpr uint64_t stride = sizeof(vk::DrawIndexedIndirectCommand);
-	std::array<std::pair<Buffer*, uint64_t>, 64> arguments {};
-	std::array<uint32_t, 64>                     group_sizes {};
+	// Only the first `groups` entries are written and read: no zero fill (1.25 KB per draw).
+	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
+	std::array<uint32_t, 64>                     group_sizes;
 	uint32_t                                     groups = 0;
-	EXIT_IF(commands.size() > arguments.size());
+	EXIT_IF(commands.size() > arguments.size() || (direct != nullptr && !commands.empty()));
 	for (size_t first = 0; first < commands.size();) {
 		size_t count = 1;
 		while (first + count < commands.size() && commands[first + count] == commands[first] + count * stride) ++count;
@@ -2184,6 +2344,11 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 		vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
 	}
 	if ((debug & 2u) == 0) {
+		if (direct != nullptr) {
+			// The index buffer is bound at the draw's first index (index_base).
+			vk_buffer.drawIndexed(direct->draw.index_count, direct->draw.instance_count, 0, direct->vertex_offset,
+			                      direct->first_instance);
+		}
 		// Each group of consecutive arguments goes out as one multi-draw.
 		for (uint32_t group = 0; group < groups; ++group)
 			vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second,
@@ -2196,6 +2361,12 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	emit.index_base  = index_base;
 	emit.index_bytes = index_bytes;
 	emit.index_type  = index_type;
+	// KYTY_FRAMEGEN: the camera, which the normal path's draw hook reads from the G-buffer vertex
+	// shader's SRT. Without it frames drawn from records had no generated frames (and were not
+	// capped by KYTY_FLIP_RATE).
+	if (FrameGen::Enabled() && record.stage_count > 0 && record.stages[0].program != nullptr) {
+		FrameGen::OnDraw(record.stages[0].program->shader_hash, record.stages[0].flattened);
+	}
 	return true;
 }
 
@@ -2232,9 +2403,11 @@ bool RenderExecutor::NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArg
 // Runtime: a DRAW_INDEX_INDIRECT run of the current object. `clean`: no graphics
 // register changed since the previous indexed indirect draw except user data.
 bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<const uint64_t> commands,
-                                  uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type) {
+                                  uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
+                                  const NativeXprDirectDraw* direct) {
 	auto& cache = NativeXprState();
-	if (buffer.IsInvalid() || commands.empty() || commands.size() > 64 || index_base == 0 || index_bytes == 0)
+	if (buffer.IsInvalid() || (direct == nullptr ? commands.empty() : !commands.empty()) || commands.size() > 64 ||
+	    index_base == 0 || index_bytes == 0)
 		return false;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
@@ -2248,10 +2421,13 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	const auto hash  = XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t));
 	auto* const found = cache.IndexFind(hash);
 	if (found != nullptr) NativeXprPrefetchFields(*found);
+	LiveCounters::Add(direct != nullptr ? LiveCounters::XprDirectTries : LiveCounters::XprTries);
 	if (found == nullptr || !found->SameKey(cache.key)) {
+		LiveCounters::Add(LiveCounters::XprMissKey);
 		if (const auto pair = cache.pairs.find(NativeXprPairKey(cache.key));
-		    pair != cache.pairs.end() && pair->second.blocked)
+		    pair != cache.pairs.end() && (pair->second.blocked || pair->second.unstorable))
 			return false;
+		if (!cache.SeenAgain(hash, m_context.FrameNumber())) return false;
 		m_native_xpr_store = true;
 		return false;
 	}
@@ -2261,30 +2437,58 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	if (kyty_local_native_xpr_predict_mode.load(std::memory_order_relaxed) != 0) {
 		// Learn the order, then fetch the fields of the predicted next record while
 		// this draw runs. Records are found through the index only (never a stale pointer).
-		if (cache.last_hash != 0 && cache.last_hash != hash)
+		if (cache.last_hash != 0 && cache.last_hash != hash) {
 			if (auto* previous = cache.IndexFind(cache.last_hash)) previous->next_hash = hash;
+			if (cache.last2_hash != 0 && cache.last2_hash != hash)
+				if (auto* before = cache.IndexFind(cache.last2_hash)) before->next2_hash = hash;
+			cache.last2_hash = cache.last_hash;
+		}
 		cache.last_hash = hash;
+		// Two ahead: the index line of the record after next, so the lookup below finds the
+		// next record's slot in cache (the index is too large to stay there between frames).
+		if (record.next2_hash != 0) __builtin_prefetch(cache.IndexSlotOf(record.next2_hash));
 		if (record.next_hash != 0)
 			if (auto* next = cache.IndexFind(record.next_hash)) NativeXprPrefetchFields(*next);
 	}
-	const auto state_it = cache.states.find(cache.state_key);
-	if (state_it == cache.states.end()) {
-		m_native_xpr_store = true;
-		return false;
+	// States are never erased (a replaced one keeps its address): the last lookup's entry
+	// stands while the state key is the same.
+	if (cache.last_state == nullptr || cache.last_state_key != cache.state_key) {
+		const auto state_it = cache.states.find(cache.state_key);
+		if (state_it == cache.states.end()) {
+			LiveCounters::Add(LiveCounters::XprMissState);
+			m_native_xpr_store = true;
+			return false;
+		}
+		cache.last_state_key = cache.state_key;
+		cache.last_state     = state_it->second.get();
 	}
 	const auto pipeline_it = std::ranges::find(record.pipelines, cache.state_key,
 	                                           &std::pair<uint64_t, const PipelineCache::Pipeline*>::first);
 	if (pipeline_it == record.pipelines.end()) {
+		LiveCounters::Add(LiveCounters::XprMissState);
 		m_native_xpr_store = true;
 		return false;
 	}
-	const auto& draw_state = *state_it->second;
+	// A direct draw also needs the offsets the normal path resolved under this state.
+	NativeXprDirect direct_draw;
+	if (direct != nullptr) {
+		const auto offsets =
+		    std::ranges::find(record.direct_offsets, cache.state_key, &NativeXprRecord::DirectOffsets::state);
+		if (offsets == record.direct_offsets.end()) {
+			LiveCounters::Add(LiveCounters::XprMissState);
+			m_native_xpr_store = true;
+			return false;
+		}
+		direct_draw = {*direct, offsets->vertex, offsets->instance};
+	}
+	const auto& draw_state = *cache.last_state;
 	// A deleted target image took the state's attachment views along (its slot
 	// may hold another image by now): the normal path captures the state again.
 	auto& textures = m_context.GetTextureCache();
 	for (const auto& target: draw_state.targets) {
 		const auto* image = textures.m_slot_images.try_get(target.id);
 		if (image == nullptr || image->serial != target.serial) {
+			LiveCounters::Add(LiveCounters::XprMissTarget);
 			m_native_xpr_store = true;
 			return false;
 		}
@@ -2293,15 +2497,17 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	// arrays together instead of missing on each in turn.
 	NativeXprPrefetchArrays(record);
 	// A sampled image that is also a render target takes the normal path.
-	for (const auto& dep: record.images)
+	for (const auto id: record.image_ids)
 		for (const auto& target: draw_state.targets)
-			if (dep.id == target.id) {
+			if (id == target.id) {
+				LiveCounters::Add(LiveCounters::XprMissTarget);
 				return false;
 			}
 	const auto frame = m_context.FrameNumber();
 	// Every use reads the SRT words again: the guest may rewrite constants between
 	// two draws of one frame (the normal path reads them at each draw).
 	if (!NativeXprValidate(record, frame)) {
+		LiveCounters::Add(LiveCounters::XprMissValidate);
 		cache.IndexErase(hash);
 		const auto owner = cache.records.find(hash);
 		NativeXprRetire(std::move(owner->second), true);
@@ -2313,22 +2519,25 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		m_native_xpr_verify = {&record, &draw_state};
 		return false;
 	}
-	return NativeXprEmit(buffer, record, draw_state, *pipeline_it->second, commands, index_base, index_bytes,
-	                     index_type, false);
+	const bool emitted = NativeXprEmit(buffer, record, draw_state, *pipeline_it->second, commands, index_base,
+	                                   index_bytes, index_type, false, direct != nullptr ? &direct_draw : nullptr);
+	if (emitted) LiveCounters::Add(direct != nullptr ? LiveCounters::XprDirectHits : LiveCounters::XprHits);
+	return emitted;
 }
 
 // Mode 2: the normal path prepared the draw the native path would have emitted
 // from `m_native_xpr_verify`; every difference is a record the proofs kept
 // although it went stale (or state they do not cover).
 void RenderExecutor::NativeXprVerify(CommandBuffer& buffer, const DrawRenderState& state,
-                                     const RenderState& rendering, std::span<PreparedBindings* const> stages) {
+                                     const RenderState& rendering, std::span<PreparedBindings* const> stages,
+                                     const DrawEmitInfo& emit) {
 	const auto pending = m_native_xpr_verify;
 	m_native_xpr_verify = {};
 	if (pending.record == nullptr) return;
 	const auto& record     = *pending.record;
 	const auto& draw_state = *pending.state;
 	static uint64_t                 verified = 0, mismatches = 0;
-	static std::array<uint64_t, 11> kinds {};
+	static std::array<uint64_t, 12> kinds {};
 	++verified;
 	uint32_t mismatch = 0;
 	if (stages.size() != record.stage_count) mismatch |= 1u;
@@ -2382,6 +2591,14 @@ void RenderExecutor::NativeXprVerify(CommandBuffer& buffer, const DrawRenderStat
 	        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
 	        : vk::ImageAspectFlags {});
 	if (std::memcmp(&dynamic, &draw_state.dynamic, sizeof(dynamic)) != 0) mismatch |= 1024u;
+	// Direct draws: the offsets the record holds for this state.
+	if (emit.state_offsets) {
+		const auto offsets = std::ranges::find(record.direct_offsets, m_native_xpr->state_key,
+		                                       &NativeXprRecord::DirectOffsets::state);
+		if (offsets != record.direct_offsets.end() &&
+		    (offsets->vertex != emit.vertex_offset || offsets->instance != emit.first_instance))
+			mismatch |= 2048u;
+	}
 	if (mismatch != 0) {
 		++mismatches;
 		for (uint32_t bit = 0; bit < kinds.size(); ++bit)
@@ -2406,8 +2623,8 @@ void RenderExecutor::NativeXprVerify(CommandBuffer& buffer, const DrawRenderStat
 	}
 	if (verified % 20000 == 0) {
 		std::printf("NATIVE_XPR_VERIFY_SUMMARY verified=%" PRIu64 " mismatches=%" PRIu64, verified, mismatches);
-		static constexpr const char* names[] = {"stages", "program", "structure", "flattened", "shader_data",
-		                                        "views", "samplers", "buffers", "targets", "depth_layout", "dynamic"};
+		static constexpr const char* names[] = {"stages", "program", "structure", "flattened", "shader_data", "views",
+		                                        "samplers", "buffers", "targets", "depth_layout", "dynamic", "offsets"};
 		for (size_t i = 0; i < kinds.size(); ++i) std::printf(" %s=%" PRIu64, names[i], kinds[i]);
 		std::printf("\n");
 		std::fflush(stdout);

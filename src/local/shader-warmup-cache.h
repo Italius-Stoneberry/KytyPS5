@@ -212,7 +212,7 @@ template<class A> bool VisitPipeline(A& a, PipelineRecord& r) {
 class Cache {
 public:
     static constexpr size_t MaxBytes = 256 * 1024 * 1024;
-    static constexpr uint32_t MaxRecords = 16384, MaxPipelines = 65536;
+    static constexpr uint32_t MaxRecords = 65536, MaxPipelines = 262144;
     bool Enabled() const { return !path.empty(); }
     std::vector<std::vector<uint32_t>> records, pipelines;
     ~Cache() { StopWriter(); }
@@ -222,35 +222,37 @@ public:
         records.clear(); pipelines.clear(); record_index.clear(); pipeline_index.clear();
         changed = false; total_bytes = 8;
         path = location; identity = "KytyShaderWarmup2:" + signature;
-        std::vector<uint32_t> contents;
         if (!std::filesystem::exists(path)) return true;
-        if (!ReadFile(path, identity, contents)) return false;
-        Reader reader {contents};
-        std::vector<std::vector<uint32_t>> loaded, loaded_pipelines;
-        if (!ReadRecords(reader, loaded)) return false;
-        uint32_t count = 0; reader(count);
-        if (!reader.Good() || count > MaxPipelines) return false;
-        loaded_pipelines.resize(count);
-        for (auto& words : loaded_pipelines) {
-            if (!Words(reader, words, 4096) || !ValidPipeline(words, loaded)) return false;
+        return Load(path, identity);
+    }
+
+    // The first line of a warm file: its schema, title and device signature.
+    static std::string FileIdentity(const std::filesystem::path& location) {
+        std::ifstream file(location, std::ios::binary);
+        std::string signature;
+        for (char c = 0; signature.size() < 1024 && file.get(c);) {
+            signature += c;
+            if (c == '\n') return signature;
         }
-        if (!reader.Good() || reader.cursor != contents.size()) return false;
-        records = std::move(loaded); pipelines = std::move(loaded_pipelines);
-        Reindex(); return true;
+        return {};
+    }
+
+    // Takes over the inputs of another device signature's file (another driver version of
+    // the same GPU, or another OS) while this one is still empty. They are compiler inputs,
+    // validated again on load and against the live source on use; saved under this identity.
+    bool Adopt(const std::filesystem::path& from) {
+        if (!Enabled() || !records.empty() || !pipelines.empty()) return false;
+        const auto signature = FileIdentity(from);
+        if (!signature.starts_with("KytyShaderWarmup2:") || !Load(from, signature)) return false;
+        changed = true;
+        return true;
     }
 
     // Version 1 contains compiler inputs, not compiled driver binaries. Import
     // only matching hardware inputs, validate every record, then recompile with
     // the current compiler. Live source/key/specialization checks still apply.
     bool ImportLegacy(const std::filesystem::path& location, std::string_view device_suffix) {
-        std::ifstream file(location, std::ios::binary);
-        std::string signature;
-        for (size_t i = 0; i < 1024; ++i) {
-            char c = 0;
-            if (!file.get(c)) return false;
-            signature += c;
-            if (c == '\n') break;
-        }
+        const auto signature = FileIdentity(location);
         if (!signature.starts_with("KytyShaderWarmup1:KytyPC1:") ||
             !signature.ends_with(device_suffix)) return false;
         std::vector<uint32_t> contents;
@@ -309,6 +311,16 @@ public:
         return ok;
     }
 
+    // A seed file (tools/local/static-precompile): the same schema under its own identity line, with
+    // records whose resource specialization is left to the compiler (see PipelineCache::WarmSeeds).
+    static bool ReadSeeds(const std::filesystem::path& location, std::vector<std::vector<uint32_t>>& out_records,
+                          std::vector<std::vector<uint32_t>>& out_pipelines) {
+        const auto signature = FileIdentity(location);
+        std::vector<uint32_t> contents;
+        return signature.starts_with("KytyShaderSeeds1:") && ReadFile(location, signature, contents) &&
+               Parse(contents, out_records, out_pipelines);
+    }
+
 private:
     struct Pending { bool pipeline; std::vector<uint32_t> words; };
     using Index = std::unordered_multimap<uint64_t, uint32_t>;
@@ -357,6 +369,26 @@ private:
             pending.push_back({pipeline, entries.back()});
         }
         return id;
+    }
+    // Nothing changes unless the whole file is valid.
+    bool Load(const std::filesystem::path& location, const std::string& signature) {
+        std::vector<uint32_t> contents;
+        std::vector<std::vector<uint32_t>> loaded, loaded_pipelines;
+        if (!ReadFile(location, signature, contents) || !Parse(contents, loaded, loaded_pipelines)) return false;
+        records = std::move(loaded); pipelines = std::move(loaded_pipelines);
+        Reindex(); return true;
+    }
+    // Records, then pipeline recipes valid against them, and nothing after.
+    static bool Parse(const std::vector<uint32_t>& contents, std::vector<std::vector<uint32_t>>& out_records,
+                      std::vector<std::vector<uint32_t>>& out_pipelines) {
+        Reader reader {contents};
+        if (!ReadRecords(reader, out_records)) return false;
+        uint32_t count = 0; reader(count);
+        if (!reader.Good() || count > MaxPipelines) return false;
+        out_pipelines.resize(count);
+        for (auto& words : out_pipelines)
+            if (!Words(reader, words, 4096) || !ValidPipeline(words, out_records)) return false;
+        return reader.Good() && reader.cursor == contents.size();
     }
     static bool ReadFile(const std::filesystem::path& location, const std::string& signature,
                          std::vector<uint32_t>& contents) {

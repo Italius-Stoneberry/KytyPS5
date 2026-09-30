@@ -55,7 +55,22 @@ def generate(registry, header):
                       # Native XPR records allocate while the worker may still write
                       # other sets of the same pool (vkUpdateDescriptorSets needs only
                       # the destination set synchronized).
-                      'vkAllocateDescriptorSets'}
+                      'vkAllocateDescriptorSets',
+                      # Likewise a free: a set is freed only once the GPU passed the tick
+                      # it retired at, so no unreplayed packet names it (once a frame).
+                      'vkFreeDescriptorSets',
+                      # New objects no queued packet can reference.
+                      'vkCreateDescriptorSetLayout', 'vkCreateSampler'}
+    # Live `tracem`: a GPU timestamp after each emulator-side work command (LiveTrace::VulkanMark);
+    # the ids are the tags tools/local/live-trace.py marks prints by name.
+    MARK_IDS = {'vkCmdDispatch': 1, 'vkCmdDispatchIndirect': 2, 'vkCmdDispatchBase': 3,
+                'vkCmdCopyBuffer': 10, 'vkCmdCopyBuffer2': 11, 'vkCmdCopyImage': 12, 'vkCmdCopyImage2': 13,
+                'vkCmdCopyBufferToImage': 14, 'vkCmdCopyBufferToImage2': 15,
+                'vkCmdCopyImageToBuffer': 16, 'vkCmdCopyImageToBuffer2': 17,
+                'vkCmdFillBuffer': 20, 'vkCmdUpdateBuffer': 21,
+                'vkCmdClearColorImage': 30, 'vkCmdClearDepthStencilImage': 31, 'vkCmdClearAttachments': 32,
+                'vkCmdBlitImage': 40, 'vkCmdBlitImage2': 41, 'vkCmdResolveImage': 42, 'vkCmdResolveImage2': 43,
+                'vkCmdPipelineBarrier': 50, 'vkCmdPipelineBarrier2': 51}
     declarations, installs, names, deferred = [], [], [], []
     section = header.read_text().split('class DispatchLoaderDynamic :', 1)[1].split(
         'DispatchLoaderDynamic()', 1)[0]
@@ -77,8 +92,15 @@ def generate(registry, header):
         # Besides vkCmd*, calls that must keep their order relative to recorded commands
         # but need no result: queue them instead of draining.
         ok = (name.startswith('vkCmd') or name in ORDERED_HOST_CALLS) and ret == 'void'
+        # A host allocator cannot be copied; the renderer never passes one. Such a call is
+        # queued only without it (vkDestroyImageView drained the stream five times a frame).
+        allocator = False
         for p in params:
             n, t, d = p.findtext('name'), p.findtext('type'), decl(p)
+            if n == 'pAllocator' and t == 'VkAllocationCallbacks':
+                allocator = True
+                args.append('nullptr')
+                continue
             if '*' not in d and '[' not in d:
                 args.append(n)
                 continue
@@ -94,13 +116,17 @@ def generate(registry, header):
             copies.append(f'auto copied_{n} = writer.Copy({n}, {size});')
             args.append('copied_' + n)
         names.append(name)
+        mark_id = MARK_IDS.get(name[:-3] if name.endswith('KHR') else name)
+        mark = (f'LiveTrace::VulkanMark(commandBuffer, {mark_id}, {"true" if mark_id < 10 else "false"}); '
+                if mark_id is not None and ret == 'void' else '')
         declarations.append(f'static VKAPI_ATTR {ret} VKAPI_CALL Wrapped_{name}({", ".join(decl(p) for p in params)}) {{')
         # Commands that do GPU work or synchronize: unchanged between two barriers = none in between.
         if re.match(r'vkCmd(Draw|Dispatch|Copy|Fill|Clear|Blit|Resolve|UpdateBuffer|BeginRendering|PipelineBarrier|WriteTimestamp|ExecuteCommands)', name):
             declarations.append('    g_work_calls.fetch_add(1, std::memory_order_relaxed);')
         if ok:
             deferred.append(name)
-            declarations.append('    if (auto* stream = RecordingStream()) {')
+            declarations.append('    if (auto* stream = pAllocator == nullptr ? RecordingStream() : nullptr) {'
+                                if allocator else '    if (auto* stream = RecordingStream()) {')
             declarations.append('        if (stream->Enqueue([&](Writer& writer) {')
             declarations.extend('            ' + c for c in copies)
             mutates_state = (name.startswith('vkCmdSet') or name.startswith('vkCmdBindPipeline') or
@@ -108,14 +134,18 @@ def generate(registry, header):
                              name.startswith('vkCmdBeginRenderPass') or name.startswith('vkCmdNextSubpass'))
             invalidate = 'InvalidateRawState(); ' if mutates_state else ''
             declarations.append(f'            writer.Command([=] {{ {invalidate}original.{name}({", ".join(args)}); }});')
-            declarations.append('        })) return;')
+            declarations.append(f'        }})) {{ {mark}return; }}')
             declarations.append('    }')
         # A progress query observes previously submitted work and neither
         # accesses a command pool nor executes commands still being recorded.
         # Preserve the real query; do not wait for our CPU recording queue.
         if name not in NO_DRAIN_CALLS:
             declarations.append('    BeforeDirect();')
-        declarations.append(f'    return original.{name}({", ".join(pnames)});')
+        if mark:
+            declarations.append(f'    original.{name}({", ".join(pnames)});')
+            declarations.append(f'    {mark}')
+        else:
+            declarations.append(f'    return original.{name}({", ".join(pnames)});')
         declarations.append('}')
         installs.append(f'if (original.{name}) dispatcher.{name} = Wrapped_{name};')
     return ('// Generated; edit generate-vulkan-recording.py, not this file.\n' +

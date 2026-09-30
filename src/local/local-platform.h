@@ -1,0 +1,54 @@
+#pragma once
+// Host-OS helpers for the local performance and diagnostic code (thread names, thread
+// ids, CPU pinning), so the local headers stay free of <windows.h> and Linux-only APIs.
+
+#include <cstddef>
+#include <cstdint>
+
+namespace LocalPlatform {
+
+// Names the calling thread (Linux: 15 characters are kept).
+void SetThreadName(const char* name);
+
+// The OS id of the calling thread (Linux: gettid, Windows: GetCurrentThreadId).
+uint32_t ThreadId();
+
+// Pins the calling thread to a comma-separated CPU list ("1,2,3"); an empty or invalid
+// list leaves the affinity alone.
+void PinThreadToCpuList(const char* list);
+
+// Pins a thread (a CurrentThreadHandle) to a CPU list; false if the list or the call fails.
+bool PinThreadHandleToCpuList(uint64_t handle, const char* list);
+
+// Windows: the process's default CPU set as a CPU list; "" restores all CPUs. Linux: false.
+bool SetProcessDefaultCpuList(const char* list);
+
+// Opaque handle of the calling thread for ThreadCpuSeconds (valid while the thread runs).
+uint64_t CurrentThreadHandle();
+double   ThreadCpuSeconds(uint64_t handle);
+
+// Total CPU seconds of the threads with this name (0 where the OS cannot enumerate them).
+double NamedThreadsCpuSeconds(const char* name);
+
+// Stack bounds of the calling thread; false when unknown.
+bool CurrentThreadStack(uint64_t* low, uint64_t* high);
+
+#if defined(_WIN32)
+// Collects the unwind tables of the loaded images for SampleThread (call before sampling).
+void PrepareSampling();
+
+// Suspends the thread (a CurrentThreadHandle) and records pc and its callers (unwound with
+// the tables of PrepareSampling, else the word at rsp and the frame-pointer chain) within its
+// stack [stack_low, stack_high) into out[0..words). stack_high 0: the stack is unknown (a guest
+// thread), the walk stays inside the committed region that holds rsp.
+bool SampleThread(uint64_t handle, uint64_t stack_low, uint64_t stack_high, uint64_t* out, size_t words);
+// A handle to another thread of this process for SampleThread and PinThreadHandleToCpuList (0 if
+// it cannot be opened), and its release.
+uint64_t OpenThreadForSampling(uint32_t thread_id);
+void     CloseThreadForSampling(uint64_t handle);
+
+// Base address and path of the module that contains the address.
+bool ModuleOf(const void* address, uint64_t* base, char* path, size_t path_size);
+#endif
+
+} // namespace LocalPlatform

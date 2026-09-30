@@ -84,6 +84,32 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
+// The canonical form of a specialization of portable modules (PortableShaders): the fields the
+// code reads from its buffer words at run time (a stride below 4096 without swizzling) are cleared,
+// so a warmup record from before canonicalizes to the permutation the game now selects (but for a
+// null texture, which such a record holds as 2D; MaterializeResources now gives it the dimension
+// the shader declares).
+void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& specialization);
+
+// The portable form of a (canonical) specialization: the formatted buffers the code only loads from
+// decode the format of their buffer words (RuntimeBufferFormat) instead of the V#'s. Its module
+// serves every format: the static precompile compiles it, and a program meets a format for the
+// first time with it (PipelineCache). False when that leaves the specialization unchanged.
+bool PortableFormats(const ShaderInfo& info, ResourceSpecialization& specialization);
+
+// The buffer word (BufferWord) of a materialized V#.
+uint32_t BufferDescriptorWord(const DescriptorValue& descriptor);
+
+// A buffer format's layout and component type as a buffer word holds them (bits 0-6 of the word
+// shifted right by BufferWord::LayoutShift); 0 for a format without them.
+uint32_t BufferFormatClass(Prospero::BufferFormat format);
+
+// The numeric class each image of a program most likely has, from how the program uses it (the
+// texture's format, which decides it, is the game's data): Uint when what it reads is used as
+// integers (bit operations, integer compares and conversions) and never as floats, or what it
+// stores is made by integer operations; Float otherwise. For the static precompile.
+std::vector<Prospero::TextureNumericClass> PredictImageNumericClasses(const Program& program);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCEMATERIALIZATION_H_ */

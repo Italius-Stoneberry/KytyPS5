@@ -69,19 +69,24 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
+// The bit queries read under the region lock's sequence (TrackingSpinLock::ReadShared): every
+// change of the bits holds the lock.
+template <typename Query>
+static bool QueryRegion(RegionManager* manager, Query&& query) {
+	return manager->lock.ReadShared(query);
+}
+
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		return QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Cpu>(offset, bytes); });
 	});
 }
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+		return QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Gpu>(offset, bytes); });
 	});
 }
 
@@ -89,8 +94,7 @@ bool MemoryTracker::IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	// Missing regions start CPU-dirty, so they must also participate in this test.
 	return !Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
-		return !manager->IsModified<DirtySource::Gpu, true>(offset, bytes);
+		return !QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Gpu, true>(offset, bytes); });
 	});
 }
 

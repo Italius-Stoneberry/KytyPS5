@@ -7,7 +7,8 @@
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
-#include "live-trace.h"
+#include "live-trace-gpu.h"
+#include "local-platform.h"
 
 #include <algorithm>
 #include <atomic>
@@ -113,7 +114,7 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
       m_tick_monitor([this](std::stop_token stop) {
-	      (void)pthread_setname_np(pthread_self(), "Kyty.TickMon");
+	      LocalPlatform::SetThreadName("Kyty.TickMon");
 	      {
 		      vk::QueryPoolCreateInfo info {};
 		      info.queryType  = vk::QueryType::eTimestamp;
@@ -454,6 +455,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	LiveTrace::g_mark_command = static_cast<VkCommandBuffer>(m_command.m_buffer);
 	return m_command;
 }
 
@@ -514,6 +516,7 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 	if (result != VK_SUCCESS) {
 		EXIT("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n", static_cast<int>(result), submit.tick);
 	}
+	LocalVulkanRecording::NoteDeferredSubmitDone();
 }
 } // namespace
 #endif
@@ -550,6 +553,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 			deferred.signal_ticks[i]      = submit.signal_ticks[i];
 		}
 		const LocalVulkanRecording::Segment segments[] {{&deferred, sizeof(deferred)}};
+		LocalVulkanRecording::NoteDeferredSubmitQueued();
 		if (!LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true)) {
 			// Keep order: everything recorded so far, then this exact submit.
 			LocalVulkanRecording::Drain();

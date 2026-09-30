@@ -36,6 +36,22 @@ public:
 	};
 	static void SetDeferredWriteProtectSink(std::vector<DeferredRange>* sink) noexcept;
 
+	// Sets every page of the range to its watchers' current protection (writable when none).
+	void SyncProtection(uint64_t vaddr, uint64_t size);
+
+	// While set on this thread, watchers released inside [begin, end) update the page state
+	// without making the pages writable on the host: the range is about to be unmapped, which
+	// drops its protection anyway (a texture pool made of 64 KiB mappings cost one VirtualProtect
+	// per mapping for each image the unmap deleted). Protections are still applied: a skipped one
+	// would leave a watched page writable and writes to it unseen. If the unmap fails, the caller
+	// syncs the range (SyncProtection). end == 0 clears it.
+	static void SetUnmappingRange(uint64_t begin, uint64_t end) noexcept;
+	// A write fault on a page no watcher holds: its host protection is not the trackers'. Gives
+	// the page the guest's own protection back (writable if the guest's is) and returns true;
+	// false when the page is watched. Checked and changed under the page's lock, so a watcher
+	// protecting the page meanwhile is not undone.
+	[[nodiscard]] bool RestoreIfUnwatched(uint64_t vaddr) noexcept;
+
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>

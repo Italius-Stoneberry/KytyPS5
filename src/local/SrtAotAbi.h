@@ -4,6 +4,13 @@
 #include <cstdint>
 #include <cstring>
 
+// Exported entry points of a compiled plan library.
+#if defined(_WIN32)
+#define KYTY_SRT_AOT_EXPORT __declspec(dllexport)
+#else
+#define KYTY_SRT_AOT_EXPORT __attribute__((visibility("default")))
+#endif
+
 // Standalone interface for locally compiled resource plans. No STL layouts,
 // emulator pointers embedded in code, or guest memory contents enter the file.
 namespace KytySrtAot {

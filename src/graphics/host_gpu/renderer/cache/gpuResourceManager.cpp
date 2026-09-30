@@ -5,6 +5,9 @@
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 
 #include <bit>
+#include <chrono>
+#include <optional>
+#include <x86intrin.h>
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -13,6 +16,9 @@
 
 extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode {0};
+// 1: watchers removed while memory is released skip the host protection change there
+// (PageManager::SetUnmappingRange); a write fault on a page nothing watches unprotects it.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode {0};
 }
 
 namespace Libs::Graphics {
@@ -87,6 +93,12 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 			return true;
 		}
 		LiveCounters::Add(LiveCounters::WriteFault);
+		// No watcher holds the page, so no cache expects this fault: the protection outlived its
+		// watchers and would fault forever. It gets the guest's own protection back.
+		if (m_page_manager.RestoreIfUnwatched(fault_vaddr)) {
+			LiveCounters::Add(LiveCounters::StaleProtectRepairs);
+			return true;
+		}
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
@@ -115,7 +127,17 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 }
 
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
-	if (m_gpu) m_gpu->SendCommandSync([this] { m_buffer_cache.DrainGuestReadback(); });
+	if (m_gpu) {
+		// A pending readback writes its backing when it finishes, which a new mapping aliasing
+		// mapped memory would show; memory nothing else maps has no readback pending.
+		const bool aliased = !LibKernel::Memory::IsUniqueGuestBackingRange(vaddr, size);
+		m_gpu->SendCommandSync([this, vaddr, size, aliased] {
+			if (aliased) m_buffer_cache.DrainGuestReadback();
+			m_texture_cache.MapMemory(vaddr, size);
+		});
+	} else {
+		m_texture_cache.MapMemory(vaddr, size);
+	}
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
@@ -123,20 +145,44 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
+void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing) {
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	const auto unmap = [this, vaddr, size] {
-		m_buffer_cache.DrainGuestReadback();
+	const auto unmap = [this, vaddr, size, releasing] {
+		// Released memory loses its host protection with the mapping: the watchers removed
+		// below need not restore it page run by page run first.
+		struct UnmappingRange {
+			explicit UnmappingRange(uint64_t begin, uint64_t end) { PageManager::SetUnmappingRange(begin, end); }
+			~UnmappingRange() { PageManager::SetUnmappingRange(0, 0); }
+		};
+		std::optional<UnmappingRange> unmapping;
+		if (releasing && kyty_local_unmap_protect_skip_mode.load(std::memory_order_relaxed) != 0) {
+			unmapping.emplace(vaddr, vaddr + size);
+		}
+		// Readbacks write guest memory when they finish: the ones into the range finish first
+		// (the others do not touch it).
+		m_buffer_cache.DrainGuestReadback(vaddr, size);
 		// Pending upload copies read the backing of ranges that are about to change owner.
 		AsyncUpload::Drain();
-		if (m_scheduler.Active()) {
-			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Finish();
-			m_scheduler.WaitPriorityOperations(tick);
+		// The GPU only works on the caches' own buffers and images, which are freed after the
+		// work in flight completes (deferred operations), so the unmap need not wait for the GPU
+		// (it used to finish all of it: up to a frame of GPU work, for every guest unmap). What
+		// writes guest memory after the GPU are the readbacks drained above and GPU-written
+		// images' downloads, which complete on the priority thread: wait for those over the range.
+		// (Deferred fault-buffer processing skips ranges no longer mapped.)
+		const auto download_tick = m_scheduler.Active() ? m_texture_cache.PendingDownloadTick(vaddr, size) : 0;
+		if (download_tick != 0) {
+			const auto start = std::chrono::steady_clock::now();
+			if (!m_scheduler.IsFree(download_tick)) m_scheduler.Wait(download_tick);
+			m_scheduler.WaitPriorityOperations(download_tick);
+			LiveCounters::Add(LiveCounters::UnmapFinishes);
+			LiveCounters::Add(LiveCounters::UnmapFinishUs,
+			                  static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                            std::chrono::steady_clock::now() - start)
+			                                            .count()));
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);

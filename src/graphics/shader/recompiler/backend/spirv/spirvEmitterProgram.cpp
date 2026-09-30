@@ -659,8 +659,13 @@ void EmitProgram(EmitterState& state) {
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		if (state.lane_count == 2) {
-			for (const auto& [inst, id]: dispatch.spills[0]) {
-				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
+			// In program order: the ids, hence the module, must not depend on where the IR lives.
+			for (const auto* block: program.blocks) {
+				for (const auto& inst: *block) {
+					if (dispatch.spills[0].contains(&inst)) {
+						dispatch.spills[1].emplace(&inst, state.builder.AllocateId());
+					}
+				}
 			}
 			high.dispatcher_spills = &dispatch.spills[1];
 		}

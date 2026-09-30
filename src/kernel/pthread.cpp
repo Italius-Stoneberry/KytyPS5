@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "time-census.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -3898,6 +3899,7 @@ int KYTY_SYSV_ABI KernelClockGetres(KernelClockid clock_id, KernelTimespec* tp) 
 
 int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp) {
 	// Called constantly by Python frame/timer code.
+	KYTY_TIME_CENSUS(KernelClockGettime, static_cast<uint64_t>(clock_id));
 
 	if (tp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -3929,6 +3931,7 @@ int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp)
 
 int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 	// PRINT_NAME();
+	KYTY_TIME_CENSUS(Gettimeofday, 0);
 
 	if (tp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -4045,14 +4048,17 @@ int KYTY_SYSV_ABI KernelConvertUtcToLocaltime(int64_t utc_time, int64_t* local_t
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetTscFrequency() {
+	KYTY_TIME_CENSUS(TscFrequency, 0);
 	return KernelGetTscFrequencyNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelReadTsc() {
+	KYTY_TIME_CENSUS(ReadTsc, 0);
 	return KernelReadTscNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
+	KYTY_TIME_CENSUS(ProcessTime, 0);
 	const auto frequency = KernelGetTscFrequencyNative();
 	if (frequency == 0) {
 		return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0);
@@ -4064,10 +4070,12 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter() {
+	KYTY_TIME_CENSUS(ProcessTimeCounter, 0);
 	return KernelGetElapsedTsc();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounterFrequency() {
+	KYTY_TIME_CENSUS(CounterFrequency, 0);
 	return KernelGetTscFrequencyNative();
 }
 
@@ -4082,6 +4090,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	KYTY_TIME_CENSUS(Usleep, microseconds);
 	Common::Timer t;
 	t.Start();
 	SleepMicroWithSignalPoll(microseconds);
@@ -4103,6 +4112,9 @@ unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(Nanosleep, rqtp != nullptr ? static_cast<uint64_t>(rqtp->tv_sec) * 1000000u +
+	                                                  static_cast<uint64_t>(rqtp->tv_nsec) / 1000u
+	                                            : 0);
 
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;

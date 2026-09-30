@@ -8,11 +8,14 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "live-census.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstring>
+#include <iterator>
 #include <fmt/format.h>
 
 namespace Libs::Graphics {
@@ -665,6 +668,15 @@ static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
 }
 
 void LogDrawPhase(const char* draw_name, const char* phase) {
+	if (LiveCensus::g_draw_phases) {
+		// Local diagnostic (live census, draw phases): the phase this marker starts.
+		static constexpr const char* phases[] = {"ResolveRenderColorTarget", "ResolveRenderDepthTarget",
+		                                         "GetGraphicsPrograms",      "PrepareBindings",
+		                                         "PrepareVertexBuffers",     "CreatePipeline",
+		                                         "BeginRendering",           "DrawComplete"};
+		for (uint32_t i = 0; i < std::size(phases); ++i)
+			if (std::strcmp(phase, phases[i]) == 0) LiveCensus::MarkDrawPhase(i + 1);
+	}
 	if (graphics_debug_dump_enabled()) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {

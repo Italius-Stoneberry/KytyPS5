@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 
 #include <atomic>
+#include <immintrin.h>
 #include <mutex>
 #include <utility>
 
@@ -20,7 +21,9 @@
 #undef max
 #elif defined(__APPLE__)
 #include <pthread.h>
+#include <sched.h>
 #elif defined(__linux__)
+#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -34,26 +37,68 @@ public:
 		if (m_owner.load(std::memory_order_relaxed) == thread) {
 			EXIT("recursive region tracking lock\n");
 		}
+		uint32_t spins = 0;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
 			}
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			// Wait with plain loads: repeated locked writes would keep the line away from the
+			// owner and slow the very critical section being waited for. Past a short spin the
+			// waiter yields its CPU: guest threads streaming textures fault into the texture
+			// cache at once, and pure spinners starved a descheduled owner (the render thread,
+			// 100+ ms frames with its samples parked inside the critical section).
+			do {
+				if (++spins < 512) {
+					_mm_pause();
+				} else {
+					YieldCpu();
+				}
+			} while (m_lock.test(std::memory_order_relaxed));
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
+		// Odd while held: ReadShared retries a read that overlapped a holder.
+		m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
 	}
 	void unlock() noexcept {
 		if (m_owner.load(std::memory_order_relaxed) != CurrentThread()) {
 			EXIT("region tracking lock released by non-owner\n");
 		}
+		m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_release);
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
+	}
+	// A read of state only holders of this lock write, without taking it: valid when no holder
+	// was inside while it ran (the sequence even and unchanged), else done again under the lock.
+	// The query then costs no locked instruction and leaves the lock's line to the writers.
+	template <typename Read>
+	auto ReadShared(Read&& read) {
+		const auto before = m_seq.load(std::memory_order_acquire);
+		if ((before & 1u) == 0) {
+			auto result = read();
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (m_seq.load(std::memory_order_relaxed) == before) return result;
+		}
+		lock();
+		auto result = read();
+		unlock();
+		return result;
+	}
+
+	static void YieldCpu() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		SwitchToThread();
+#else
+		sched_yield();
+#endif
 	}
 
 private:
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return GetCurrentThreadId();
+		// TEB ClientId.UniqueThread, what GetCurrentThreadId returns: one load instead of a
+		// call into kernel32 on every lock and unlock.
+		return static_cast<uint32_t>(__readgsqword(0x48));
 #elif defined(__APPLE__)
 		// mach thread port is a nonzero per-thread id (0 is the "no owner" sentinel).
 		return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
@@ -67,6 +112,7 @@ private:
 
 	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
 	std::atomic_uint32_t m_owner {0};
+	std::atomic_uint32_t m_seq {0};
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
@@ -160,7 +206,8 @@ public:
 		ForEachRange(mask, std::forward<Func>(func));
 	}
 
-	TrackingSpinLock lock;
+	// Own cache line: guest fault handling updates the epoch and bitmaps below.
+	alignas(64) TrackingSpinLock lock;
 
 private:
 	template <bool track>
@@ -230,7 +277,7 @@ private:
 		}
 	}
 
-	PageManager&          m_page_manager;
+	alignas(64) PageManager& m_page_manager;
 	uint64_t              m_cpu_addr = 0;
 	std::atomic<uint64_t> m_cpu_epoch {1};
 	std::atomic<uint32_t> m_deferred_protects {0};

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "slow-log.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -167,7 +168,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	if (resource.formatted && resource.written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+		context.GetTextureCache().InvalidateMemoryFromGPU(address, size, "storage-buffer");
 	}
 	const char* access = "Read";
 	if (resource.written && resource.read) {
@@ -610,8 +611,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    cache.TryReuseSampledImage(entry.binding.image_id, entry.binding.desc, entry.epoch)) {
 		return entry.binding;
 	}
-	const auto epoch  = cache.ResolutionEpoch();
-	auto       result = ResolveTextureUncached(resource, value);
+	auto epoch  = cache.ResolutionEpoch();
+	auto result = ResolveTextureUncached(resource, value);
 	// Discovery may insert/merge an owner. Publish only after a lookup with stable identity.
 	if (cache.TryReuseSampledImage(result.image_id, result.desc, epoch)) {
 		entry = {value, resource, result, epoch};
@@ -906,6 +907,11 @@ void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = runtime.resources;
+	SlowLog::Scope slow([&](double ms) {
+		std::printf("SLOW PrepareBindingsInto %.1f ms shader=0x%016llx images=%zu buffers=%zu samplers=%zu\n", ms,
+		            static_cast<unsigned long long>(program.shader_hash), snapshot.images.size(),
+		            snapshot.buffers.size(), snapshot.samplers.size());
+	});
 	// Retain vector capacity only. Every resource and upload belongs to this
 	// invocation; previous handles, shader data and stage associations are stale.
 	prepared.buffer_sources.clear();
@@ -993,6 +999,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               program.info.buffers[i], program.stage, i,
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
+	}
+	for (uint32_t i = 0; i < layout.buffer_word_count; i++) {
+		prepared.shader_data[layout.BufferWordDword() + i] =
+		    ShaderRecompiler::IR::BufferDescriptorWord(snapshot.buffers[i]);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {

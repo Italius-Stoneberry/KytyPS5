@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 
 namespace LiveCounters {
 
@@ -51,20 +52,87 @@ enum Id : uint32_t {
 	RbQueueInflight,       // ... waiting only for their last writer (KYTY_READBACK_QUEUE=2)
 	RbQueueVerified,       // copy-engine copies compared with a graphics-queue copy (mode 3)
 	RbQueueMismatch,       // ... that differed
+	IndirectTables,        // indirect register tables / command buffers synchronized before parsing
+	DirectDraws,           // prepared draws recorded directly (not as a recording packet)
+	MeshDraws,             // ... of them, mesh-shader draws
+	BackingReadBytes,      // bytes of backing reads of 64 KiB and more (texture and buffer initialization)
+	BackingReadUs,         // ... their copy time in microseconds (page faults of the backing view)
+	XprTries,              // native XPR lookups (NativeXprTry)
+	XprHits,               // ... emitted natively
+	XprMissKey,            // ... no record for the draw's key
+	XprMissState,          // ... no captured draw state / pipeline for the state key
+	XprMissTarget,         // ... a target image changed or is also sampled
+	XprMissValidate,       // ... the record's words or resources failed validation (record dropped)
+	XprStores,             // records stored after a normal-path draw
+	Vblanks,               // video-out vblanks signalled (present thread)
+	AsyncImageBytes,       // image staging bytes copied by the upload worker (KYTY_ASYNC_UPLOAD=2)
+	BackingLockWaits,      // render-thread waits for the guest backing store mutex
+	BackingLockWaitUs,     // ... their time in microseconds
+	BackingHoldZeroUs,     // backing store mutex held to zero new allocations (any thread), microseconds
+	BackingHoldWriteUs,    // ... held for backing writes (GPU readback results)
+	BackingHoldMapUs,      // ... held for mapping changes
+	AliasRebuilds,         // rebuilds of the guest backing alias intervals (IsUniqueGuestBackingRange)
+	AliasRebuildUs,        // ... their time in microseconds
+	AliasMaps,             // ... guest mappings summed over the rebuilds
+	UnmapFinishes,         // guest unmaps that waited for a download of an image over the range (GpuResourceManager::UnmapMemory)
+	UnmapFinishUs,         // ... their wait in microseconds
+	PartialDirtyFaults,    // CPU writes into large images recorded as dirty ranges (KYTY_PARTIAL_IMAGE_DIRTY)
+	PartialUploads,        // ... refreshes that uploaded only the dirty subresources
+	PartialUploadBytes,    // ... guest bytes those refreshes staged
+	PartialFallbacks,      // ... refreshes that fell back to the whole image
+	PartialUnmaps,         // unmaps inside a large image that kept it (only the unmapped span dirty)
+	StaleProtectRepairs,   // write faults on unwatched pages given the guest's protection back
+	ReadbackParts,         // GPU-modified ranges a finished guest readback subtracted
+	GpuRangeEntries,       // entries of the GPU-modified range set, summed at each finished readback
+	TextureUnmaps,         // TextureCache::UnmapMemory calls
+	TextureUnmapUs,        // ... their time in microseconds
+	TextureUnmapDeletes,   // ... images they deleted
+	FullUploads,           // whole-image uploads (InitializeImage)
+	FullUploadBytes,       // ... their guest bytes
+	AsyncPipelines,        // pipelines handed to the compile workers (KYTY_ASYNC_XPR_PIPELINES)
+	XprStorePending,       // native XPR stores skipped while their pipeline variant compiles
+	DispatchKeyNew,        // dispatches whose (shader, user data, groups) last frame did not dispatch (KYTY_DISPATCH_KEYS)
+	DispatchKeySame,       // ... repeated from last frame with the same materialized resources
+	DispatchKeyChanged,    // ... repeated with other resources
+	DrawKeyNew,            // KYTY_DISPATCH_KEYS: a DrawIndex object key (native XPR key) not drawn last frame
+	DrawKeySame,           // ... drawn last frame too
+	XprDirectTries,        // native records tried for a direct indexed draw (DRAW_INDEX_2 / _OFFSET_2)
+	XprDirectHits,         // ... emitted from the record
+	XprStored,             // native records inserted by a store
+	XprRefuseProgram,      // stores refused: stage layout, DMA/GDS or written resources
+	XprRefuseReads,        // ... the SRT read log (alignment, span or total size)
+	XprRefuseBind,         // ... resource binding for the record's set
+	XprRefuseDraw,         // store requests the normal path did not store (mesh, non-indexed, vertex buffers)
+	DepthOverlaps,         // images recreated between depth and colour use (ResolveDepthOverlap)
+	DepthOverlapBytes,     // ... their guest bytes
 	Count
 };
 
 inline constexpr const char* Names[Count] = {
     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch"};
+    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch", "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us", "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target", "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits", "backing_lock_wait_us", "backing_hold_zero_us", "backing_hold_write_us", "backing_hold_map_us", "alias_rebuilds", "alias_rebuild_us", "alias_maps", "unmap_finishes", "unmap_finish_us", "partial_dirty_faults", "partial_uploads", "partial_upload_bytes", "partial_fallbacks", "partial_unmaps", "stale_protect_repairs", "readback_parts", "gpu_range_entries", "texture_unmaps", "texture_unmap_us", "texture_unmap_deletes", "full_uploads", "full_upload_bytes", "async_pipelines", "xpr_store_pending", "dispatch_key_new", "dispatch_key_same", "dispatch_key_changed", "draw_key_new", "draw_key_same", "xpr_direct_tries", "xpr_direct_hits", "xpr_stored", "xpr_refuse_program", "xpr_refuse_reads", "xpr_refuse_bind", "xpr_refuse_draw", "depth_overlaps", "depth_overlap_bytes"};
 
 inline std::atomic<uint64_t> g_values[Count];
+// The render thread's counts: it is their only writer, so an increment needs no locked
+// instruction (a locked add also drains the store buffer). Readers add both (Value).
+inline std::atomic<uint64_t> g_render_values[Count];
+inline thread_local bool     g_single_writer = false; // set on the render thread (live-control.h Start)
+// Local diagnostic (KYTY_DISPATCH_KEYS): classify every dispatch against last frame's (renderCompute.cpp).
+inline std::atomic_bool g_dispatch_keys_on {std::getenv("KYTY_DISPATCH_KEYS") != nullptr};
 // Render thread: the last draw (0) or dispatch shader address.
 inline uint64_t g_last_dispatch_shader = 0;
 
 inline void Add(Id id, uint64_t n = 1) {
+	if (g_single_writer) {
+		auto& value = g_render_values[id];
+		value.store(value.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+		return;
+	}
 	g_values[id].fetch_add(n, std::memory_order_relaxed);
+}
+[[nodiscard]] inline uint64_t Value(size_t id) {
+	return g_values[id].load(std::memory_order_relaxed) + g_render_values[id].load(std::memory_order_relaxed);
 }
 
 // Per 1 MiB granule (hashed, tagged): what cycles where.
@@ -93,5 +161,10 @@ inline void AddGranule(uint64_t address, GranuleField field, uint64_t n) {
 
 // PM4 packets per opcode (render thread; relaxed atomics so the live thread can read).
 inline std::atomic<uint64_t> g_pm4[256];
+inline void AddPm4(uint32_t opcode) {
+	// Only the render thread counts: no locked add.
+	auto& value = g_pm4[opcode & 0xffu];
+	value.store(value.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
 
 } // namespace LiveCounters

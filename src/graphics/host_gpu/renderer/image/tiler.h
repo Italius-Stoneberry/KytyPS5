@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <mutex>
 #include <span>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -142,6 +143,17 @@ private:
 	vk::Pipeline                            m_d24_to_d16  = nullptr;
 	vk::Pipeline                            m_d32_to_d16  = nullptr;
 	vk::Pipeline                            m_swap_bgra16 = nullptr;
+	// Scratch buffers the GPU finished with, by power-of-two capacity: a texture streamed in
+	// otherwise allocates (and later frees) device memory for every detile, and a new VMA
+	// block under memory pressure stalls the render thread for up to seconds.
+	struct PooledScratch {
+		vk::Buffer    buffer     = nullptr;
+		VmaAllocation allocation = nullptr;
+		uint64_t      capacity   = 0;
+	};
+	std::mutex                 m_scratch_mutex;
+	std::vector<PooledScratch> m_scratch_pool;
+	uint64_t                   m_scratch_pool_bytes = 0;
 };
 
 } // namespace Libs::Graphics

@@ -575,8 +575,18 @@ void CreatePipelineInternal(
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
-	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-	                                                 &pipeline.pipeline);
+	// The static precompile's pipeline when it holds this one (no compilation), else the usual create.
+	if (graphics.static_pipeline_cache != nullptr && graphics.pipeline_cache_control_enabled) {
+		auto cached_info = pipeline_info;
+		cached_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+		if (graphics.device.createGraphicsPipelines(graphics.static_pipeline_cache, 1, &cached_info, nullptr,
+		                                            &pipeline.pipeline) != vk::Result::eSuccess) {
+			pipeline.pipeline = nullptr;
+		}
+	}
+	result = pipeline.pipeline != nullptr
+	             ? vk::Result::eSuccess
+	             : graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr, &pipeline.pipeline);
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -646,8 +656,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	// The static precompile's pipeline when it holds this one (no compilation), else the usual create.
+	if (graphics.static_pipeline_cache != nullptr && graphics.pipeline_cache_control_enabled) {
+		auto cached_info = info;
+		cached_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+		if (graphics.device.createComputePipelines(graphics.static_pipeline_cache, 1, &cached_info, nullptr,
+		                                           &pipeline.pipeline) != vk::Result::eSuccess) {
+			pipeline.pipeline = nullptr;
+		}
+	}
+	result = pipeline.pipeline != nullptr
+	             ? vk::Result::eSuccess
+	             : graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

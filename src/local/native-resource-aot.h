@@ -6,12 +6,30 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
-#if defined(__linux__) && defined(__x86_64__)
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
+#define KYTY_LOCAL_SRT_AOT 1
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#elif defined(__linux__) && defined(__x86_64__)
+#define KYTY_LOCAL_SRT_AOT 1
 #include <dlfcn.h>
 #endif
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
-#if defined(__linux__) && defined(__x86_64__)
+#if defined(KYTY_LOCAL_SRT_AOT)
+// The compiled library: a DLL on Windows (tools/local/compile-srt-aot-windows.py), a shared
+// object on Linux (tools/local/compile-srt-aot.py).
+#if defined(_WIN32)
+inline void* OpenSrtAotLibrary(const char* path) { return reinterpret_cast<void*>(LoadLibraryA(path)); }
+inline void* SrtAotSymbol(void* module, const char* name) {
+    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module), name));
+}
+#else
+inline void* OpenSrtAotLibrary(const char* path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+inline void* SrtAotSymbol(void* module, const char* name) { return dlsym(module, name); }
+#endif
 inline std::string EmitLinearSrtAot(const LinearSrtPlan& plan, bool packed = false) {
     using Kind = LinearSrtPlan::Kind;
     std::ostringstream out;
@@ -149,11 +167,11 @@ inline void PrepareLinearSrtAot(LinearSrtPlan& plan) {
                 std::ofstream file(path);
                 file << "#include \"SrtAotAbi.h\"\n"
                      << "static_assert(KytySrtAot::AbiVersion == " << KytySrtAot::AbiVersion << ");\n"
-                     << "extern \"C\" __attribute__((visibility(\"default\"))) const char* " << symbol
+                     << "extern \"C\" KYTY_SRT_AOT_EXPORT const char* " << symbol
                      << "_signature() { return R\"KYTY(" << signature << ")KYTY\"; }\n"
-                     << "extern \"C\" __attribute__((visibility(\"default\"))) bool " << symbol
+                     << "extern \"C\" KYTY_SRT_AOT_EXPORT bool " << symbol
                      << "(KytySrtAot::Runtime* r, uint64_t* values) {\n" << body << "}\n"
-                     << "extern \"C\" __attribute__((visibility(\"default\"))) bool " << symbol
+                     << "extern \"C\" KYTY_SRT_AOT_EXPORT bool " << symbol
                      << "_materialize(KytySrtAot::Runtime* r, const KytySrtAot::Outputs* output) {\n" << packed << "}\n";
             }
         }
@@ -161,11 +179,11 @@ inline void PrepareLinearSrtAot(LinearSrtPlan& plan) {
     if (!library || !*library) return;
     // One explicitly selected, immutable local library lives for the process.
     // Full source-signature equality makes hash collisions harmless misses.
-    static void* module = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+    static void* module = OpenSrtAotLibrary(library);
     if (!module) return;
-    const auto get_signature = reinterpret_cast<const char* (*)()>(dlsym(module, (symbol + "_signature").c_str()));
-    const auto function = reinterpret_cast<KytySrtAot::Function>(dlsym(module, symbol.c_str()));
-    const auto materialize = reinterpret_cast<KytySrtAot::MaterializeFunction>(dlsym(module, (symbol + "_materialize").c_str()));
+    const auto get_signature = reinterpret_cast<const char* (*)()>(SrtAotSymbol(module, (symbol + "_signature").c_str()));
+    const auto function = reinterpret_cast<KytySrtAot::Function>(SrtAotSymbol(module, symbol.c_str()));
+    const auto materialize = reinterpret_cast<KytySrtAot::MaterializeFunction>(SrtAotSymbol(module, (symbol + "_materialize").c_str()));
     if (!get_signature || !function || !materialize || signature != get_signature()) return;
     plan.aot_function = function;
     plan.aot_materialize = materialize;

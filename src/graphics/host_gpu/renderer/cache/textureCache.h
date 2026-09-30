@@ -12,10 +12,12 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
+#include <mutex>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -56,7 +58,7 @@ public:
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
 	// Only reuses discovery. FindTexture still refreshes contents and selects the current view.
-	[[nodiscard]] bool TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t epoch);
+	[[nodiscard]] bool TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t& epoch);
 	// TryReuseSampledImage without the resolution-epoch proof, for caches that must
 	// survive image registrations elsewhere (native XPR records): the owner is
 	// still registered, not being rebound, and has the same backing and resources.
@@ -77,7 +79,7 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source = "");
 	[[nodiscard]] bool HasTrackedDataOverlap(uint64_t address, uint64_t size);
 	enum class ReadOnlyBufferOverlap { None, CpuSampled, Unsafe };
 	[[nodiscard]] ReadOnlyBufferOverlap ClassifyReadOnlyBufferOverlap(uint64_t address, uint64_t size);
@@ -98,9 +100,16 @@ public:
 	[[nodiscard]] bool ClearMeta(uint64_t address, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
+	void MapMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// The latest tick of a GPU-written image's download that will write guest memory overlapping
+	// the range once the GPU completes it (on the priority thread); 0 when none is pending.
+	[[nodiscard]] uint64_t PendingDownloadTick(uint64_t address, uint64_t size);
+	// Once per guest flip (the unit of NumFramesBeforeRemoval).
+	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t CurrentFrame() const noexcept { return m_frame.load(std::memory_order_relaxed); }
 
 private:
 	enum class TransferDirection { Upload, Download };
@@ -138,14 +147,26 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
-	void                      FreeImage(ImageId id);
+	void                      FreeImage(ImageId id, const char* site = "");
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
 	void                      TrackImageTail(ImageId id);
-	void                      UntrackImage(ImageId id);
+	void                      UntrackImage(ImageId id, const char* why = "");
 	void                      UntrackImageHead(ImageId id);
 	void                      UntrackImageTail(ImageId id);
+	// Partial CPU writes of large images (KYTY_PARTIAL_IMAGE_DIRTY). Caller holds m_lock.
+	[[nodiscard]] static bool PartialDirtyCandidate(const Image& image);
+	// `granule`: the released span grows to these boundaries (counted from the image start).
+	[[nodiscard]] bool TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
+	                                        uint64_t granule);
+	void               UntrackImagePages(Image& image, uint64_t begin, uint64_t end);
+	void               RetrackHoles(Image& image);
+	void               FinishRefresh(Image& image);
+	[[nodiscard]] bool UploadImagePartial(Image& image);
+	[[nodiscard]] bool UploadDepthPartial(Image& image);
+	void               UpdatePartialHashes(Image& image, bool all);
+	[[nodiscard]] bool CheckPartialHashes(const Image& image);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
@@ -195,6 +216,9 @@ private:
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
+	// Images with a depth_id (stencil associations): deleting an image looks for the ones
+	// pointing at it here instead of walking every slot.
+	std::vector<ImageId>                              m_stencil_associations;
 	ImagePageTable                                    m_image_page_table;
 	// Start address -> number of registered images starting there, and the
 	// log of addresses that gained their first one.
@@ -202,16 +226,46 @@ private:
 	std::atomic<uint64_t>                             m_start_epoch {1};
 	std::vector<std::pair<uint64_t, uint64_t>>        m_start_log; // (epoch, address)
 	std::atomic<uint64_t>                             m_resolution_epoch {1};
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
+	// Null textures: a 1x1 image per format and type (1D, 2D or 3D).
+	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// UploadImagePartial: the transfer plan of each large image it uploads (by Image::serial);
+	// a 256-layer mip-mapped array has 2816 subresources to plan otherwise on every refresh.
+	struct PartialPlan {
+		BindingType                          binding {};
+		std::shared_ptr<TextureTransferPlan> plan;
+	};
+	std::unordered_map<uint64_t, PartialPlan> m_partial_plans;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	std::atomic<uint64_t>                             m_meta_epoch {1};
+	// The m_surface_metas keys as bits of a 1024-bit filter: a clear bit proves an address holds
+	// no metadata without m_lock (IsMeta and ClearMeta run for the buffers of every dispatch).
+	// Inserts set their bit under m_lock; UnmapMemory rebuilds it from the remaining keys (a
+	// word only loses bits of erased keys); other erases leave a stale bit (a locked lookup).
+	std::array<std::atomic<uint64_t>, 16> m_meta_filter {};
+	static uint32_t MetaFilterBit(uint64_t address) {
+		return static_cast<uint32_t>((address * 0x9e3779b97f4a7c15ull) >> 54u);
+	}
+	void MetaFilterAdd(uint64_t address) {
+		const auto bit = MetaFilterBit(address);
+		m_meta_filter[bit >> 6u].fetch_or(uint64_t {1} << (bit & 63u), std::memory_order_release);
+	}
+	[[nodiscard]] bool MetaFilterMayHold(uint64_t address) const {
+		const auto bit = MetaFilterBit(address);
+		return ((m_meta_filter[bit >> 6u].load(std::memory_order_acquire) >> (bit & 63u)) & 1u) != 0;
+	}
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	std::atomic<uint64_t> m_frame {0};
+	struct PendingDownload {
+		uint64_t address = 0, size = 0, tick = 0;
+	};
+	std::mutex                   m_download_mutex; // the priority thread removes finished ones
+	std::vector<PendingDownload> m_pending_downloads;
 	mutable uint32_t m_image_query_epoch      = 0;
 	// KYTY_TEXTURE_RESOLVE_PAGES: a resolution proven at an epoch still holds while no
 	// image over its range registered or unregistered since.

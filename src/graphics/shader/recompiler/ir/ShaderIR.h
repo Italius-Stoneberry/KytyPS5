@@ -116,6 +116,10 @@ constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
+	// indirect_search_iterations of a portable table (PortableShaders): the search runs until its
+	// range is empty, and indirect_mapping_offset names the flattened-SRT word that holds the
+	// offset of the key mapping.
+	static constexpr uint32_t RuntimeIndirectSearch = UINT32_MAX;
 
 	uint32_t                      source            = 0;
 	uint32_t                      first_use_pc      = 0;
@@ -394,16 +398,61 @@ struct DescriptorBinding {
 	bool operator==(const DescriptorBinding& other) const = default;
 };
 
+// A buffer's runtime descriptor word (shader data, after the memory offsets): what its code reads
+// from the V# at run time instead of a specialization, so one module serves every value.
+//   [0,12)  stride, when below 4096 and not swizzled (a larger one stays in the specialization)
+//   [12,16) layout of a formatted buffer's elements: 0-11 byte-aligned components (count - 1 in
+//           the low two bits, log2 of the component bytes in the high two), 12 11_11_10,
+//           13 10_11_11, 14 2_10_10_10, 15 10_10_10_2
+//   [16,19) Format::ComponentType of the elements (0: unknown format, raw dwords)
+//   [20,32) dst_sel
+struct BufferWord {
+	static constexpr uint32_t StrideBits    = 12;
+	static constexpr uint32_t MaxStride     = (1u << StrideBits) - 1u;
+	static constexpr uint32_t LayoutShift   = 12;
+	static constexpr uint32_t TypeShift     = 16;
+	static constexpr uint32_t DstSelShift   = 20;
+	static constexpr uint32_t PackedLayouts = 12;
+};
+
+// Portable shader modules (KYTY_PORTABLE_SHADERS, default on; read once, fixed for the process):
+// what a module could only get from the descriptors the game binds at run time (a buffer's stride
+// and format, a null texture's type) no longer selects one, so the modules of a program can be
+// compiled ahead from the game files (tools/local/static-precompile). Buffers take those values
+// from their buffer words (BufferWord) in the shader data.
+bool PortableShaders();
+
+inline constexpr uint32_t BufferAddTidBit = 1u << 20u;
+
+// With buffer words, a buffer whose stride (ShaderBufferResource::PackedStride) its code reads at
+// run time: not swizzled (the swizzled address takes the stride apart) and at most MaxStride.
+[[nodiscard]] constexpr bool RuntimeBufferStride(uint32_t packed_stride) {
+	const auto stride = packed_stride & 0x3fffu;
+	return (stride == 0u || ((packed_stride >> 14u) & 1u) == 0u) && stride <= BufferWord::MaxStride;
+}
+
+// With buffer words, a formatted buffer whose format its code can decode at run time: one it only
+// loads from (stores pack with the specialized format). Its specialization chooses: the V#'s format
+// and dst_sel give the fast specialized decode, kInvalid and the default dst_sel (PortableFormats)
+// the decode of whatever the buffer word says.
+[[nodiscard]] constexpr bool RuntimeBufferFormat(const BufferResource& buffer) {
+	return buffer.formatted && !buffer.written;
+}
+
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	uint32_t                       buffer_word_count = 0; // one per buffer (BufferWord), or none
 	uint32_t                       lod_stats_count = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
-	[[nodiscard]] uint32_t LodStatsDword() const {
+	[[nodiscard]] uint32_t BufferWordDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t LodStatsDword() const {
+		return BufferWordDword() + buffer_word_count;
 	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return LodStatsDword() + lod_stats_count;

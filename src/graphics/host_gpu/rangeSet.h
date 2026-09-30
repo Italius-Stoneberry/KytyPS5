@@ -4,6 +4,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <map>
@@ -121,22 +122,24 @@ public:
 	}
 
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
+	[[nodiscard]] size_t Count() const { return m_ranges.size(); }
 
 private:
 	[[nodiscard]] bool Fast() const {
 		return m_fast_eligible && kyty_local_range_set_fast_mode.load(std::memory_order_relaxed) != 0;
 	}
 
-	// [address, end) lies inside one interval; remembers that interval.
+	// [address, end) lies inside one interval; remembers that interval. An interval found at
+	// version V covers the same bytes while the set stays at V: a few are kept, since lookups
+	// alternate between ranges (a dispatch's written buffers).
 	bool Covered(uint64_t address, uint64_t end) const {
-		if (m_hint_version == m_version && m_hint_begin <= address && end <= m_hint_end) return true;
+		for (const auto& hint: m_hints)
+			if (hint.version == m_version && hint.begin <= address && end <= hint.end) return true;
 		auto it = m_ranges.upper_bound(address);
 		if (it == m_ranges.begin()) return false;
 		--it;
 		if (it->first > address || it->second < end) return false;
-		m_hint_version = m_version;
-		m_hint_begin   = it->first;
-		m_hint_end     = it->second;
+		m_hints[m_next_hint++ % m_hints.size()] = {m_version, it->first, it->second};
 		return true;
 	}
 
@@ -150,7 +153,11 @@ private:
 	std::map<uint64_t, uint64_t> m_ranges;
 	bool                         m_fast_eligible = false;
 	uint64_t                     m_version = 1;
-	mutable uint64_t             m_hint_version = 0, m_hint_begin = 0, m_hint_end = 0;
+	struct Hint {
+		uint64_t version = 0, begin = 0, end = 0;
+	};
+	mutable std::array<Hint, 4> m_hints {};
+	mutable uint32_t            m_next_hint = 0;
 };
 
 } // namespace Libs::Graphics

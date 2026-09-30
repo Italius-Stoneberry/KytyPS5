@@ -144,6 +144,9 @@ void FaultManager::ProcessFaultBuffer() {
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
+			// Unmapped since the GPU recorded the access (GpuResourceManager::UnmapMemory no
+			// longer waits for this processing): no buffer over memory that is gone.
+			if (!m_buffer_cache.IsGpuMapped(start, end - start)) return;
 			(void)m_buffer_cache.FindBuffer(start, end - start);
 		});
 		m_fault_areas[area] = 0;

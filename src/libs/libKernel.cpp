@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "time-census.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -1122,6 +1123,18 @@ static int KYTY_SYSV_ABI KernelRemoveExceptionHandler(int signum) {
 static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	constexpr int POSIX_SIGUSR1 = 30;
 
+	{
+		// Diagnostic: how often the guest interrupts its threads (each delivery may land on a
+		// guest red zone on Windows).
+		static std::atomic<uint64_t> calls {0};
+		const auto                   n = calls.fetch_add(1, std::memory_order_relaxed);
+		if (n < 8 || (n & (n - 1)) == 0) {
+			std::printf("sceKernelRaiseException #%" PRIu64 ": signum=%d target=%p caller=%p\n", n + 1,
+			            signum, static_cast<void*>(thread), __builtin_return_address(0));
+			std::fflush(stdout);
+		}
+	}
+
 	if (signum != POSIX_SIGUSR1 || thread == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -1803,6 +1816,7 @@ static KYTY_SYSV_ABI int KernelGetCurrentCpu() {
 
 int KYTY_SYSV_ABI clock_gettime(int clock_id, LibKernel::KernelTimespec* time) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(PosixClockGettime, static_cast<uint64_t>(clock_id));
 
 	return POSIX_CALL(LibKernel::KernelClockGettime(clock_id, time));
 }
@@ -1865,6 +1879,7 @@ int KYTY_SYSV_ABI getpagesize() {
 
 int KYTY_SYSV_ABI clock_gettime(int clock_id, LibKernel::KernelTimespec* time) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(PosixClockGettime, static_cast<uint64_t>(clock_id));
 
 	return POSIX_CALL(LibKernel::KernelClockGettime(clock_id, time));
 }
@@ -1882,6 +1897,7 @@ struct KernelTimezone {
 
 int KYTY_SYSV_ABI gettimeofday(LibKernel::KernelTimeval* time, KernelTimezone* timezone) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(Gettimeofday, 1);
 
 	if (time != nullptr) {
 		int result = LibKernel::KernelGettimeofday(time);
@@ -1902,6 +1918,9 @@ int KYTY_SYSV_ABI gettimeofday(LibKernel::KernelTimeval* time, KernelTimezone* t
 int KYTY_SYSV_ABI nanosleep(const LibKernel::KernelTimespec* rqtp,
                             LibKernel::KernelTimespec*       rmtp) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(Nanosleep, rqtp != nullptr ? static_cast<uint64_t>(rqtp->tv_sec) * 1000000u +
+	                                                  static_cast<uint64_t>(rqtp->tv_nsec) / 1000u
+	                                            : 0);
 
 	return POSIX_CALL(LibKernel::KernelNanosleep(rqtp, rmtp));
 }

@@ -72,6 +72,17 @@ inline void WriteIndirectBlock(uint32_t space, const uint32_t* packet) {
 	}
 }
 
+// The registers changed in bulk (context clear/push/pop, a register reset): nothing the
+// shadow holds is known any more.
+inline void Invalidate() {
+	auto& s = g_shadow;
+	s.cx_valid.reset();
+	s.sh_valid.reset();
+	s.uc_valid.reset();
+	s.chain = false;
+	s.dirty = true;
+}
+
 // Every packet the command processor is about to execute.
 inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t packet_dw, bool predicated_skip) {
 	auto& s = g_shadow;
@@ -113,8 +124,13 @@ inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t pack
 		case Pm4::IT_DISPATCH_DIRECT:
 		case Pm4::IT_DISPATCH_INDIRECT:
 		case Pm4::IT_SET_BASE:
-		case Pm4::IT_NUM_INSTANCES:
 		case Pm4::IT_NOP:
+			// NOP-encoded commands: R_CONTEXT_STATE clears, pushes or pops the graphics
+			// context and R_DISPATCH_RESET resets every register (CommandProcessor::Reset).
+			if (const auto r = KYTY_PM4_R(packet[0]); r == Pm4::R_CONTEXT_STATE || r == Pm4::R_DISPATCH_RESET)
+				Invalidate();
+			return;
+		case Pm4::IT_NUM_INSTANCES:
 		case Pm4::IT_ACQUIRE_MEM:
 		case Pm4::IT_RELEASE_MEM:
 		case Pm4::IT_WAIT_REG_MEM:

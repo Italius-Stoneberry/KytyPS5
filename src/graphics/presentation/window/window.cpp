@@ -35,6 +35,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "frame-gen.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -817,6 +818,9 @@ static void WindowCreate(WindowContext& context) {
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
+	// Pixel-exact windows and swapchains on scaled displays: without per-monitor awareness a
+	// 200% desktop gets a half-size swapchain that the compositor stretches back (blurry).
+	SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #endif
 
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
@@ -854,6 +858,11 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
+#if defined(_WIN32)
+	// KYTY_FRAMEGEN: Streamline must be initialized before SDL loads Vulkan with the window, and
+	// then becomes that loader (the instance and device are created through it).
+	Libs::Graphics::FrameGen::Initialize();
+#endif
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
 	                                  KYTY_SDL_WINDOWPOS_CENTERED, width, height, window_flags);
 
@@ -863,6 +872,10 @@ static void WindowCreate(WindowContext& context) {
 
 	SDL_SetWindowResizable(context.window, SDL_FALSE);
 	context.UpdateIcon();
+	// SDL2 starts text input with the video subsystem, which keeps the IME attached to the
+	// window: with a Japanese/Chinese IME on, letter keys (the default Cross, WASD...) never
+	// reach the game. The system overlay starts text input itself while it needs it.
+	SDL_StopTextInput();
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {

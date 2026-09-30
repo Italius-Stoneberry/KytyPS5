@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <span>
@@ -620,6 +622,16 @@ struct SystemOverlay::Impl {
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
+		// The default font first (dialogs); the KYTY_FPS_HUD panel's where Windows has it.
+		io.Fonts->AddFontDefault();
+#ifdef _WIN32
+		const char* windows = std::getenv("WINDIR");
+		const auto  path = std::string(windows != nullptr ? windows : "C:\\Windows") + "\\Fonts\\segoeuib.ttf";
+		if (FILE* file = std::fopen(path.c_str(), "rb"); file != nullptr) {
+			std::fclose(file);
+			hud_font = io.Fonts->AddFontFromFileTTF(path.c_str(), 32.0f);
+		}
+#endif
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
 		style.WindowRounding = 10.0f;
@@ -942,14 +954,47 @@ struct SystemOverlay::Impl {
 		}
 	}
 
-	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
+	// KYTY_FPS_HUD: top right of the game image, below the game's own corner icon.
+	void DrawHud(SystemOverlayHud& hud) {
+		const auto  region = hud.region;
+		const float unit   = std::max(static_cast<float>(region.extent.height) / 1080.0f, 0.5f);
+		ImGui::SetNextWindowPos({static_cast<float>(region.offset.x) + static_cast<float>(region.extent.width) - 28.0f * unit,
+		                         static_cast<float>(region.offset.y) + static_cast<float>(region.extent.height) * 0.10f},
+		                        ImGuiCond_Always, {1.0f, 0.0f});
+		ImGui::SetNextWindowBgAlpha(0.45f);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {16.0f * unit, 8.0f * unit});
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * unit);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0.0f, 0.0f});
+		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+		                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+		                                   ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+		                                   ImGuiWindowFlags_NoFocusOnAppearing;
+		ImGui::Begin("##FpsHud", nullptr, flags);
+		ImGui::PushFont(hud_font, 46.0f * unit);
+		ImGui::TextColored({0.46f, 0.73f, 0.0f, 1.0f}, "%s", hud.title.c_str());
+		ImGui::PopFont();
+		ImGui::PushFont(hud_font, 21.0f * unit);
+		ImGui::TextUnformatted(hud.detail.c_str());
+		ImGui::PopFont();
+		const auto position = ImGui::GetWindowPos();
+		const auto size     = ImGui::GetWindowSize();
+		ImGui::End();
+		ImGui::PopStyleVar(4);
+		hud.drawn = {{static_cast<int32_t>(position.x), static_cast<int32_t>(position.y)},
+		             {static_cast<uint32_t>(std::max(size.x, 0.0f)), static_cast<uint32_t>(std::max(size.y, 0.0f))}};
+	}
+
+	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count,
+	                  SystemOverlayHud* hud) {
 		OverlaySnapshot snapshot;
-		if (!GetOverlaySnapshot(&snapshot)) {
+		bool            dialog = GetOverlaySnapshot(&snapshot);
+		if (!dialog && hud == nullptr) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
 		EnsureVulkan(format, image_count);
-		if (session != snapshot.session) {
+		if (dialog && session != snapshot.session) {
 			session       = snapshot.session;
 			focus_pending = true;
 			shift         = (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
@@ -961,7 +1006,9 @@ struct SystemOverlay::Impl {
 			io.ClearInputKeys();
 			io.ClearInputMouse();
 		}
-		DrainInput(snapshot.session);
+		if (dialog) {
+			DrainInput(snapshot.session);
+		}
 
 		auto& io       = ImGui::GetIO();
 		io.DisplaySize = {static_cast<float>(frame_extent.width),
@@ -974,14 +1021,22 @@ struct SystemOverlay::Impl {
 		last_frame     = now;
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
-		if (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session) {
-			ImGui::EndFrame();
-			return false;
+		if (dialog && (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session)) {
+			if (hud == nullptr) {
+				ImGui::EndFrame();
+				return false;
+			}
+			dialog = false;
 		}
-		if (snapshot.session.kind == OverlayKind::Error) {
-			DrawError(snapshot.error, frame_extent);
-		} else {
-			DrawIme(snapshot.ime, frame_extent);
+		if (dialog) {
+			if (snapshot.session.kind == OverlayKind::Error) {
+				DrawError(snapshot.error, frame_extent);
+			} else {
+				DrawIme(snapshot.ime, frame_extent);
+			}
+		}
+		if (hud != nullptr) {
+			DrawHud(*hud);
 		}
 		ImGui::Render();
 		extent = frame_extent;
@@ -1021,6 +1076,7 @@ struct SystemOverlay::Impl {
 
 	GraphicContext&                       graphics;
 	ImGuiContext*                         imgui_context      = nullptr;
+	ImFont*                               hud_font           = nullptr; // null: the default font
 	bool                                  vulkan_initialized = false;
 	bool                                  shift              = false;
 	bool                                  symbol_mode        = false;
@@ -1038,8 +1094,9 @@ SystemOverlay::SystemOverlay(GraphicContext& graphics): m_impl(std::make_unique<
 
 SystemOverlay::~SystemOverlay() = default;
 
-bool SystemOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count) {
-	return m_impl->PrepareFrame(extent, format, image_count);
+bool SystemOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count,
+                                 SystemOverlayHud* hud) {
+	return m_impl->PrepareFrame(extent, format, image_count, hud);
 }
 
 void SystemOverlay::Record(vk::CommandBuffer command, vk::ImageView target) {

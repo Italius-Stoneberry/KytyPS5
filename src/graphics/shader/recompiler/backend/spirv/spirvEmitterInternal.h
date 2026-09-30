@@ -375,6 +375,7 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> buffer_words {}; // IR::BufferWord, when used
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -667,6 +668,9 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
+
+// The buffer word (IR::BufferWord) of a buffer access's resource, loaded at function entry.
+uint32_t RuntimeBufferWord(const EmitterState& state, const IR::MemoryInfo& mem);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 uint32_t LdsStorageDwordCount(const EmitterState& state);

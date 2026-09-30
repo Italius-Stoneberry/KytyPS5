@@ -16,6 +16,18 @@
 
 namespace Common {
 
+// RecoverableExitScope: the message of the pending EXIT on this thread.
+static thread_local bool        t_recoverable = false;
+static thread_local std::string t_recoverable_message;
+
+RecoverableExitScope::RecoverableExitScope() {
+	t_recoverable = true;
+}
+
+RecoverableExitScope::~RecoverableExitScope() {
+	t_recoverable = false;
+}
+
 // The raw return addresses of a fatal error (resolve with addr2line against the executable).
 static void WriteFatalBacktrace() {
 #if defined(__linux__)
@@ -34,6 +46,10 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 }
 
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
+	if (t_recoverable) {
+		t_recoverable_message = fmt::format("{} in {}:{}", text, file, line);
+		return 1;
+	}
 	Log::WriteFatal(BuildFatalReport(title, text, file, line));
 	WriteFatalBacktrace();
 	Subsystems::EmergencyShutdownActive();
@@ -50,18 +66,29 @@ int DbgNotImplementedHandler(const char* expr, const char* file, int line) {
 }
 
 int DbgExitHandler(const char* file, int line, std::string_view text) {
+	if (t_recoverable) {
+		t_recoverable_message = fmt::format("{} in {}:{}", text, file, line);
+		return 1;
+	}
 	Log::WriteFatal(BuildFatalReport("--- Error ---", text, file, line));
 	WriteFatalBacktrace();
 	return 1;
 }
 
 int DbgExitHandler(const char* file, int line, fmt::text_style style, std::string_view text) {
+	if (t_recoverable) {
+		t_recoverable_message = fmt::format("{} in {}:{}", text, file, line);
+		return 1;
+	}
 	Log::WriteFatal(style, BuildFatalReport("--- Error ---", text, file, line));
 	WriteFatalBacktrace();
 	return 1;
 }
 
 void DbgExit(int status) {
+	if (t_recoverable) {
+		throw RecoverableExit {std::move(t_recoverable_message)};
+	}
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
 	std::_Exit(status);

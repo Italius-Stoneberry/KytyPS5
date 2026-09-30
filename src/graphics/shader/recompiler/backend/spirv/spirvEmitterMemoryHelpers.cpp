@@ -62,6 +62,18 @@ void EmitMemoryOffsets(EmitterState& state) {
 		    state, OpBitwiseAnd, EmitBinaryU32(state, OpShiftRightLogical, word, shift),
 		    ConstantU32(state, 0xffu));
 	}
+	for (uint32_t i = 0; i < state.program.bindings.buffer_word_count; i++) {
+		state.buffer_words[i] = EmitShaderDataDwordLoad(state, state.program.bindings.BufferWordDword() + i);
+	}
+}
+
+uint32_t RuntimeBufferWord(const EmitterState& state, const IR::MemoryInfo& mem) {
+	const auto index = ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	if (index >= state.program.bindings.buffer_word_count) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+		                             "buffer word is missing");
+	}
+	return state.buffer_words[index];
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {

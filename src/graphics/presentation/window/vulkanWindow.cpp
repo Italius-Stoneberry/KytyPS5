@@ -36,6 +36,7 @@
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
+#include "frame-gen.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -570,17 +571,30 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	const float               queue_priorities[2] = {1.0f, 1.0f};
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.sType            = vk::StructureType::eDeviceQueueCreateInfo;
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.pQueuePriorities = queue_priorities;
 
 	// KYTY_READBACK_QUEUE: also a queue of a transfer-only family (the copy engine).
 	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {queue_create_info, queue_create_info};
 	uint32_t                                 queue_create_count = 1;
 	graphics.readback_family                                    = static_cast<uint32_t>(-1);
+#if defined(_WIN32)
+	// A second graphics-family queue for presents (GraphicContext::present_queue).
+	{
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		if (queue_family < family_count && families[queue_family].queueCount >= 2) {
+			queue_create_infos[0].queueCount = 2;
+			graphics.present_queue_created   = true;
+		}
+	}
+#endif
 	if (const char* readback = std::getenv("KYTY_READBACK_QUEUE");
 	    readback != nullptr && readback[0] != '\0' && std::strcmp(readback, "0") != 0) {
 		uint32_t family_count = 0;
@@ -782,6 +796,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	features13.pipelineCreationCacheControl = supported_features13.pipelineCreationCacheControl;
+	graphics.pipeline_cache_control_enabled = features13.pipelineCreationCacheControl == VK_TRUE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -802,6 +818,12 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
 	}
+	vk::PhysicalDevicePresentIdFeaturesKHR present_id {};
+	if (HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+		present_id.presentId = VK_TRUE;
+		present_id.pNext     = const_cast<void*>(create_info.pNext);
+		create_info.pNext    = &present_id;
+	}
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -814,6 +836,11 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
+		std::printf("vkCreateDevice failed: %s (%u extensions)\n", vk::to_string(result).c_str(),
+		            create_info.enabledExtensionCount);
+		for (uint32_t i = 0; i < create_info.enabledExtensionCount; ++i)
+			std::printf("  extension %s\n", create_info.ppEnabledExtensionNames[i]);
+		std::fflush(stdout);
 		return nullptr;
 	}
 
@@ -1206,6 +1233,11 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
+		// KYTY_FRAMEGEN: Streamline enables VK_NV_low_latency2 (Reflex) without the present-id
+		// extension it requires; current drivers then refuse the device.
+		if (FrameGen::Requested() && HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		}
 	}
 
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
@@ -1216,16 +1248,22 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	FrameGen::BypassCommandHooks(graphic_ctx.device);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::Install();
 #endif
 	graphic_ctx.queue_family = queue_family;
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.present_queue_created) {
+		graphic_ctx.device.getQueue(queue_family, 1, &graphic_ctx.present_queue);
+		LOGF("\tpresent queue: family %u index 1\n", queue_family);
+	}
 	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
 		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
 		EXIT_IF(graphic_ctx.readback_queue == nullptr);
 	}
+	Libs::Graphics::FrameGen::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1344,6 +1382,7 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 	                                        device_extensions, graphic_ctx);
 	if (graphic_ctx.device == nullptr) return false;
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	FrameGen::BypassCommandHooks(graphic_ctx.device);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::Install();
 #endif

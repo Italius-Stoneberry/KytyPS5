@@ -51,8 +51,8 @@ bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint
 	    parameters.NumRecords() != 1 || (parameters.Base48() & 3) != 0)
 		return false;
 	std::array<uint32_t, 2> controls {};
-	if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(parameters.Base48(), controls.data(),
-	                                                     sizeof(controls)))
+	if (!Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(parameters.Base48(), controls.data(),
+	                                                           sizeof(controls)))
 		return false;
 	const uint64_t count = controls[0], period = controls[1], bytes = count * 4;
 	if (count == 0 || period < count || count > source.NumRecords() ||

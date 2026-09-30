@@ -119,6 +119,23 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	bool Save();
 
+#ifdef KYTY_STATIC_PRECOMPILE
+	// The static precompile, a program of its own (src/local/shader-precompile.cpp): a seed file's
+	// shaders and pipelines (tools/local/static-precompile) into the static pipeline cache.
+	struct PrecompileOptions {
+		std::filesystem::path seeds;
+		std::filesystem::path out;     // what was compiled, as a warmup file (optional)
+		std::filesystem::path timings; // each pipeline's compile time (optional)
+		uint32_t              shard   = 0;
+		uint32_t              shards  = 1;
+		uint32_t              threads = 1;
+		bool                  pipelines = true;
+	};
+	static bool Precompile(GraphicContext& graphics, const PrecompileOptions& options);
+	// The caches the shards of a precompile saved next to the static cache, merged into it.
+	static bool MergePrecompileShards(GraphicContext& graphics);
+#endif
+
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
@@ -155,6 +172,16 @@ public:
 	                       vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program,
 	                       bool native_bindings = false);
+	// The same pipeline without blocking the caller on the driver compile: null while a
+	// background worker creates it (the native XPR variants, whose draws take the normal path
+	// until then). A later call with the same state returns the finished pipeline.
+	[[nodiscard]] Pipeline*
+	TryCreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	                          const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+	                          const ShaderPixelInputInfo* ps_input_info,
+	                          vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                          const ShaderProgram& vertex_program, const ShaderProgram& pixel_program,
+	                          bool native_bindings);
 	Pipeline& CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	                                const ShaderProgram&          compute_program);
 	// Native XPR records (src/local/native-xpr.inc): the SRT evaluation of a stage
@@ -243,6 +270,9 @@ private:
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
+	// The static precompile's pipelines (_PipelineCache/static), kept across emulator builds:
+	// GraphicContext::static_pipeline_cache while loaded.
+	vk::PipelineCache             m_static_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::string                   m_driver_cache_key;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
@@ -253,9 +283,26 @@ private:
 	    m_native_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
+	// TryCreateGraphicsPipeline: pipelines a worker is still compiling, by key.
+	struct PendingGraphicsPipeline;
+	class CompileWorkers;
+	std::unordered_map<GraphicsPipelineKey, std::shared_ptr<PendingGraphicsPipeline>, GraphicsPipelineKeyHash>
+	                                m_pending_graphics_pipelines;
+	std::unique_ptr<CompileWorkers> m_compile_workers;
 
+	Pipeline* CreateGraphicsPipelineImpl(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	                                     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+	                                     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	                                     bool primitive_restart_enable, const ShaderProgram& vertex_program,
+	                                     const ShaderProgram& pixel_program, bool native_bindings, bool async);
+	void      FinishCompileWorkers();
 	void InitializeDriverCache();
+	void InitializeStaticCache(bool create);
 	void WarmPipelines();
+#ifdef KYTY_STATIC_PRECOMPILE
+	bool SaveStaticCache(vk::PipelineCache cache, const std::filesystem::path& path);
+	bool WarmSeeds(const PrecompileOptions& options);
+#endif
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

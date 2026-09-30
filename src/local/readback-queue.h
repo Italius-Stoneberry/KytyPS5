@@ -5,8 +5,12 @@
 // single graphics queue (a guest reading data written frames ago otherwise waits for the whole
 // in-flight frame). Buffers are then shared by both queue families (VK_SHARING_MODE_CONCURRENT).
 //
-// Recording and submission belong to the GPU thread and bypass the recording worker: this queue
-// is not ordered with the graphics command stream, only with the graphics timeline.
+// Recording belongs to the GPU thread and bypasses the recording worker: this queue is not
+// ordered with the graphics command stream, only with the graphics timeline. With deferred
+// submits (KYTY_DEFERRED_SUBMIT) the submission itself goes through the worker, after the
+// graphics submissions queued before it: a copy never waits on a tick the driver has not been
+// given yet. Windows drivers stall presents, and every submission behind their device lock, on
+// such a wait-before-signal, and the worker's own submission of that tick is one of them.
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -28,6 +32,42 @@ public:
 		VkBuffer     source;
 		VkBufferCopy copy;
 	};
+	// One copy's queue submission (plain data: it is copied into the recording stream).
+	struct SubmitPacket {
+		VkQueue         queue;
+		VkCommandBuffer command;
+		VkSemaphore     wait;
+		uint64_t        wait_value;
+		VkSemaphore     signal;
+		uint64_t        signal_value;
+	};
+	template <typename Dispatch>
+	static void Submit(const SubmitPacket& packet, const Dispatch& dispatch) {
+		VkTimelineSemaphoreSubmitInfo values {};
+		values.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+		values.waitSemaphoreValueCount   = 1;
+		values.pWaitSemaphoreValues      = &packet.wait_value;
+		values.signalSemaphoreValueCount = 1;
+		values.pSignalSemaphoreValues    = &packet.signal_value;
+		const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+		VkSubmitInfo submit {};
+		submit.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submit.pNext                = &values;
+		submit.waitSemaphoreCount   = 1;
+		submit.pWaitSemaphores      = &packet.wait;
+		submit.pWaitDstStageMask    = &stage;
+		submit.commandBufferCount   = 1;
+		submit.pCommandBuffers      = &packet.command;
+		submit.signalSemaphoreCount = 1;
+		submit.pSignalSemaphores    = &packet.signal;
+		Check(dispatch.vkQueueSubmit(packet.queue, 1, &submit, VK_NULL_HANDLE), "submit readback copy");
+	}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	static void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
+	                         const vk::detail::DispatchLoaderDynamic&      dispatch) {
+		Submit(*static_cast<const SubmitPacket*>(segments[0].data), dispatch);
+	}
+#endif
 
 	explicit Queue(Libs::Graphics::GraphicContext& graphics)
 	    :
@@ -91,24 +131,12 @@ public:
 		d.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier,
 		                       0, nullptr, 0, nullptr);
 		Check(d.vkEndCommandBuffer(command), "end readback commands");
-		VkTimelineSemaphoreSubmitInfo values {};
-		values.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-		values.waitSemaphoreValueCount   = 1;
-		values.pWaitSemaphoreValues      = &wait_value;
-		values.signalSemaphoreValueCount = 1;
-		values.pSignalSemaphoreValues    = &value;
-		const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-		VkSubmitInfo submit {};
-		submit.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-		submit.pNext                = &values;
-		submit.waitSemaphoreCount   = 1;
-		submit.pWaitSemaphores      = &timeline;
-		submit.pWaitDstStageMask    = &stage;
-		submit.commandBufferCount   = 1;
-		submit.pCommandBuffers      = &command;
-		submit.signalSemaphoreCount = 1;
-		submit.pSignalSemaphores    = &m_semaphore;
-		Check(d.vkQueueSubmit(m_queue, 1, &submit, VK_NULL_HANDLE), "submit readback copy");
+		const SubmitPacket packet {m_queue, command, timeline, wait_value, m_semaphore, value};
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		const LocalVulkanRecording::Segment segments[] {{&packet, sizeof(packet)}};
+		if (LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true)) return value;
+#endif
+		Submit(packet, d);
 		return value;
 	}
 

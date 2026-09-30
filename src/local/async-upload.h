@@ -2,17 +2,18 @@
 // KYTY_ASYNC_UPLOAD: buffer upload copies (guest backing -> host-visible staging memory) run on
 // one worker, in the order the render thread recorded them; a queue submission first waits for
 // the copies recorded before it. The render thread only records the copy commands.
+// KYTY_ASYNC_UPLOAD=2: the staging copies of image uploads (ObtainBufferForImage) as well.
 //
 // The worker reads the backing view, never the guest range: a guest write or protection change
 // cannot fault it, and unmapping drains the queue before the range can be reused.
+
+#include "local-platform.h"
 
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <pthread.h>
-#include <sched.h>
 #include <thread>
 #include <x86intrin.h>
 
@@ -88,24 +89,15 @@ private:
 	};
 
 	void Run() {
-		(void)pthread_setname_np(pthread_self(), "Kyty.Upload");
+		LocalPlatform::SetThreadName("Kyty.Upload");
 		// Created by the render thread: do not inherit its dedicated CPU.
-		if (const char* cpus = std::getenv("KYTY_RECORDING_CPUS"); cpus != nullptr) {
-			cpu_set_t set;
-			CPU_ZERO(&set);
-			for (const char* p = cpus; *p != '\0';) {
-				char*      end = nullptr;
-				const long cpu = std::strtol(p, &end, 10);
-				if (end == p) break;
-				if (cpu >= 0 && cpu < CPU_SETSIZE) CPU_SET(static_cast<int>(cpu), &set);
-				p = (*end == ',') ? end + 1 : end;
-			}
-			if (CPU_COUNT(&set) != 0) (void)sched_setaffinity(0, sizeof(set), &set);
-		}
-		uint64_t done = 0;
+		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
+		// Pause iterations the worker polls for new copies before it sleeps.
+		constexpr uint32_t UploadSpins = 20000;
+		uint64_t           done        = 0;
 		for (;;) {
 			uint64_t head = m_head.load(std::memory_order_acquire);
-			for (int spin = 0; head == done && spin < 20000; ++spin) {
+			for (uint32_t spin = 0; head == done && spin < UploadSpins; ++spin) {
 				_mm_pause();
 				head = m_head.load(std::memory_order_acquire);
 			}

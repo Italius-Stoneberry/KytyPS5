@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/pageManager.h"
+#include "slow-log.h"
 
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -9,6 +10,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <immintrin.h>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -21,12 +23,15 @@
 #undef min
 #undef max
 #else
+#include <sched.h>
 #include <unistd.h>
 #endif
 
 namespace Libs::Graphics {
 namespace {
 thread_local std::vector<PageManager::DeferredRange>* g_deferred_write_protect = nullptr;
+thread_local uint64_t g_unmapping_begin = 0;
+thread_local uint64_t g_unmapping_end   = 0;
 
 constexpr uint64_t PAGE_SIZE    = TRACKER_PAGE_SIZE;
 constexpr uint64_t REGION_SIZE  = TRACKER_REGION_SIZE;
@@ -80,8 +85,21 @@ Common::VirtualMemory::Mode ToMemoryMode(uint32_t protection) {
 class SpinGuard final {
 public:
 	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
+		// Owners call VirtualProtect inside: past a short spin a waiter yields its CPU instead
+		// of competing with a descheduled owner (see TrackingSpinLock).
+		uint32_t spins = 0;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			do {
+				if (++spins < 512) {
+					_mm_pause();
+				} else {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+					SwitchToThread();
+#else
+					sched_yield();
+#endif
+				}
+			} while (m_lock.test(std::memory_order_relaxed));
 		}
 	}
 	~SpinGuard() { m_lock.clear(std::memory_order_release); }
@@ -223,12 +241,24 @@ struct PageManager::Impl {
 		return ptr;
 	}
 
-	void Protect(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
+	static void ProtectHost(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size,
 		                                                     ToMemoryMode(protection))) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr,
 			      protection);
 		}
+	}
+
+	void Protect(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
+		const auto end = vaddr + size;
+		if (protection == READ_WRITE_PROTECTION && g_unmapping_end > g_unmapping_begin &&
+		    vaddr < g_unmapping_end && end > g_unmapping_begin) {
+			// Releases inside the range being unmapped are left to the unmap (SetUnmappingRange).
+			if (vaddr < g_unmapping_begin) ProtectHost(vaddr, g_unmapping_begin - vaddr, protection);
+			if (end > g_unmapping_end) ProtectHost(g_unmapping_end, end - g_unmapping_end, protection);
+			return;
+		}
+		ProtectHost(vaddr, size, protection);
 	}
 
 	template <bool track, bool is_read, bool masked>
@@ -287,6 +317,27 @@ struct PageManager::Impl {
 		}
 
 		release_pending();
+	}
+
+	void SyncProtection(uint64_t vaddr, uint64_t size) {
+		const auto begin = PageStart(vaddr);
+		const auto end   = PageEnd(vaddr, size);
+		for (auto chunk_begin = begin; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, (chunk_begin / REGION_SIZE + 1) * REGION_SIZE);
+			const auto region_base = chunk_begin / REGION_SIZE * REGION_SIZE;
+			if (auto* region = FindRegion(chunk_begin); region != nullptr) {
+				SpinGuard lock(region->lock);
+				const auto last = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+				for (auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE); first < last;) {
+					const auto perms = region->pages[first].Perms();
+					auto       next  = first + 1;
+					while (next < last && region->pages[next].Perms() == perms) next++;
+					Protect(region_base + first * PAGE_SIZE, (next - first) * PAGE_SIZE, perms);
+					first = next;
+				}
+			}
+			chunk_begin = chunk_end;
+		}
 	}
 
 	void ReapplyProtection(uint64_t vaddr, uint64_t size) {
@@ -362,12 +413,38 @@ void PageManager::SetDeferredWriteProtectSink(std::vector<DeferredRange>* sink) 
 	g_deferred_write_protect = sink;
 }
 
+void PageManager::SyncProtection(uint64_t vaddr, uint64_t size) {
+	m_impl->SyncProtection(vaddr, size);
+}
+
+void PageManager::SetUnmappingRange(uint64_t begin, uint64_t end) noexcept {
+	g_unmapping_begin = end == 0 ? 0 : begin;
+	g_unmapping_end   = end;
+}
+
+bool PageManager::RestoreIfUnwatched(uint64_t vaddr) noexcept {
+	// A region that does not exist yet never held a watcher: the protection is not ours.
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	SpinGuard lock(region->lock);
+	if (region->pages[(vaddr % REGION_SIZE) / PAGE_SIZE].Perms() != READ_WRITE_PROTECTION) {
+		return false;
+	}
+	return Libs::LibKernel::Memory::RestoreGuestWritable(PageStart(vaddr), PAGE_SIZE);
+}
+
 void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size) {
 	m_impl->ReapplyProtection(vaddr, size);
 }
 
 template <bool track>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
+	SlowLog::Scope slow([&](double ms) {
+		std::printf("SLOW UpdatePageWatchers %.1f ms track=%d addr=0x%llx size=0x%llx\n", ms, track ? 1 : 0,
+		            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size));
+	});
 	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
 }
 

@@ -14,6 +14,8 @@
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "live-census.h"
+#include "live-counters.h"
 
 #include <algorithm>
 #include <array>
@@ -69,6 +71,42 @@ constexpr uint32_t RegisterSelectorMask     = 0x70000000u;
 
 constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
+}
+
+// Indirect register tables and indirect command buffers can be written by the GPU (GPU-driven
+// rendering writes per-draw data in compute passes). Like the indirect draw arguments, bring
+// GPU-written bytes back before the command processor reads guest memory; without it a table
+// read before its first download is all zeros (an "unknown register 0" crash at startup).
+void SyncCommandMemory(uint64_t address, uint64_t bytes, const char* what) {
+	LiveCounters::Add(LiveCounters::IndirectTables);
+	LiveCensus::Scope census(LiveCensus::CommandSync, 0, 0);
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(address, bytes)) {
+		static std::atomic<uint32_t> logs {0};
+		if (logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("%s: failed to synchronise 0x%016" PRIx64 " (+%" PRIu64
+			     " bytes; image-owned range, reading guest memory)\n",
+			     what, address, bytes);
+		}
+	}
+}
+
+// An entry of an indirect register table the emulator cannot apply: report the table once in a
+// while and skip the entry (the hardware ignores writes to unused register slots).
+void ReportIndirectRegister(const char* bank, uint64_t address, uint32_t count, uint32_t index,
+                            uint32_t raw_offset, uint32_t value) {
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) >= 8) {
+		return;
+	}
+	std::printf("warning: skipping indirect %s register table entry %u/%u at 0x%016" PRIx64
+	            ": offset=0x%08x value=0x%08x\n",
+	            bank, index, count, address, raw_offset, value);
+	const auto* table = reinterpret_cast<const uint32_t*>(address);
+	for (uint32_t j = 0; j < count && j < 16; j++) {
+		std::printf("\t%s_indirect[%u] offset=0x%08x value=0x%08x\n", bank, j, table[j * 2],
+		            table[j * 2 + 1]);
+	}
+	std::fflush(stdout);
 }
 
 bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
@@ -1959,6 +1997,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 		     indirect_num_dw, buffer[2]);
 	}
 
+	SyncCommandMemory(reinterpret_cast<uint64_t>(indirect_buffer),
+	                  uint64_t {indirect_num_dw} * sizeof(uint32_t), "IndirectBuffer");
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
 	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw});
@@ -1983,6 +2023,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs");
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2019,7 +2061,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto pfunc = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
 
 		if (pfunc == nullptr) {
-			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			ReportIndirectRegister("cx", indirect_address, indirect_num_dw, i, raw_cmd_offset, value);
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2046,6 +2089,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs");
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2053,39 +2097,16 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		auto value          = indirect_buffer[1];
 
 		// Not sure if this is correct
-		// if (raw_cmd_offset != cmd_offset) {
-		// 	LOGF_COLOR(Log::Color::Red,
-		// 	           "\t temporary: normalized indirect SH register offset 0x%08" PRIx32
-		// 	           " -> 0x%08" PRIx32 "\n",
-		// 	           raw_cmd_offset, cmd_offset);
-		// }
-
-		// Not sure if this is correct
 		if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
 			continue;
 		}
 
-		if (cmd_offset >= Pm4::SH_NUM) {
-			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+		if (cmd_offset >= Pm4::SH_NUM || g_hw_sh_indirect_func[cmd_offset] == nullptr) {
+			ReportIndirectRegister("sh", indirect_address, indirect_num_dw, i, raw_cmd_offset, value);
+			continue;
 		}
 
-		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
-
-		if (pfunc == nullptr) {
-			LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
-			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-			     i, indirect_num_dw, indirect_address, cmd_offset, value);
-			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
-			}
-			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
-		}
-
-		pfunc(cp, cmd_offset, value);
+		g_hw_sh_indirect_func[cmd_offset](cp, cmd_offset, value);
 	}
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -2108,6 +2129,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs");
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -2123,23 +2146,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
 		}
-		if (cmd_offset >= Pm4::UC_NUM) {
-			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+		if (cmd_offset >= Pm4::UC_NUM || g_hw_uc_indirect_func[cmd_offset] == nullptr) {
+			ReportIndirectRegister("uc", indirect_address, indirect_num_dw, i, raw_cmd_offset, value);
+			continue;
 		}
-
-		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
-
-		if (pfunc == nullptr) {
-			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
-			}
-			EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
-		}
-		pfunc(cp, cmd_offset, value);
+		g_hw_uc_indirect_func[cmd_offset](cp, cmd_offset, value);
 	}
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;

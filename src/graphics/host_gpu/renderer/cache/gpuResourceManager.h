@@ -29,12 +29,15 @@ public:
 	void                        SetGpu(GuestGpu* gpu) noexcept { m_gpu = gpu; }
 	// After a guest protection change: tracked pages get the tracker's protection back.
 	void ReapplyProtection(uint64_t vaddr, uint64_t size) { m_page_manager.ReapplyProtection(vaddr, size); }
+	void SyncProtection(uint64_t vaddr, uint64_t size) { m_page_manager.SyncProtection(vaddr, size); }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
-	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// `releasing`: the caller unmaps or decommits the range right after (munmap, free,
+	// memory pool decommit), not a range about to receive a mapping.
+	void               UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing = false);
 	void               PrepareBda();
 	void BeginAliasWrite() noexcept;
 	void EndAliasWrite() noexcept;
@@ -47,6 +50,7 @@ public:
 
 	bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
 	void               RunGarbageCollector();
+	void               AdvanceFrame() noexcept { m_texture_cache.AdvanceFrame(); }
 
 private:
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);

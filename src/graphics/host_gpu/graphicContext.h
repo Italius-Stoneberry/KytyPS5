@@ -33,6 +33,11 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
+	// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT is usable.
+	bool                               pipeline_cache_control_enabled        = false;
+	// The static precompile's pipelines (PipelineCache): looked up first when a pipeline is
+	// created, never compiled into outside the precompile.
+	vk::PipelineCache                  static_pipeline_cache                 = nullptr;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
@@ -49,6 +54,13 @@ struct GraphicContext {
 	// copies (src/local/readback-queue.h); buffers are then shared with its family.
 	uint32_t                           readback_family = static_cast<uint32_t>(-1);
 	vk::Queue                          readback_queue  = nullptr;
+	// Windows: a second queue of the graphics family used only for vkQueuePresentKHR. The
+	// driver can block a present in the kernel until earlier GPU work on its queue is done;
+	// on the graphics queue that held queue_mutex against the very submissions that work
+	// waited for. Null: presents use `queue` under queue_mutex.
+	Common::Mutex                      present_queue_mutex;
+	vk::Queue                          present_queue = nullptr;
+	bool                               present_queue_created = false; // queue index 1 of queue_family
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

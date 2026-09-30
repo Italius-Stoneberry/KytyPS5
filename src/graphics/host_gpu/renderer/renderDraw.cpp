@@ -32,9 +32,10 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
-#include "debug-delay.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "frame-capture.h"
+#include "frame-gen.h"
 #include "native-preparation-state.h"
 #include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -55,6 +56,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <xxhash.h>
 
@@ -64,6 +66,9 @@ extern "C" {
 // 0: a draw run reads no buffer range that any image overlaps; 1: sampled
 // images whose contents still come from the CPU may overlap its read ranges.
 volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode {0};
+// KYTY_DRAW_PACKETS: the ordinary DrawIndex/DrawAuto draws are recorded as packets too (their
+// debug phases are CPU-side notes only), instead of ~20 separately recorded Vulkan calls each.
+volatile std::atomic_uint32_t kyty_local_draw_packets_mode {0};
 }
 
 // Draw state in reusable preparation storage when that switch is on.
@@ -1222,6 +1227,97 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+// Live `capture`: the draw's shaders, targets, textures and fixed-function state.
+static void CaptureFrameDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
+                             const DrawRenderState& state, const PreparedBindings& vertex,
+                             const std::optional<PreparedBindings>& pixel) {
+	auto& call     = FrameCapture::g_call;
+	call.prepared  = true;
+	call.count     = draw.index_count;
+	call.instances = draw.instance_count;
+	if (state.vs_input_info.stage.program != nullptr) {
+		call.vs = state.vs_input_info.stage.program->shader_hash;
+	}
+	if (state.ps_active && state.ps_input_info.stage.program != nullptr) {
+		call.ps = state.ps_input_info.stage.program->shader_hash;
+	}
+	auto& shaders   = buffer.GetShaders();
+	call.vs_address = shaders.GetVs().gs_regs.data_addr;
+	call.ps_address = shaders.GetPs().ps_regs.data_addr;
+
+	const auto& hw       = buffer.GetRegisters();
+	const auto& screen   = hw.GetScreenViewport();
+	const auto& viewport = screen.viewports[0];
+	call.viewport[0]     = viewport.xscale;
+	call.viewport[1]     = viewport.xoffset;
+	call.viewport[2]     = viewport.yscale;
+	call.viewport[3]     = viewport.yoffset;
+	call.viewport[4]     = viewport.zscale;
+	call.viewport[5]     = viewport.zoffset;
+	call.scissor[0]      = screen.screen_scissor_left;
+	call.scissor[1]      = screen.screen_scissor_top;
+	call.scissor[2]      = screen.screen_scissor_right;
+	call.scissor[3]      = screen.screen_scissor_bottom;
+	call.target_mask     = hw.GetRenderTargetMask();
+	call.blend_mask      = 0;
+	for (uint32_t slot = 0; slot < 8; ++slot) {
+		if (hw.GetBlendControl(slot).enable) call.blend_mask |= 1u << slot;
+	}
+	const auto& blend0 = hw.GetBlendControl(0);
+	call.blend0        = blend0.color_srcblend | (uint32_t {blend0.color_destblend} << 8u) |
+	              (uint32_t {blend0.color_comb_fcn} << 16u);
+	const auto& depth = hw.GetDepthControl();
+	call.z_enable     = depth.z_enable ? 1 : 0;
+	call.z_write      = depth.z_write_enable ? 1 : 0;
+	call.z_func       = depth.zfunc;
+
+	for (uint32_t i = 0; i < state.color_count; ++i) {
+		call.images.push_back(FrameCapture::FromInfo(state.color_info[i].desc.info,
+		                                             FrameCapture::ColorTarget,
+		                                             FrameCapture::StagePs, i));
+	}
+	if (state.depth_info.image_id) {
+		call.images.push_back(FrameCapture::FromInfo(state.depth_info.desc.info,
+		                                             FrameCapture::DepthTarget,
+		                                             FrameCapture::StagePs, 0));
+	}
+	const auto textures = [&](const PreparedBindings& prepared, uint8_t stage) {
+		const auto* program = prepared.runtime != nullptr ? prepared.runtime->program : nullptr;
+		for (uint32_t i = 0; i < prepared.images.size(); ++i) {
+			auto image = FrameCapture::FromInfo(prepared.images[i].desc.info, FrameCapture::Texture,
+			                                    stage, i);
+			if (program != nullptr && i < program->info.images.size()) {
+				const auto& resource = program->info.images[i];
+				image.storage =
+				    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+				image.written = resource.written ? 1 : 0;
+			}
+			call.images.push_back(image);
+		}
+	};
+	textures(vertex, FrameCapture::StageVs);
+	if (pixel) {
+		textures(*pixel, FrameCapture::StagePs);
+	}
+	if (FrameCapture::WantsData(call.vs) || FrameCapture::WantsData(call.ps)) {
+		const auto constants = [](const PreparedBindings& prepared, const std::string& stage) {
+			if (prepared.runtime != nullptr) {
+				FrameCapture::AddWords(stage + ".user", 0, prepared.runtime->resources.user_data);
+				FrameCapture::AddWords(stage + ".srt", 0, prepared.runtime->resources.flattened_srt);
+			}
+			for (uint32_t i = 0; i < prepared.buffer_sources.size(); ++i) {
+				FrameCapture::AddGuest(stage + ".buf" + std::to_string(i),
+				                       prepared.buffer_sources[i].address,
+				                       prepared.buffer_sources[i].size);
+			}
+		};
+		constants(vertex, "vs");
+		if (pixel) {
+			constants(*pixel, "ps");
+		}
+	}
+}
+
 bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1265,6 +1361,13 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& bindings = binding_storage.Get();
 	PrepareGraphicsBindingsInto(state.vs_input_info.stage, state.ps_input_info.stage,
 	                            state.ps_active, bindings);
+	if (FrameCapture::Active()) {
+		CaptureFrameDraw(buffer, draw, state, bindings.vertex, bindings.pixel);
+	}
+	if (FrameGen::Enabled() && state.vs_input_info.stage.program != nullptr) {
+		FrameGen::OnDraw(state.vs_input_info.stage.program->shader_hash,
+		                 state.vs_input_info.stage.resources.flattened_srt);
+	}
 	if (XprCapture::g_state.pending) {
 		CaptureXprTargets(state, bindings);
 	}
@@ -1329,7 +1432,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	const auto primitive = ucfg.GetPrimType();
 	record_draw = LocalVulkanRecording::PacketsEnabled() && !mesh_active &&
-	    !set_bind_debug && !set_auto_debug &&
+	    ((!set_bind_debug && !set_auto_debug) ||
+	     kyty_local_draw_packets_mode.load(std::memory_order_relaxed) != 0) &&
 	    (primitive == Prospero::PrimitiveType::kPointList ||
 	     primitive == Prospero::PrimitiveType::kLineList ||
 	     primitive == Prospero::PrimitiveType::kLineStrip ||
@@ -1381,6 +1485,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                  ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
 	                                  : vk::ImageAspectFlags {};
 	if (!record_draw) {
+		LiveCounters::Add(LiveCounters::DirectDraws);
+		if (mesh_active) LiveCounters::Add(LiveCounters::MeshDraws);
 		CommitGraphicsState(buffer, state.vs_input_info, state.color_info, state.color_count,
 		                    state.depth_info, pipeline.pipeline, feedback_aspects);
 	} else {
@@ -1450,12 +1556,14 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// After the draw is recorded: storing may clean buffer owners (copies) and so
 	// may end rendering or restart the scheduler.
 	if (m_native_xpr_verify.record != nullptr)
-		NativeXprVerify(buffer, state, rendering, std::span {descriptor_stages.data(), descriptor_stage_count});
+		NativeXprVerify(buffer, state, rendering, std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
 	if (m_native_xpr_store) {
 		m_native_xpr_store = false;
 		if (!mesh_active && emit.indexed && vertex_bindings.count == 0)
 			NativeXprStore(buffer, state, topology, primitive_restart_enable, rendering,
-			               std::span {descriptor_stages.data(), descriptor_stage_count});
+			               std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
+		else
+			LiveCounters::Add(LiveCounters::XprRefuseDraw);
 	}
 #endif
 	return true;
@@ -1555,6 +1663,8 @@ bool RenderExecutor::TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer,
 		return false;
 	if (!m_context.GetGpuResources().IsMapped(run.indices.address, run.indices.size)) return false;
 	m_context.GetCommandScheduler().PopPendingOperations();
+	LiveTrace::MarkAfter gpu_mark {[&] { return m_context.GetCommandScheduler().Current().RawHandle(); },
+	                               LiveTrace::MarkDraw, buffer.GetShaders().GetPs().ps_regs.data_addr};
 	Common::LockGuard lock(m_context.GetMutex());
 	const auto        mapping_epoch = m_context.GetGpuResources().MappingEpoch();
 	const auto        alias_epoch   = m_context.GetGpuResources().PreparationAliasEpoch();
@@ -1830,6 +1940,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	XprCapture::g_state.pending.reset(); // a capture never spans two draws
 	KYTY_PROFILER_FUNCTION();
+	FrameCapture::Scope frame_capture("DrawIndex", false);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1837,9 +1948,9 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 	LiveCensus::Scope census(LiveCensus::Draw, sh_ctx.GetVs().gs_regs.data_addr, sh_ctx.GetPs().ps_regs.data_addr);
+	LiveCensus::DrawPhases census_phases(sh_ctx.GetPs().ps_regs.data_addr);
 	LiveTrace::MarkAfter gpu_mark {[&] { return m_context.GetCommandScheduler().Current().RawHandle(); },
 	                               LiveTrace::MarkDraw, sh_ctx.GetPs().ps_regs.data_addr};
-	DebugDelay::At(DebugDelay::Draw);
 	LiveCounters::g_last_dispatch_shader = 0;
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex), submit_id,
@@ -1850,8 +1961,28 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (args.index_count == 0 || args.instance_count == 0) {
 		return;
 	}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (LiveCounters::g_dispatch_keys_on.load(std::memory_order_relaxed)) {
+		// Local diagnostic: was this object (the native XPR key: shader addresses and user data)
+		// drawn last frame too? What a native record for direct draws could reuse.
+		static std::unordered_set<uint64_t> previous, current;
+		static uint32_t                     keys_frame = 0;
+		const auto                          frame      = static_cast<uint32_t>(m_context.FrameNumber());
+		if (frame != keys_frame) {
+			previous.swap(current);
+			current.clear();
+			keys_frame = frame;
+		}
+		thread_local std::vector<uint32_t> key;
+		NativeXprKey(buffer, key);
+		const auto hash = XXH3_64bits(key.data(), key.size() * sizeof(uint32_t));
+		current.insert(hash);
+		LiveCounters::Add(previous.contains(hash) ? LiveCounters::DrawKeySame : LiveCounters::DrawKeyNew);
+	}
+#endif
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
+		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "metadata_or_depth_copy";
 		ResetBindings();
 		return;
 	}
@@ -1956,6 +2087,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	DrawEmitInfo emit {};
 	emit.indexed       = true;
+	emit.state_offsets = !indirect && args.base_vertex == 0;
 	emit.vertex_offset = vertex_offset;
 	emit.first_instance =
 	    indirect ? args.first_instance : ResolveInstanceOffset(state.vs_input_info);
@@ -1968,12 +2100,15 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	FrameCapture::Scope frame_capture("DrawAuto", false);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
+	LiveTrace::MarkAfter gpu_mark {[&] { return m_context.GetCommandScheduler().Current().RawHandle(); },
+	                               LiveTrace::MarkDraw, sh_ctx.GetPs().ps_regs.data_addr};
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndexAuto), submit_id,
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
@@ -1985,6 +2120,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
+		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "metadata_or_depth_copy";
 		ResetBindings();
 		return;
 	}

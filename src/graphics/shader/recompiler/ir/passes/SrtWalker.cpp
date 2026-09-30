@@ -8,8 +8,11 @@
 #include "native-resource-runtime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
@@ -1281,10 +1284,17 @@ static std::optional<uint32_t> SelectNativePredicate(const LinearSrtPlan& root, 
     return root.single_condition_variants[choice];
 }
 
-static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePlan& program) {
+static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePlan& program,
+                                                                std::string& reason) {
     if(!program.srt_plan_complete || program.control_flow.empty() || program.control_flow.size()>256 ||
-        program.descriptor_sources.empty() ||
-        std::ranges::any_of(program.clean_flat_slots,[](uint8_t value){return value!=0;}))return {};
+        program.descriptor_sources.empty()) {
+        reason = "controlled: shape";
+        return {};
+    }
+    if(std::ranges::any_of(program.clean_flat_slots,[](uint8_t value){return value!=0;})) {
+        reason = "controlled: clean flat slots";
+        return {};
+    }
     // Predicate reads and raw transaction reads use separate memo domains in
     // the interpreter. Exclude clean flat slots until that shared memo can be
     // represented without duplicating a clean callback or changing its order.
@@ -1292,13 +1302,22 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
     for(uint32_t i=0;i<program.control_flow.size();++i) {
         const auto& block=program.control_flow[i];
         if(std::ranges::any_of(block.sources,[&](uint32_t id){return id>=program.descriptor_sources.size();}) ||
-            std::ranges::any_of(block.successors,[&](uint32_t id){return id>=program.control_flow.size();}))return {};
+            std::ranges::any_of(block.successors,[&](uint32_t id){return id>=program.control_flow.size();})) {
+            reason = "controlled: block ids";
+            return {};
+        }
         if(!block.condition.IsEmpty()) {
-            if(block.successors.size()!=2)return {};
+            if(block.successors.size()!=2) {
+                reason = "controlled: successors";
+                return {};
+            }
             conditional.push_back(i);
         }
     }
-    if(conditional.empty() || conditional.size()>2)return {};
+    if(conditional.empty() || conditional.size()>2) {
+        reason = fmt::format("controlled: {} conditionals", conditional.size());
+        return {};
+    }
     auto root=std::make_shared<LinearSrtPlan>();
     root->sources=program.materialization_sources;root->clean_slots=program.clean_flat_slots;
     uint32_t combinations=1;
@@ -1323,8 +1342,14 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
         }
         if(std::ranges::any_of(root->control_variants,[&](const auto& variant){return variant->active_sources==active;}))continue;
         auto leaf=std::make_shared<LinearSrtPlan>();
-        if(!LinearSrtCompiler(program,*leaf,active).Build())return {};
+        LinearSrtCompiler compiler(program,*leaf,active);
+        if(!compiler.Build()) {
+            reason = fmt::format("controlled leaf: {} {}", compiler.failure ? compiler.failure : "?",
+                                 ValueOpcodeName(compiler.failed_op));
+            return {};
+        }
         PrepareLinearSrtAot(*leaf);
+        root->add_carry |= leaf->add_carry;
         root->control_variants.push_back(std::move(leaf));
     }
     BuildNativePredicate(program, *root, conditional);
@@ -1336,11 +1361,28 @@ void BuildLinearSrtPlan(ResourcePlan& program) {
     program.linear_srt.reset();
 #if defined(__x86_64__) || defined(_M_X64)
     auto compiled=std::make_shared<LinearSrtPlan>();
-    if (LinearSrtCompiler(program,*compiled).Build()) {
+    LinearSrtCompiler compiler(program,*compiled);
+    if (compiler.Build()) {
         PrepareLinearSrtAot(*compiled);
         program.linear_srt=std::move(compiled);
+        return;
     }
-    else program.linear_srt=BuildControlledLinearSrt(program);
+    std::string controlled;
+    program.linear_srt=BuildControlledLinearSrt(program, controlled);
+    // KYTY_SRT_LINEAR_LOG: why a plan stays on the SRT interpreter (each evaluation walks the IR).
+    static const bool log = std::getenv("KYTY_SRT_LINEAR_LOG") != nullptr;
+    if (log && !program.linear_srt) {
+        uint32_t dwords = 0, conditionals = 0;
+        for (const auto& source: program.descriptor_sources) dwords += source.dword_count;
+        for (const auto& block: program.control_flow) conditionals += block.condition.IsEmpty() ? 0u : 1u;
+        std::printf("SRT interpreter plan: hash=0x%016llx stage=%u sources=%zu materialized=%zu dwords=%u "
+                    "flat=%zu blocks=%zu conditionals=%u linear=%s %s controlled=%s\n",
+                    static_cast<unsigned long long>(program.shader_hash), static_cast<unsigned>(program.stage),
+                    program.descriptor_sources.size(), program.materialization_sources.size(), dwords,
+                    program.srt_reads.size(), program.control_flow.size(), conditionals,
+                    compiler.failure ? compiler.failure : "?",
+                    std::string(ValueOpcodeName(compiler.failed_op)).c_str(), controlled.c_str());
+    }
 #endif
 }
 
@@ -1395,11 +1437,20 @@ static bool EvaluateLinearSrt(const LinearSrtPlan& plan,const SrtRuntime& runtim
 static bool TraceLinearPlan(const ResourcePlan& program, const LinearSrtPlan& plan, const SrtRuntime& runtime,
                             SrtReadTrace& trace) {
 	if (plan.function == nullptr) return false;
-	std::vector<uint64_t> values(plan.nodes.size());
+	// Per-thread scratch: native XPR retraces call this for every stored record.
+	thread_local struct {
+		std::vector<uint64_t>                                values;
+		std::vector<uint8_t>                                 structural, data;
+		std::vector<uint32_t>                                read_index;
+		std::vector<std::pair<SrtReadTrace::Kind, uint32_t>> kinds;
+	} scratch;
+	auto& values = scratch.values;
+	values.assign(plan.nodes.size(), 0);
 	if (!plan.function(&runtime, values.data())) return false;
 	using Kind = LinearSrtPlan::Kind;
 	// A node is structural when another node or a descriptor dword consumes it.
-	std::vector<uint8_t> structural(plan.nodes.size(), 0);
+	auto& structural = scratch.structural;
+	structural.assign(plan.nodes.size(), 0);
 	for (const auto& node: plan.nodes) {
 		uint32_t used = 0;
 		uint8_t  use  = SrtReadTrace::Computed;
@@ -1418,7 +1469,8 @@ static bool TraceLinearPlan(const ResourcePlan& program, const LinearSrtPlan& pl
 	for (const auto node: plan.descriptor_words)
 		if (node != UINT32_MAX) structural[node] |= SrtReadTrace::Descriptor;
 	trace.flat_words = plan.flat_words.size();
-	std::vector<uint8_t> data(plan.nodes.size(), 0);
+	auto& data = scratch.data;
+	data.assign(plan.nodes.size(), 0);
 	for (uint32_t i = 0; i < plan.flat_words.size(); ++i) {
 		const auto index = plan.flat_words[i];
 		if (index == UINT32_MAX) continue;
@@ -1431,7 +1483,8 @@ static bool TraceLinearPlan(const ResourcePlan& program, const LinearSrtPlan& pl
 		trace.data.emplace_back(i, address);
 		data[index] = 1;
 	}
-	std::vector<uint32_t> read_index(plan.nodes.size(), UINT32_MAX);
+	auto& read_index = scratch.read_index;
+	read_index.assign(plan.nodes.size(), UINT32_MAX);
 	for (uint32_t index = 0; index < plan.nodes.size(); ++index) {
 		const auto& node = plan.nodes[index];
 		if (node.kind != Kind::Read || data[index]) continue;
@@ -1447,7 +1500,8 @@ static bool TraceLinearPlan(const ResourcePlan& program, const LinearSrtPlan& pl
 	// Descriptor sources in evaluation order are the buffers, the direct images
 	// and the samplers of the snapshot (MaterializeSnapshot). Without that exact
 	// correspondence no feed is reported.
-	std::vector<std::pair<SrtReadTrace::Kind, uint32_t>> kinds;
+	auto& kinds = scratch.kinds;
+	kinds.clear();
 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) kinds.emplace_back(SrtReadTrace::Kind::Buffer, i);
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 		const auto* source = Source(program, program.info.images[i].source);
@@ -1596,6 +1650,44 @@ bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint
 	                                  active);
 }
 
+// KYTY_SRT_LINEAR_VERIFY: every linear evaluation that uses the add-with-carry lowering is
+// repeated by the interpreter (which evaluated those plans before) and compared.
+static void VerifyLinearSrt(const ResourcePlan& program, std::span<const uint32_t> sources,
+                            const SrtRuntime& runtime, std::span<const uint8_t> clean_flat_slots, bool ok,
+                            const std::vector<DescriptorValue>& results, const std::vector<uint32_t>& flat,
+                            const std::vector<uint8_t>& active_sources) {
+    static std::atomic<uint64_t> checks {0}, mismatches {0};
+    std::vector<DescriptorValue> expected_results;
+    std::vector<uint32_t>        expected_flat;
+    std::vector<uint8_t>         expected_active;
+    const bool expected_ok = EvaluateRuntimeSourcesImpl(program, sources, runtime, expected_results, expected_flat,
+                                                        true, clean_flat_slots, expected_active);
+    const bool same = ok == expected_ok &&
+                      (!ok || (results == expected_results && flat == expected_flat &&
+                               active_sources == expected_active));
+    const auto count = checks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!same) {
+        const auto failed = mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (failed <= 16) {
+            size_t first_result = 0, first_flat = 0;
+            while (first_result < std::min(results.size(), expected_results.size()) &&
+                   results[first_result] == expected_results[first_result]) ++first_result;
+            while (first_flat < std::min(flat.size(), expected_flat.size()) &&
+                   flat[first_flat] == expected_flat[first_flat]) ++first_flat;
+            std::printf("SRT linear verify MISMATCH: hash=0x%016llx ok=%d/%d results=%zu/%zu (first diff %zu) "
+                        "flat=%zu/%zu (first diff %zu) active=%zu/%zu\n",
+                        static_cast<unsigned long long>(program.shader_hash), ok, expected_ok, results.size(),
+                        expected_results.size(), first_result, flat.size(), expected_flat.size(), first_flat,
+                        active_sources.size(), expected_active.size());
+        }
+    }
+    if (count % 20000 == 0) {
+        std::printf("SRT linear verify: %llu checks, %llu mismatches\n", static_cast<unsigned long long>(count),
+                    static_cast<unsigned long long>(mismatches.load(std::memory_order_relaxed)));
+        std::fflush(stdout);
+    }
+}
+
 bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
@@ -1605,22 +1697,29 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
         if(linear && std::ranges::equal(sources,linear->sources) && LinearMaskMatches(clean_flat_slots,linear->clean_slots)) {
             if(!program.srt_plan_complete || (runtime.read_specialization_memory==nullptr &&
                 std::ranges::any_of(clean_flat_slots,[](uint8_t v){return v!=0;})))return false;
-            if(!linear->control_variants.empty()) {
-                if (const auto variant = SelectNativePredicate(*linear, runtime)) {
-                    return EvaluateLinearSrt(*linear->control_variants[*variant], runtime, results, flat, active_sources);
+            const auto run = [&] {
+                if(!linear->control_variants.empty()) {
+                    if (const auto variant = SelectNativePredicate(*linear, runtime)) {
+                        return EvaluateLinearSrt(*linear->control_variants[*variant], runtime, results, flat, active_sources);
+                    }
+                    auto clean=runtime;clean.read_memory=runtime.read_specialization_memory;
+                    Evaluator predicate_evaluator(program,clean);
+                    std::vector<uint8_t> active;
+                    EvaluateSourceActivity(program,runtime,predicate_evaluator,active);
+                    const auto leaf=std::ranges::find_if(linear->control_variants,
+                        [&](const auto& candidate){return candidate->active_sources==active;});
+                    EXIT_IF(leaf==linear->control_variants.end());
+                    return EvaluateLinearSrt(**leaf,runtime,results,flat,active_sources);
                 }
-                auto clean=runtime;clean.read_memory=runtime.read_specialization_memory;
-                Evaluator predicate_evaluator(program,clean);
-                std::vector<uint8_t> active;
-                EvaluateSourceActivity(program,runtime,predicate_evaluator,active);
-                const auto leaf=std::ranges::find_if(linear->control_variants,
-                    [&](const auto& candidate){return candidate->active_sources==active;});
-                EXIT_IF(leaf==linear->control_variants.end());
-                return EvaluateLinearSrt(**leaf,runtime,results,flat,active_sources);
-            }
-            // A runtime failure is final: replaying the original evaluator could
-            // duplicate a reader's side effects or mask a failed ownership check.
-            return EvaluateLinearSrt(*linear,runtime,results,flat,active_sources);
+                // A runtime failure is final: replaying the original evaluator could
+                // duplicate a reader's side effects or mask a failed ownership check.
+                return EvaluateLinearSrt(*linear,runtime,results,flat,active_sources);
+            };
+            const bool ok = run();
+            static const bool verify = std::getenv("KYTY_SRT_LINEAR_VERIFY") != nullptr;
+            if (verify && linear->add_carry)
+                VerifyLinearSrt(program, sources, runtime, clean_flat_slots, ok, results, flat, active_sources);
+            return ok;
         }
     }
 	const auto& linear = program.linear_srt;

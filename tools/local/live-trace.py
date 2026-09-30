@@ -8,6 +8,8 @@
     live-trace.py gpu TRACE INDEX [--span MS]    GPU command buffers of one frame: when they ran,
                                                  when the render thread submitted them, from which
                                                  guest queue slice
+    live-trace.py sites TRACE [--range A:B]      guest instructions that fault on tracked pages
+                                                 (reads: the readback wait that follows each one)
     live-trace.py marks TRACE [--top N]          GPU time per shader from a `tracem` capture (a GPU
                                                  timestamp after every draw, dispatch and native XPR
                                                  run), all frames and the part after each flip
@@ -17,7 +19,10 @@ Memory stays bounded: ranges are matched with sorted intervals, never expanded p
 """
 import argparse
 import collections
-import resource
+try:
+    import resource
+except ImportError:  # Windows
+    resource = None
 import statistics
 import struct
 from pathlib import Path
@@ -25,6 +30,7 @@ from pathlib import Path
 SUBMIT, GUEST_DONE, EQUEUE_WAIT, FLIP_SUBMIT, FLIP_COMPLETE, FRONT_SUSPEND = 1, 2, 7, 8, 9, 10
 GPU_SUBMIT, GPU_DONE, GUEST_READBACK, RENDER_IDLE, READBACK_TICKS = 11, 12, 13, 14, 19
 TICK_DONE, RENDER_SLICE, GPU_SPAN, GPU_SPAN_NS, GPU_WRITE, SYNC_READBACK = 20, 21, 22, 23, 26, 28
+FAULT_SITE, FAULT_CALLER = 32, 33
 
 
 class Trace:
@@ -193,8 +199,12 @@ def cmd_producers(t, args):
 def cmd_gpu(t, args):
     lo = t.flips[args.index]
     hi = lo + args.span
-    submitted, queue = {}, None
+    submitted, replayed, queue = {}, {}, None
     for tsc, tid, kind, a, b in t.records:
+        # The recording worker's replay (b == 1) is when the command buffer reached the queue,
+        # after the upload copies it reads (KYTY_DEFERRED_SUBMIT).
+        if kind == GPU_SUBMIT and b == 1:
+            replayed[a] = t.ms(tsc)
         if tid != t.render:
             continue
         if kind == RENDER_SLICE:
@@ -208,13 +218,23 @@ def cmd_gpu(t, args):
         at, q = submitted.get(tick, (None, None))
         busy_by_queue[q] += min(e, hi) - max(s, lo)
         if e - s >= args.min:
+            queued = replayed.get(tick)
             print(f'GPU {s - lo:7.2f}-{e - lo:7.2f} ({e - s:5.2f} ms) tick {tick} from {q} submitted '
-                  f'{"?" if at is None else f"{at - lo:.2f}"}')
+                  f'{"?" if at is None else f"{at - lo:.2f}"} queued {"?" if queued is None else f"{queued - lo:.2f}"}')
     print('busy by submitting slice:', {k: round(v, 2) for k, v in busy_by_queue.most_common()})
 
 
+# Tags of kind-4 marks: emulator-side Vulkan commands (MARK_IDS in generate-vulkan-recording.py).
+VULKAN_MARKS = {1: 'Dispatch', 2: 'DispatchIndirect', 3: 'DispatchBase', 10: 'CopyBuffer', 11: 'CopyBuffer2',
+                12: 'CopyImage', 13: 'CopyImage2', 14: 'CopyBufferToImage', 15: 'CopyBufferToImage2',
+                16: 'CopyImageToBuffer', 17: 'CopyImageToBuffer2', 20: 'FillBuffer', 21: 'UpdateBuffer',
+                30: 'ClearColorImage', 31: 'ClearDepthStencilImage', 32: 'ClearAttachments', 40: 'BlitImage',
+                41: 'BlitImage2', 42: 'ResolveImage', 43: 'ResolveImage2', 50: 'PipelineBarrier',
+                51: 'PipelineBarrier2'}
+
+
 def cmd_marks(t, args):
-    kinds = {1: 'draw', 2: 'dispatch', 3: 'native'}
+    kinds = {1: 'draw', 2: 'dispatch', 3: 'native', 4: 'vk'}
     recorded = {}
     for tsc, tid, kind, a, b in t.records:
         if kind == 24:
@@ -251,14 +271,65 @@ def cmd_marks(t, args):
                 after_flip[key] += cost
     print(f'{frames} frames; GPU ms per frame by shader (whole frame | first {args.after} ms after each flip)')
     for key, value in total.most_common(args.top):
-        print(f'  {key[0]:8s} {key[1]:#014x}  {value / frames:6.3f} | {after_flip[key] / frames:6.3f}  '
+        name = VULKAN_MARKS.get(key[1], str(key[1])) if key[0] == 'vk' else f'{key[1]:#014x}'
+        print(f'  {key[0]:8s} {name:>14s}  {value / frames:6.3f} | {after_flip[key] / frames:6.3f}  '
               f'({count[key] / frames:.1f}/frame)')
     print(f'  all marks: {sum(total.values()) / frames:.2f} | {sum(after_flip.values()) / frames:.2f}')
+    busy = sum(e - s for s, e, tick in t.gpu) / frames
+    print(f'  GPU busy (command buffer spans): {busy:.2f} ms/frame; by kind:')
+    for kind in sorted(set(k for k, _ in total)):
+        print(f'    {kind:8s} {sum(v for (k, _), v in total.items() if k == kind) / frames:6.2f} | '
+              f'{sum(v for (k, _), v in after_flip.items() if k == kind) / frames:6.2f}')
+
+
+def cmd_sites(t, args):
+    lo, hi = (float(v) * 1000.0 for v in args.range.split(':')) if args.range else (float('-inf'), float('inf'))
+    # Per thread: the readback waits in time order, to charge each read fault its wait.
+    waits = collections.defaultdict(list)
+    for begin, end, tid, address in t.readback_waits:
+        waits[tid].append((begin, end))
+    for items in waits.values():
+        items.sort()
+    import bisect
+    reads = collections.Counter()
+    read_ms = collections.Counter()
+    writes = collections.Counter()
+    example = {}
+    for tsc, tid, kind, a, b in t.records:
+        if kind != FAULT_SITE:
+            continue
+        ms = t.ms(tsc)
+        if not lo <= ms <= hi:
+            continue
+        address = b & ((1 << 63) - 1)
+        if b >> 63:
+            writes[a] += 1
+            continue
+        reads[a] += 1
+        example.setdefault(a, address)
+        items = waits.get(tid, [])
+        at = bisect.bisect_left(items, (ms, -1.0))
+        if at < len(items) and items[at][0] - ms < 1.0:
+            read_ms[a] += items[at][1] - items[at][0]
+    print(f'read-fault sites: {sum(reads.values())} faults, {sum(read_ms.values()):.1f} ms of readback waits')
+    for site, n in sorted(reads.items(), key=lambda item: -read_ms[item[0]])[:args.top]:
+        print(f'  {site:#014x}  {n:6d} faults  {read_ms[site]:8.2f} ms  e.g. {example[site]:#x}')
+    print(f'write-fault sites: {sum(writes.values())} faults')
+    for site, n in writes.most_common(args.top):
+        print(f'  {site:#014x}  {n:6d} faults')
+    # Host code faults (FaultCaller): the qword at the stack top, the caller of a leaf copy routine.
+    callers = collections.Counter((b, a) for tsc, tid, kind, a, b in t.records
+                                  if kind == FAULT_CALLER and lo <= t.ms(tsc) <= hi)
+    if callers:
+        print(f'host fault sites by stack-top caller: {sum(callers.values())} faults')
+        for (site, caller), n in callers.most_common(args.top):
+            print(f'  {site:#014x} <- {caller:#014x}  {n:6d}')
 
 
 def main():
     # A runaway report must never take the machine down with the game running.
-    resource.setrlimit(resource.RLIMIT_AS, (16 << 30, 16 << 30))
+    if resource is not None:
+        resource.setrlimit(resource.RLIMIT_AS, (16 << 30, 16 << 30))
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--hz', type=float, default=3187145000.0)
     sub = parser.add_subparsers(dest='action', required=True)
@@ -282,6 +353,11 @@ def main():
     p.add_argument('--top', type=int, default=30)
     p.add_argument('--after', type=float, default=7.0)
     p.set_defaults(func=cmd_marks)
+    p = sub.add_parser('sites')
+    p.add_argument('trace')
+    p.add_argument('--range', default='')
+    p.add_argument('--top', type=int, default=25)
+    p.set_defaults(func=cmd_sites)
     p = sub.add_parser('producers')
     p.add_argument('trace')
     p.add_argument('--frames', default='5:7')

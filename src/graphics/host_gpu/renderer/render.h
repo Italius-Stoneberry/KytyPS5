@@ -271,7 +271,7 @@ private:
 		const NativeXprDrawState* state  = nullptr;
 	} m_native_xpr_verify; // mode 2: the next prepared draw is compared with this record
 	void NativeXprVerify(CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering,
-	                     std::span<PreparedBindings* const> stages);
+	                     std::span<PreparedBindings* const> stages, const DrawEmitInfo& emit);
 	NativeXprCache& NativeXprState();
 	void NativeXprRequestStore();
 	void NativeXprKey(CommandBuffer& buffer, std::vector<uint32_t>& key) const;
@@ -295,7 +295,8 @@ private:
 	void NativeXprLearn(const NativeXprRecord& stale, NativeXprRecord& fresh);
 	void NativeXprStore(CommandBuffer& buffer, const DrawRenderState& state,
 	                    vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                    const RenderState& rendering, std::span<PreparedBindings* const> stages);
+	                    const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	                    const DrawEmitInfo& emit);
 	[[nodiscard]] bool NativeXprValidate(NativeXprRecord& record, uint64_t frame);
 	[[nodiscard]] bool NativeXprReevaluate(NativeXprRecord& record);
 	[[nodiscard]] bool NativeXprValidateResources(NativeXprRecord& record, uint64_t frame, bool mapping_moved);
@@ -303,17 +304,27 @@ private:
 	[[nodiscard]] bool NativeXprGather(NativeXprRecord& record);
 	enum class NativeXprPatch { Done, Evaluate, Invalid };
 	[[nodiscard]] NativeXprPatch NativeXprPatchDescriptors(NativeXprRecord& record);
+	struct NativeXprDirect; // one direct draw (public NativeXprDirectDraw) with its record's offsets
 	[[nodiscard]] bool NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& record,
 	                                 const NativeXprDrawState& draw_state,
 	                                 const PipelineCache::Pipeline& pipeline,
 	                                 std::span<const uint64_t> commands, uint64_t index_base,
-	                                 uint64_t index_bytes, vk::IndexType index_type, bool keep_clears);
+	                                 uint64_t index_bytes, vk::IndexType index_type, bool keep_clears,
+	                                 const NativeXprDirect* direct = nullptr);
 	[[nodiscard]] bool NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArgs& args);
 
 public:
 	// Runtime entry points for the command processor (kyty_local_native_xpr_mode).
+	// A direct indexed draw (DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2): its indices, count and instances.
+	struct NativeXprDirectDraw {
+		uint64_t index_address  = 0;
+		uint32_t index_count    = 0;
+		uint32_t instance_count = 1;
+	};
+	// `direct`: that draw instead of the DRAW_INDEX_INDIRECT run `commands`.
 	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, bool clean, std::span<const uint64_t> commands,
-	                                uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type);
+	                                uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
+	                                const NativeXprDirectDraw* direct = nullptr);
 	// After a refused NativeXprTry: the normal path stores. Returns the log the
 	// caller's ShaderReadObserver fills with the SRT evaluation's reads.
 	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>>* NativeXprReadLog();

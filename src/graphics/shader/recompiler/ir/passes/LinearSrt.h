@@ -42,6 +42,8 @@ struct LinearSrtPlan {
 	std::vector<uint8_t>                              active_sources;
 	std::vector<std::shared_ptr<const LinearSrtPlan>> control_variants;
 	uint32_t                                          active_count = 0;
+	// Uses the add-with-carry lowering (KYTY_SRT_LINEAR_VERIFY compares it with the interpreter).
+	bool                                              add_carry = false;
 	// The generated register convention is explicit on every host, including
 	// Windows. C++ helpers bridge to the host ABI of reader callbacks.
 	using Function    = KYTY_SYSV_ABI bool (*)(const SrtRuntime*, uint64_t*);
@@ -263,8 +265,22 @@ class LinearSrtCompiler {
 			default: return false;
 		}
 	}
+public:
+	// Why Build failed (the first rejected construct), for diagnostics.
+	const char* failure   = nullptr;
+	ValueOpcode failed_op = ValueOpcode::Void;
+
+private:
+	uint32_t Fail(const char* why, ValueOpcode op = ValueOpcode::Void) {
+		if (failure == nullptr) {
+			failure   = why;
+			failed_op = op;
+		}
+		return Invalid;
+	}
+
 	uint32_t Add(Value value, bool clean, unsigned depth = 0) {
-		if (depth > 64 || result.nodes.size() >= 8192) return Invalid;
+		if (depth > 64 || result.nodes.size() >= 8192) return Fail("size");
 		Node node;
 		node.clean       = clean;
 		const Inst* inst = nullptr;
@@ -276,14 +292,14 @@ class LinearSrtCompiler {
 				case Type::U32: node.immediate = value.U32(); break;
 				case Type::U64: node.immediate = value.U64(); break;
 				case Type::F32: node.immediate = std::bit_cast<uint32_t>(value.F32Value()); break;
-				default: return Invalid;
+				default: return Fail("immediate type");
 			}
 		} else {
 			inst = value.TryInstruction();
-			if (!inst) return Invalid;
+			if (!inst) return Fail("not an instruction");
 			const auto key = std::pair {inst, clean};
 			if (auto found = known.find(key); found != known.end()) return found->second;
-			if (!visiting.insert(key).second) return Invalid;
+			if (!visiting.insert(key).second) return Fail("cycle");
 			struct Pop {
 				decltype(visiting)& set;
 				decltype(key)       key_value;
@@ -301,7 +317,7 @@ class LinearSrtCompiler {
 				case ValueOpcode::BitCastF32U32: return alias(arg(0));
 				case ValueOpcode::GetUserData: {
 					const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
-					if (reg < source.user_data_base) return Invalid;
+					if (reg < source.user_data_base) return Fail("user data below base");
 					node.kind      = Kind::User;
 					node.immediate = reg - source.user_data_base;
 					break;
@@ -311,7 +327,7 @@ class LinearSrtCompiler {
 					const auto slot = inst->Arg(1).Resolve();
 					if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
 					    slot.U32() >= source.srt_reads.size())
-						return Invalid;
+						return Fail("dynamic const slot");
 					const bool use_clean = clean || (slot.U32() < result.clean_slots.size() &&
 					                                 result.clean_slots[slot.U32()]);
 					return alias(Add(source.srt_reads[slot.U32()].value, use_clean, depth + 1));
@@ -320,16 +336,44 @@ class LinearSrtCompiler {
 					const auto  component = inst->Arg(1).Resolve();
 					const auto* packed    = inst->Arg(0).ResolveInstruction();
 					if (!packed || !component.IsImmediate() || component.GetType() != Type::U32 ||
-					    component.U32() >= 2 ||
-					    packed->GetOpcode() != ValueOpcode::CompositeConstructU32x2)
-						return Invalid;
-					return alias(Add(packed->Arg(component.U32()), clean, depth + 1));
+					    component.U32() >= 2)
+						return Fail("composite extract u32x2", packed ? packed->GetOpcode() : ValueOpcode::Void);
+					if (packed->GetOpcode() == ValueOpcode::CompositeConstructU32x2)
+						return alias(Add(packed->Arg(component.U32()), clean, depth + 1));
+					if (packed->GetOpcode() == ValueOpcode::IAddCarry32) {
+						// 64-bit address arithmetic (s_add_u32 + s_addc_u32). As the interpreter
+						// evaluates it: word 0 is the 32-bit sum of both operands, word 1 its carry,
+						// which is the sum being below an operand. Operands in their original order.
+						const auto lhs = Add(packed->Arg(0), clean, depth + 1);
+						const auto rhs = Add(packed->Arg(1), clean, depth + 1);
+						if (lhs == Invalid || rhs == Invalid) return Invalid;
+						result.add_carry = true;
+						Node sum;
+						sum.kind    = Kind::Binary;
+						sum.op      = ValueOpcode::IAdd32;
+						sum.clean   = clean;
+						sum.args[0] = lhs;
+						sum.args[1] = rhs;
+						const uint32_t sum_index = result.nodes.size();
+						result.nodes.push_back(sum);
+						if (component.U32() == 0) return alias(sum_index);
+						Node carry;
+						carry.kind    = Kind::Binary;
+						carry.op      = ValueOpcode::ULessThan32;
+						carry.clean   = clean;
+						carry.args[0] = sum_index;
+						carry.args[1] = lhs;
+						const uint32_t carry_index = result.nodes.size();
+						result.nodes.push_back(carry);
+						return alias(carry_index);
+					}
+					return Fail("composite extract u32x2", packed->GetOpcode());
 				}
 				case ValueOpcode::CompositeExtractU64: {
 					const auto component = inst->Arg(1).Resolve();
 					if (!component.IsImmediate() || component.GetType() != Type::U32 ||
 					    component.U32() >= 2)
-						return Invalid;
+						return Fail("composite extract u64");
 					node.kind      = Kind::Unary;
 					node.immediate = component.U32();
 					node.args[0]   = arg(0);
@@ -340,7 +384,7 @@ class LinearSrtCompiler {
                     const auto width = inst->Arg(2).Resolve();
                     if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
                         !width.IsImmediate() || width.GetType() != Type::U32 ||
-                        offset.U32() > 32 || width.U32() > 32 - offset.U32()) return Invalid;
+                        offset.U32() > 32 || width.U32() > 32 - offset.U32()) return Fail("bitfield");
                     const auto input = arg(0);
                     if (input == Invalid) return Invalid;
                     const auto mask = width.U32() == 32 ? UINT32_MAX :
@@ -382,7 +426,7 @@ class LinearSrtCompiler {
 					    handle->NumArgs() != (buffer ? 4u : 2u) ||
 					    source.memory_info[memory].kind !=
 					        (buffer ? ResourceKind::ScalarBuffer : ResourceKind::ScalarAddress))
-						return Invalid;
+						return Fail("memory handle", node.op);
 					node.kind      = Kind::Read;
 					node.immediate = source.memory_info[memory].offset;
 					node.args[0]   = Add(handle->Arg(0), clean, depth + 1);
@@ -394,7 +438,7 @@ class LinearSrtCompiler {
 					break;
 				}
 				default:
-					if (!Binary(node.op)) return Invalid;
+					if (!Binary(node.op)) return Fail("opcode", node.op);
 					node.kind    = Kind::Binary;
 					node.args[0] = arg(0);
 					node.args[1] = arg(1);
@@ -413,18 +457,18 @@ public:
 	                  std::span<const uint8_t> active = {})
 	    : source(input), result(output), active_sources(active) {}
 	bool Build() {
-		if (!source.srt_plan_complete || (!source.control_flow.empty() && active_sources.empty()))
-			return false;
+		if (!source.srt_plan_complete) return Fail("incomplete plan"), false;
+		if (!source.control_flow.empty() && active_sources.empty()) return Fail("control flow"), false;
 		if (!active_sources.empty() && active_sources.size() != source.descriptor_sources.size())
-			return false;
+			return Fail("active sources"), false;
 		result.active_sources.assign(active_sources.begin(), active_sources.end());
 		result.sources      = source.materialization_sources;
 		result.clean_slots  = source.clean_flat_slots;
 		result.active_count = source.descriptor_sources.size();
 		for (const auto source_index: result.sources) {
-			if (source_index >= source.descriptor_sources.size()) return false;
+			if (source_index >= source.descriptor_sources.size()) return Fail("source index"), false;
 			const auto& descriptor = source.descriptor_sources[source_index];
-			if (descriptor.dword_count > descriptor.dwords.size()) return false;
+			if (descriptor.dword_count > descriptor.dwords.size()) return Fail("descriptor size"), false;
 			result.descriptor_sizes.push_back(descriptor.dword_count);
 			for (uint32_t i = 0; i < descriptor.dword_count; ++i) {
 				if (!active_sources.empty() && !active_sources[source_index]) {
@@ -438,14 +482,15 @@ public:
 		}
 		result.flat_words.assign(source.srt_reads.size(), Invalid);
 		for (const auto& read: source.srt_reads) {
-			if (read.flat_offset >= result.flat_words.size()) return false;
+			if (read.flat_offset >= result.flat_words.size()) return Fail("flat offset"), false;
 			const auto index = Add(read.value, read.flat_offset < result.clean_slots.size() &&
 			                                       result.clean_slots[read.flat_offset]);
 			if (index == Invalid) return false;
 			result.flat_words[read.flat_offset] = index;
 		}
-		if (result.nodes.empty() && active_sources.empty()) return false;
-		return Generate(true);
+		if (result.nodes.empty() && active_sources.empty()) return Fail("empty"), false;
+		if (!Generate(true)) return Fail("code generation"), false;
+		return true;
 	}
     bool BuildPredicate(Value condition) {
         const auto value = Add(condition, true);
