@@ -7,11 +7,9 @@ rem is used when _Build\pgo\windows\kyty.profdata exists (see tools\local\PGO.md
 rem   KYTY_BUILD_DIR    build directory (default _Build\windows)
 rem   KYTY_CMAKE_ARGS   extra arguments for the first configure (e.g. -DKYTY_PGO_GENERATE=ON)
 setlocal
-rem On this machine the compiler crashes at random when it runs on CPUs 4/5 (the Linux
-rem launch configs leave them out as well): rerun the whole build without them.
-rem Set KYTY_BUILD_AFFINITY=FFFFFF to use every CPU.
-if not defined KYTY_BUILD_AFFINITY set "KYTY_BUILD_AFFINITY=FFFFCF"
-if not defined KYTY_BUILD_PINNED (
+rem KYTY_BUILD_AFFINITY=<hex mask>: the whole build on those CPUs only (a machine whose compiler
+rem crashes at random on some cores; this one's two unstable cores are disabled in the BIOS).
+if defined KYTY_BUILD_AFFINITY if not defined KYTY_BUILD_PINNED (
 	set "KYTY_BUILD_PINNED=1"
 	start "" /wait /b /affinity %KYTY_BUILD_AFFINITY% cmd /c "%~f0" %*
 	exit /b

@@ -50,8 +50,9 @@ python3 tools/local/play-demons-souls.py --2k  # 带运行日志的同一正式�
 
 - 依赖：VS 2022（C++ 工作负载）、LLVM 19.1.7（`winget install LLVM.LLVM --version 19.1.7`）、Vulkan SDK（glslangValidator）。
   LLVM 23.1.2 编译 `agc.cpp` 时编译器自身崩溃，不要用。
-- 构建与运行都排除 CPU 4、5（亲和性 `0xFFFFCF`，来自配置的 `cpu_affinity`）：在这两个核上 clang 会随机崩溃，与 Linux 配置一致。
-- 渲染线程限定在 P 核 1,2,3,6,7（配置的 `KYTY_RECORDING_CPUS`，非独占）：比自由调度快约 2.5%。**不要像 Linux 那样独占 CPU 0**：
+- 原 CPU 4、5 两个 P 核不稳定（clang 随机崩溃、系统蓝屏 0x20001），09-30 起在 BIOS 里禁用：现为 6 P 核（0–5）+ 16 E 核（6–21），
+  构建与运行不再需要亲和性掩码（`build-windows.cmd` 只在设了 `KYTY_BUILD_AFFINITY` 时才绑核）。
+- 渲染线程限定在 P 核 1–5（配置的 `KYTY_RECORDING_CPUS`，非独占）：比自由调度快约 2.5%。**不要像 Linux 那样独占 CPU 0**：
   Windows 的中断/DPC 集中在 CPU 0，帧率直接减半；用 CPU Set 把其他线程赶出某个 P 核也会大幅变慢。
 - 给其他电脑：`.\package-windows.ps1` 在 `_Build\windows-portable` 编 x86-64-v3 版（`-DKYTY_MARCH=x86-64-v3`；
   `-march=native` 会用到本机的 GFNI，别的 CPU 上直接非法指令），再装配 `_Build\portable\KytyPS5`（约 135 MB）：

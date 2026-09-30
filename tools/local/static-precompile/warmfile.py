@@ -16,37 +16,6 @@ from pathlib import Path
 
 import numpy as np
 
-# This machine's i9-14900K is unstable on logical CPUs 4/5 (random 0xC0000005 in any process, see the project
-# memory note).  Pin this process to the mask the project's own scripts use (0xFFFFCF) before doing real work.
-try:
-    import ctypes
-    from ctypes import wintypes
-    if hasattr(ctypes, 'WinDLL'):
-        _k32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        _k32.GetCurrentProcess.restype = wintypes.HANDLE
-        _k32.GetCurrentThread.restype = wintypes.HANDLE
-        _k32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
-        _k32.SetProcessAffinityMask.restype = wintypes.BOOL
-        _k32.SetThreadAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
-        _k32.SetThreadAffinityMask.restype = ctypes.c_size_t
-        _k32.GetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t),
-                                                ctypes.POINTER(ctypes.c_size_t)]
-        _k32.GetProcessAffinityMask.restype = wintypes.BOOL
-        _k32.SetProcessAffinityMask(_k32.GetCurrentProcess(), 0xFFFFCF)
-        _k32.SetThreadAffinityMask(_k32.GetCurrentThread(), 0xFFFFCF)
-except Exception:          # never let pinning break the analysis
-    pass
-
-
-def affinity_mask() -> int:
-    """Current process affinity mask (diagnostics)."""
-    try:
-        pm, sm = ctypes.c_size_t(), ctypes.c_size_t()
-        _k32.GetProcessAffinityMask(_k32.GetCurrentProcess(), ctypes.byref(pm), ctypes.byref(sm))
-        return pm.value
-    except Exception:
-        return -1
-
 REPO = Path(r'C:\Users\chenxiao\Documents\KytyPS5-pr500')
 CACHE_ROOT = REPO / '_PipelineCache' / 'warmup-v2'
 OUT = REPO / '_Build' / 're' / 'agent-warm'
