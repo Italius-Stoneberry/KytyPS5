@@ -505,6 +505,35 @@ public:
 		return clamped_size;
 	}
 
+	// The committed parts of [virtual_addr, virtual_addr + size) as (address, size), in order,
+	// adjacent ones merged.
+	void CommittedParts(uint64_t virtual_addr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* out) {
+		out->clear();
+		if (size == 0 || size > UINT64_MAX - virtual_addr) {
+			return;
+		}
+		const auto        end = virtual_addr + size;
+		Common::LockGuard lock(m_mutex);
+		auto              range = std::upper_bound(m_ranges.begin(), m_ranges.end(), virtual_addr,
+		                                           [](uint64_t value, const Range& r) { return value < r.start; });
+		if (range != m_ranges.begin()) {
+			--range;
+		}
+		for (; range != m_ranges.end() && range->start < end; ++range) {
+			const auto range_end = End(range->start, range->size);
+			if (range_end <= virtual_addr || !IsCommittedRangeType(range->type)) {
+				continue;
+			}
+			const auto begin  = std::max(range->start, virtual_addr);
+			const auto finish = std::min(range_end, end);
+			if (!out->empty() && out->back().first + out->back().second == begin) {
+				out->back().second += finish - begin;
+			} else {
+				out->emplace_back(begin, finish - begin);
+			}
+		}
+	}
+
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
 
@@ -1052,6 +1081,18 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 		     vaddr, size, clamped_size);
 	}
 	return clamped_size;
+}
+
+bool IsFullyMapped(uint64_t vaddr, uint64_t size) {
+	return g_virtual_ranges == nullptr || g_virtual_ranges->ClampRangeSize(vaddr, size) == size;
+}
+
+void MappedParts(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* parts) {
+	if (g_virtual_ranges == nullptr) {
+		parts->assign(1, {vaddr, size});
+		return;
+	}
+	g_virtual_ranges->CommittedParts(vaddr, size, parts);
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {

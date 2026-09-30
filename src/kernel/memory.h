@@ -138,6 +138,10 @@ bool                   RestoreGuestWritable(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size,
                                          const char** failure_reason = nullptr);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Whether guest mappings cover all of [vaddr, vaddr + size), and the parts they cover (as
+// (address, size), in order): what can be read of a range that reaches into unmapped memory.
+[[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);
+void                   MappedParts(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* parts);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // Prepare a host write using normal coherent invalidation; false means use guest faults.

@@ -1268,6 +1268,26 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		// ObtainBuffer still records the exact write range and invalidates its epoch.
 		return false;
 	}
+	// Only mapped guest memory is read. Pages the guest unmapped stay CPU-dirty (UnmapMemory
+	// invalidates them) until memory is mapped there again, and an image's range can reach into
+	// them: a texture of a streamed pool whose layers the game released while respawning. The
+	// guest mappings tell (a PRT aperture is mapped for the GPU as a whole, its pages one by one);
+	// not GpuResourceManager's ranges, whose lock PrepareBdaReadRanges holds around this.
+	if (LibKernel::Memory::IsFullyMapped(vaddr, size)) {
+		UploadDirtyRanges(buffer, vaddr, size, is_written);
+	} else {
+		std::vector<std::pair<uint64_t, uint64_t>> parts;
+		LibKernel::Memory::MappedParts(vaddr, size, &parts);
+		for (const auto& [address, bytes]: parts) UploadDirtyRanges(buffer, address, bytes, is_written);
+	}
+	if (is_texel_buffer && !is_written) {
+		return SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
+	return false;
+}
+
+// The CPU-dirty pages of a mapped range copied into the buffer (the written ones then GPU-owned).
+void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -1308,10 +1328,6 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
-	if (is_texel_buffer && !is_written) {
-		return SynchronizeBufferFromImage(buffer, vaddr, size);
-	}
-	return false;
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
