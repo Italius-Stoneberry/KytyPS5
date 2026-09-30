@@ -45,8 +45,8 @@ void NoteDeferredSubmitQueued();
 void NoteDeferredSubmitDone();
 void WaitDeferredSubmits();
 uint64_t StateEpoch();
-// Recorded commands that do GPU work or synchronize (draws, dispatches, copies, clears,
-// rendering scopes, barriers): unchanged between two barriers = no work in between.
+// Commands the calling thread recorded that do GPU work or synchronize (draws, dispatches,
+// copies, clears, rendering scopes, barriers): unchanged between two barriers = no work in between.
 uint64_t WorkCalls();
 class ProducerScope {
 public:

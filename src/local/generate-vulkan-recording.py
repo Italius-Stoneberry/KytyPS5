@@ -122,7 +122,7 @@ def generate(registry, header):
         declarations.append(f'static VKAPI_ATTR {ret} VKAPI_CALL Wrapped_{name}({", ".join(decl(p) for p in params)}) {{')
         # Commands that do GPU work or synchronize: unchanged between two barriers = none in between.
         if re.match(r'vkCmd(Draw|Dispatch|Copy|Fill|Clear|Blit|Resolve|UpdateBuffer|BeginRendering|PipelineBarrier|WriteTimestamp|ExecuteCommands)', name):
-            declarations.append('    g_work_calls.fetch_add(1, std::memory_order_relaxed);')
+            declarations.append('    ++g_work_calls;')
         if ok:
             deferred.append(name)
             declarations.append('    if (auto* stream = pAllocator == nullptr ? RecordingStream() : nullptr) {'
