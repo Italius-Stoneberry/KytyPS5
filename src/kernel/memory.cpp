@@ -1026,8 +1026,8 @@ bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t si
 }
 
 bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean) {
-	if (!data || size < 8 || size > 64 || size % 4 != 0 || !g_gpu_resources || !Graphics::GuestGpu::IsGpuThread() ||
-	    !IsGpuAddressRange(vaddr, size))
+	if (!data || size < 8 || size > (clean ? 4096u : 64u) || size % 4 != 0 || !g_gpu_resources ||
+	    !Graphics::GuestGpu::IsGpuThread() || !IsGpuAddressRange(vaddr, size))
 		return false;
 	if (!clean && !g_gpu_resources->HasReadWatchers(vaddr, size)) {
 		// 8..64 bytes of whole words: fixed-size moves inline, a variable-size memcpy is a CRT call

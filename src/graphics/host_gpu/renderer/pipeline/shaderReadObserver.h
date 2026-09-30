@@ -61,8 +61,9 @@ public:
 		static bool ReadSpan(void* userdata, uint64_t address, uint32_t* values, uint32_t count,
 		                     bool clean) {
 			auto& self = *static_cast<Runtime*>(userdata);
-			if (!self.m_original.try_read_memory_span(self.m_original.userdata, address, values,
-			                                          count, clean))
+			// Observed spans stay SRT-group sized: a native record keeps every observed word.
+			if (count > 16 || !self.m_original.try_read_memory_span(self.m_original.userdata, address,
+			                                                        values, count, clean))
 				return false;
 			self.Observe(address, uint64_t(count) * 4);
 			return true;

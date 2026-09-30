@@ -1392,6 +1392,17 @@ static bool LinearMaskMatches(std::span<const uint8_t> a,std::span<const uint8_t
     return true;
 }
 
+// Whether the linear plan evaluates these sources under this clean mask. The plan copies its
+// program's materialization sources and clean slots (BuildLinearSrtPlan), which never change
+// afterwards: the program's own vectors, what every materialization passes, match without a scan.
+static bool LinearInputsMatch(const ResourcePlan& program,const LinearSrtPlan& plan,
+                              std::span<const uint32_t> sources,std::span<const uint8_t> clean) {
+    if(sources.data()==program.materialization_sources.data() && sources.size()==program.materialization_sources.size() &&
+        clean.data()==program.clean_flat_slots.data() && clean.size()==program.clean_flat_slots.size())
+        return true;
+    return std::ranges::equal(sources,plan.sources) && LinearMaskMatches(clean,plan.clean_slots);
+}
+
 static bool EvaluateLinearSrtOriginal(const LinearSrtPlan& plan,const SrtRuntime& runtime,
                              std::vector<DescriptorValue>& results,std::vector<uint32_t>& flat,
                              std::vector<uint8_t>& active_sources) {
@@ -1539,7 +1550,9 @@ struct TraceReadLog {
 	}
 	static bool Span(void* self, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
 		auto& log = *static_cast<TraceReadLog*>(self);
-		if (!log.inner->try_read_memory_span(log.inner->userdata, address, values, count, clean)) return false;
+		// Logged spans stay SRT-group sized, as every logged word is kept.
+		if (count > 16 || !log.inner->try_read_memory_span(log.inner->userdata, address, values, count, clean))
+			return false;
 		for (uint32_t i = 0; i < count; ++i)
 			log.out->push_back({address + 4ull * i, values[i], clean, SrtReadTrace::Predicate});
 		return true;
@@ -1559,8 +1572,7 @@ bool TraceLinearSrtReads(const ResourcePlan& program, const SrtRuntime& runtime,
 	trace.feeds.clear();
 	trace.flat_feeds.clear();
 	if (plan == nullptr || !program.srt_plan_complete ||
-	    !std::ranges::equal(program.materialization_sources, plan->sources) ||
-	    !LinearMaskMatches(program.clean_flat_slots, plan->clean_slots))
+	    !LinearInputsMatch(program, *plan, program.materialization_sources, program.clean_flat_slots))
 		return false;
 	if (plan->control_variants.empty()) return TraceLinearPlan(program, *plan, runtime, trace);
 	// The leaf EvaluateRuntimeSources would select, from logged predicate reads.
@@ -1694,7 +1706,7 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
                             std::vector<uint8_t>& active_sources) {
     {
         const auto& linear=program.linear_srt;
-        if(linear && std::ranges::equal(sources,linear->sources) && LinearMaskMatches(clean_flat_slots,linear->clean_slots)) {
+        if(linear && LinearInputsMatch(program,*linear,sources,clean_flat_slots)) {
             if(!program.srt_plan_complete || (runtime.read_specialization_memory==nullptr &&
                 std::ranges::any_of(clean_flat_slots,[](uint8_t v){return v!=0;})))return false;
             const auto run = [&] {

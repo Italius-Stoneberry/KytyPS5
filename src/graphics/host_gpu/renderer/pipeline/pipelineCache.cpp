@@ -158,7 +158,8 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 }
 
 bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
-	return count >= 2 && count <= 16 &&
+	// Clean spans also read whole tables (resource materialization); raw spans are SRT groups.
+	return count >= 2 && count <= (clean ? 1024u : 16u) &&
 	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
 }
 

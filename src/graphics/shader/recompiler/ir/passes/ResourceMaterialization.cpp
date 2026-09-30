@@ -265,6 +265,25 @@ bool ReadSpecializationWord(const SrtRuntime& runtime, uint64_t address, uint32_
 	       runtime.read_specialization_memory(runtime.userdata, address, &word);
 }
 
+// The eight words of a table descriptor at `address`, as eight ReadSpecializationWord calls read
+// them: one clean span read (refused unless every word is readable), else those calls, which
+// also fail where they did. Tables hold hundreds of descriptors, each word checked on its own.
+bool ReadSpecializationDescriptor(const SrtRuntime& runtime, uint64_t address,
+                                  std::array<uint32_t, 8>& words) {
+	constexpr uint64_t last = (8u - 1u) * sizeof(uint32_t);
+	if (runtime.try_read_memory_span != nullptr && address <= AddressMask - last &&
+	    runtime.try_read_memory_span(runtime.userdata, address, words.data(), 8u, true)) {
+		return true;
+	}
+	for (uint32_t dword = 0; dword < words.size(); dword++) {
+		const auto word_address = address + dword * sizeof(uint32_t);
+		if (word_address > AddressMask || !ReadSpecializationWord(runtime, word_address, words[dword])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void MakeRangeReadable(const SrtRuntime& runtime, uint64_t base, uint64_t size) {
 	if (runtime.sync_memory != nullptr && size != 0u && base <= AddressMask - size) {
 		runtime.sync_memory(runtime.userdata, base, size);
@@ -290,6 +309,86 @@ bool ReadScalarBufferWord(const ShaderBufferResource& descriptor, uint32_t dynam
 	}
 	return true;
 }
+
+// ReadScalarBufferWord for ascending offsets into one buffer (a material table's keys). The words
+// come from clean span reads of up to 4 KiB inside the buffer: when every word of a span is
+// readable they are the words the scalar reads return; the offsets a refused span covers keep
+// the scalar reads. One read per key checked GPU ownership thousands of times per table.
+class ScalarBufferWords {
+public:
+	ScalarBufferWords(const ShaderBufferResource& descriptor, uint32_t immediate_offset,
+	                  const SrtRuntime& runtime)
+	    : m_descriptor(descriptor), m_immediate(immediate_offset), m_runtime(runtime),
+	      m_base(descriptor.Base48() & ~uint64_t {3}), m_size(ScalarBufferSize(descriptor)) {}
+
+	bool Read(uint32_t dynamic_offset, uint32_t& word) {
+		const auto aligned = (static_cast<uint64_t>(dynamic_offset) + m_immediate) & ~uint64_t {3};
+		if ((aligned < m_begin || aligned >= m_end) && (aligned < m_refused || !Fill(aligned))) {
+			return ReadScalarBufferWord(m_descriptor, dynamic_offset, m_immediate, m_runtime, word);
+		}
+		word = m_words[(aligned - m_begin) / sizeof(uint32_t)];
+		return true;
+	}
+
+private:
+	bool Fill(uint64_t aligned) {
+		m_begin = m_end = 0;
+		// Whole words inside the buffer whose addresses ReadScalarBufferWord accepts.
+		const auto bytes =
+		    aligned > m_size || aligned > AddressMask - m_base
+		        ? 0
+		        : std::min({uint64_t {sizeof(m_words)}, (m_size - aligned) & ~uint64_t {3},
+		                    (AddressMask - m_base - aligned + sizeof(uint32_t)) & ~uint64_t {3}});
+		if (bytes < 2 * sizeof(uint32_t) || m_runtime.try_read_memory_span == nullptr ||
+		    !m_runtime.try_read_memory_span(m_runtime.userdata, m_base + aligned, m_words.data(),
+		                                    static_cast<uint32_t>(bytes / sizeof(uint32_t)), true)) {
+			m_refused = aligned + std::max<uint64_t>(bytes, sizeof(uint32_t));
+			return false;
+		}
+		m_begin = aligned;
+		m_end   = aligned + bytes;
+		return true;
+	}
+
+	const ShaderBufferResource& m_descriptor;
+	const uint32_t              m_immediate;
+	const SrtRuntime&           m_runtime;
+	const uint64_t              m_base, m_size;
+	uint64_t                    m_begin = 0, m_end = 0, m_refused = 0;
+	std::array<uint32_t, 1024>  m_words;
+};
+
+// Table keys in first-seen order, key 0 first: an open-addressing set with room for every probe
+// (0 marks a free slot, key 0 is always in). std::unordered_set hashed and allocated per probe.
+class KeyOrder {
+public:
+	explicit KeyOrder(uint64_t probes): m_mask(std::bit_ceil(2 * probes + 2) - 1), m_slots(m_mask + 1) {
+		m_keys.reserve(probes + 1);
+		m_keys.push_back(0u);
+	}
+
+	void Add(uint32_t key) {
+		if (key == 0u) {
+			return;
+		}
+		for (auto slot = (key * 0x9e3779b97f4a7c15ull >> 32u) & m_mask;; slot = (slot + 1u) & m_mask) {
+			if (m_slots[slot] == key) {
+				return;
+			}
+			if (m_slots[slot] == 0u) {
+				m_slots[slot] = key;
+				m_keys.push_back(key);
+				return;
+			}
+		}
+	}
+	std::vector<uint32_t> Take() { return std::move(m_keys); }
+
+private:
+	uint64_t                     m_mask;
+	std::vector<uint32_t>        m_slots;
+	std::vector<uint32_t>        m_keys;
+};
 
 bool FinishIndirectImage(const ImageResource& image, std::vector<DescriptorValue>& probed,
                          bool over_approximates, std::string enumeration, IndirectImage& next,
@@ -396,12 +495,8 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
 		candidate.dword_count = 8u;
 		const auto entry      = static_cast<uint64_t>(indirect.table_offset) +
 		                   (static_cast<uint64_t>(key) << DenseDescriptorShift);
-		for (uint32_t dword = 0; key < entries && dword < candidate.dword_count; dword++) {
-			const auto address = base + entry + dword * sizeof(uint32_t);
-			if (address > AddressMask ||
-			    !ReadSpecializationWord(runtime, address, candidate.dwords[dword])) {
-				return note("dense table entry is not readable");
-			}
+		if (key < entries && !ReadSpecializationDescriptor(runtime, base + entry, candidate.dwords)) {
+			return note("dense table entry is not readable");
 		}
 		if (key >= entries || NullImageDescriptor(candidate) ||
 		    !ValidImageDescriptor(candidate, image.r128) ||
@@ -445,8 +540,7 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 	const auto records = static_cast<uint64_t>(indirect.item_bound);
 	MakeRangeReadable(runtime, material_base + indirect.selector_offset,
 	                  (records - 1u) * indirect.selector_stride + sizeof(uint32_t));
-	std::vector<uint32_t>        keys {0u};
-	std::unordered_set<uint32_t> seen {0u};
+	KeyOrder keys(records);
 	for (uint64_t item = 0; item < records; item++) {
 		const auto address =
 		    material_base + indirect.selector_offset + item * indirect.selector_stride;
@@ -454,13 +548,11 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 		if (address > AddressMask || !ReadSpecializationWord(runtime, address, key)) {
 			return note("record key is not readable");
 		}
-		if (seen.insert(key).second) {
-			keys.push_back(key);
-		}
+		keys.Add(key);
 	}
 
 	IndirectImage next;
-	next.keys = std::move(keys);
+	next.keys = keys.Take();
 	std::vector<DescriptorValue> probed;
 	probed.reserve(next.keys.size());
 	for (const auto key: next.keys) {
@@ -471,10 +563,7 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 		bool readable = entry + candidate.dword_count * sizeof(uint32_t) <= AddressMask;
 		if (readable) {
 			MakeRangeReadable(runtime, entry, candidate.dword_count * sizeof(uint32_t));
-			for (uint32_t dword = 0; readable && dword < candidate.dword_count; dword++) {
-				readable = ReadSpecializationWord(runtime, entry + dword * sizeof(uint32_t),
-				                                  candidate.dwords[dword]);
-			}
+			readable = ReadSpecializationDescriptor(runtime, entry, candidate.dwords);
 		}
 		if (!readable || NullImageDescriptor(candidate) ||
 		    !ValidImageDescriptor(candidate, image.r128) || !ReservedImageBitsClear(candidate)) {
@@ -526,36 +615,40 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 
 	MakeRangeReadable(runtime, material.Base48() & ~uint64_t {3}, ScalarBufferSize(material));
 	MakeRangeReadable(runtime, heap.Base48() & ~uint64_t {3}, ScalarBufferSize(heap));
-	std::vector<uint32_t>        keys {0u};
-	std::unordered_set<uint32_t> seen {0u};
-	keys.reserve(static_cast<size_t>(probe_count) + 1u);
-	seen.reserve(static_cast<size_t>(probe_count) + 1u);
+	KeyOrder          keys(probe_count);
+	ScalarBufferWords material_words(material, indirect.selector_immediate, runtime);
 	for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
 		uint32_t key = 0;
-		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset),
-		                          indirect.selector_immediate, runtime, key)) {
+		if (!material_words.Read(static_cast<uint32_t>(offset), key)) {
 			return note("material table key is not readable");
 		}
-		if (seen.insert(key).second) {
-			keys.push_back(key);
-		}
+		keys.Add(key);
 		if (limit - offset < step) {
 			break;
 		}
 	}
 
 	IndirectImage next;
-	next.keys = std::move(keys);
+	next.keys = keys.Take();
 	std::vector<DescriptorValue> probed;
 	probed.reserve(next.keys.size());
+	const auto heap_size = ScalarBufferSize(heap);
+	const auto heap_base = heap.Base48() & ~uint64_t {3};
 	for (const auto key: next.keys) {
 		DescriptorValue candidate;
 		candidate.dword_count  = 8u;
 		const auto heap_offset = key << 5u;
-		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
-			if (!ReadScalarBufferWord(heap, heap_offset, dword * sizeof(uint32_t), runtime,
-			                          candidate.dwords[dword])) {
+		// Inside the buffer, ReadScalarBufferWord reads the words at heap_base + heap_offset.
+		if (uint64_t {heap_offset} + sizeof(candidate.dwords) <= heap_size) {
+			if (!ReadSpecializationDescriptor(runtime, heap_base + heap_offset, candidate.dwords)) {
 				return note("heap entry is not readable");
+			}
+		} else {
+			for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
+				if (!ReadScalarBufferWord(heap, heap_offset, dword * sizeof(uint32_t), runtime,
+				                          candidate.dwords[dword])) {
+					return note("heap entry is not readable");
+				}
 			}
 		}
 		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, image.r128) ||
@@ -623,8 +716,11 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	next.flattened_srt.swap(flattened_srt);
 	next.images.resize(program.info.images.size());
 	for (uint32_t image_index = 0; image_index < program.info.images.size(); image_index++) {
-		const auto& image  = program.info.images[image_index];
-		const auto* source = Source(program, image.source);
+		const auto& image = program.info.images[image_index];
+		// Without an indirect image (ExtractResourcePlan), every image takes the next descriptor:
+		// the lookup would only miss the cache on the program's descriptor sources.
+		const auto* source =
+		    program.requires_specialization_memory ? Source(program, image.source) : nullptr;
 		if (source != nullptr && source->indirect_image.has_value()) {
 			if (!active_sources[image.source]) {
 				next.images[image_index].dword_count = 8u;
