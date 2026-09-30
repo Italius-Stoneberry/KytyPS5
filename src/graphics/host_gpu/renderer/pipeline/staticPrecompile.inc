@@ -432,9 +432,11 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args) {
 		const bool written = result.Save();
 		PipelineCacheLog("Shader seeds: {} {} ({} inputs, {} pipelines)", written ? "wrote" : "could not write",
 		                 Common::PathToString(out), result.records.size(), result.pipelines.size());
+		// The lists are for coverage (precompile.py), not next to the static cache.
 		const auto list = [&](const char* suffix, const auto& write) {
 			auto path = out;
 			path += suffix;
+			if (args.static_inputs) return;
 			if (auto* file = std::fopen(Common::PathToString(path).c_str(), "w")) {
 				write(file);
 				std::fclose(file);
