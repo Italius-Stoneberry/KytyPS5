@@ -1125,6 +1125,7 @@ bool RenderExecutor::NativeXprRebindSlots(NativeXprRecord& record,
 		const auto requested  = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
 		if (address == 0 || requested == 0) return false;
 		const auto size  = Libs::LibKernel::Memory::ClampRangeSize(address, requested);
+		if (size == 0) return false;
 		const auto id    = buffers.FindBuffer(address, size);
 		const auto* owner = buffers.GetBufferIfLive(id);
 		if (owner == nullptr) return false;

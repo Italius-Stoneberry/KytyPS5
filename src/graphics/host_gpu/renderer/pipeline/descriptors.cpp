@@ -965,6 +965,10 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			continue;
 		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		if (size == 0) { // unmapped: bound as a null buffer
+			prepared.buffer_sources.push_back({});
+			continue;
+		}
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }

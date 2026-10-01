@@ -1071,9 +1071,15 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
 	if (clamped_size == 0) {
-		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
-		     "\n",
-		     vaddr, size);
+		// A descriptor over memory the guest has released (a dispatch in a newly streamed area
+		// stopped the emulator here): the caller binds nothing, as for a null descriptor.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			std::printf("Memory: buffer range at an unmapped address ignored, addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			            "\n",
+			            vaddr, size);
+		}
+		return 0;
 	}
 	if (clamped_size != size) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
