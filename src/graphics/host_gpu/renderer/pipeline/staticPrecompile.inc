@@ -34,8 +34,28 @@ SeedSpecializations(const ShaderRecompiler::IR::Program& program) {
 		    program.descriptor_sources[image.source].indirect_image.has_value())
 			tables.push_back(index);
 	}
+	// Compute shaders that declare 3D images (outside tables) are often given 2D textures there (most
+	// specializations of recorded play the seeds missed), nearly always the last ones of them (95%:
+	// 3D 2D, 2D 2D, 3D 3D 2D...): every variant again with the last 1, 2, ... of them 2D (all subsets
+	// would be 2^k - 1 variants each instead of k).
+	const auto with_volumes_as_2d = [&](std::vector<ShaderRecompiler::IR::ResourceSpecialization> out) {
+		std::vector<uint32_t> volumes;
+		for (uint32_t index = 0; index < program.info.images.size(); index++) {
+			if (plain.images[index].dimension == ImageDimension::Dim3D && std::ranges::find(tables, index) == tables.end())
+				volumes.push_back(index);
+		}
+		if (program.stage != ShaderType::Compute || volumes.empty()) return out;
+		for (size_t variant = 0, count = out.size(); variant < count; variant++) {
+			auto flat = out[variant];
+			for (auto volume = volumes.rbegin(); volume != volumes.rend(); ++volume) {
+				flat.images[*volume].dimension = ImageDimension::Dim2D;
+				out.push_back(flat);
+			}
+		}
+		return out;
+	};
 	if (tables.empty() || tables.size() > 2 || !ShaderRecompiler::IR::PortableShaders()) {
-		return {plain};
+		return with_volumes_as_2d({plain});
 	}
 	constexpr uint32_t sizes[] = {1, 2, 4, 8, 16};
 	const auto         header  = static_cast<uint32_t>(program.srt_reads.size());
@@ -78,7 +98,7 @@ SeedSpecializations(const ShaderRecompiler::IR::Program& program) {
 			out.push_back(std::move(flat));
 		}
 	}
-	return out;
+	return with_volumes_as_2d(std::move(out));
 }
 
 // A recorded specialization's indirect image tables in their portable form (BuildResourceSpecialization):
