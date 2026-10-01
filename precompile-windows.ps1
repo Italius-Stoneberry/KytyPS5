@@ -16,7 +16,8 @@
 # are merged into the static cache at the end. The shards are small (-Shards, about 100 pipelines each):
 # after a few hundred pipelines NVIDIA compresses binaries with a dictionary of its own, which only that
 # PC reads (pipelineBinaries.h); a shard that got there anyway left the rest out (exit code 3) and runs
-# again as two. An interrupted run resumes: finished shards are merged first, and what the static cache
+# again as two. recorded.seeds next to the seed file (-Recorded) adds the specializations of recorded
+# play. An interrupted run resumes: finished shards are merged first, and what the static cache
 # holds is not compiled again (binaries: the final merge keeps only what this run's shards made, so
 # pipelines no seed makes any more are dropped; a .bin left from before is where the first binaries run
 # takes them from without compiling). Build the program with build-windows.cmd kyty_shader_precompile.
@@ -25,6 +26,10 @@
 param(
 	[string]$Game = '',
 	[string]$Seeds = $(if (Test-Path "$PSScriptRoot\seeds.seeds") { "$PSScriptRoot\seeds.seeds" } else { "$PSScriptRoot\_Build\static-precompile\seeds.seeds" }),
+	# The shaders as the game specialized them in recorded play (tools\local\static-precompile\precompile.py
+	# recorded-seeds): the specializations the seeds' guesses miss (a new PC compiled ~55 compute
+	# pipelines, up to 6 s each, before the HUD). '' = none.
+	[string]$Recorded = $(Join-Path (Split-Path $Seeds) 'recorded.seeds'),
 	[int]$Jobs = 0,
 	[int]$Threads = 3,
 	[int]$Shards = 512,
@@ -101,31 +106,37 @@ if ($InputsOnly) {
 }
 # The shards an interrupted run finished first: what they hold is not compiled again.
 Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
-$pending = [System.Collections.Generic.Queue[string]]::new()
-for ($i = 0; $i -lt $Shards; $i++) { $pending.Enqueue("$i/$Shards") }
+$pending = [System.Collections.Generic.Queue[object]]::new()
+for ($i = 0; $i -lt $Shards; $i++) { $pending.Enqueue(@($Seeds, "$i/$Shards")) }
+if ($Recorded -and (Test-Path $Recorded)) {
+	# A sixteenth of the shards: the recording holds about 5000 pipelines.
+	$count = [math]::Max(1, [math]::Floor($Shards / 16))
+	for ($i = 0; $i -lt $count; $i++) { $pending.Enqueue(@($Recorded, "$i/$count")) }
+}
 $running = @{}
 $finished = 0
 $split = 0
 $shown = Get-Date
 while ($pending.Count -or $running.Count) {
 	while ($pending.Count -and $running.Count -lt $Jobs) {
-		$shard = $pending.Dequeue()
-		$running[$shard] = Start-Precompile ('shard' + ($shard -replace '/', 'of')) @('--seeds', "`"$Seeds`"", '--shard', $shard, '--threads', "$Threads")
+		$seedFile, $shard = $pending.Dequeue()
+		$name = 'shard' + ($shard -replace '/', 'of') + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
+		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard, '--threads', "$Threads")))
 	}
 	Start-Sleep -Milliseconds 250
-	foreach ($shard in @($running.Keys)) {
-		$process = $running[$shard]
+	foreach ($name in @($running.Keys)) {
+		$seedFile, $shard, $process = $running[$name]
 		if (!$process.HasExited) { continue }
-		$running.Remove($shard)
+		$running.Remove($name)
 		Remove-NvidiaCache $process
 		if ($process.ExitCode -eq 3) {
 			$i, $n = [int[]]($shard -split '/')
-			if ($n -ge 65536) { throw "shard $shard cannot be split further; logs: $logName" }
-			$pending.Enqueue("$i/$(2 * $n)")
-			$pending.Enqueue("$($i + $n)/$(2 * $n)")
+			if ($n -ge 65536) { throw "$name cannot be split further; logs: $logName" }
+			$pending.Enqueue(@($seedFile, "$i/$(2 * $n)"))
+			$pending.Enqueue(@($seedFile, "$($i + $n)/$(2 * $n)"))
 			$split++
 		} elseif ($process.ExitCode -ne 0) {
-			throw "shard $shard failed; logs: $logName"
+			throw "$name failed; logs: $logName"
 		} else {
 			$finished++
 		}
@@ -143,7 +154,7 @@ $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.bin", "$PSScriptRo
 Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB; {3} shards split)" -f ((Get-Date) - $begin), $cache.FullName, ($cache.Length / 1MB), $split)
 } finally {
 	# A failed shard ends the run: the others are stopped too.
-	if ($running) { foreach ($process in $running.Values) { if (!$process.HasExited) { $process.Kill(); $process.WaitForExit() } } }
+	if ($running) { foreach ($entry in $running.Values) { if (!$entry[2].HasExited) { $entry[2].Kill(); $entry[2].WaitForExit() } } }
 	$env:__GL_SHADER_DISK_CACHE_PATH = $null
 	Remove-Item -Recurse -Force $nvidiaCaches -ErrorAction SilentlyContinue
 }

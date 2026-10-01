@@ -31,6 +31,9 @@ Copy-Item "$build\kyty_emulator.exe", "$build\kyty_shader_precompile.exe", "$bui
 # (tools\local\static-precompile\precompile.py seeds; its compute keys assume NVIDIA's 32-wide subgroups).
 $seeds = "$PSScriptRoot\_Build\static-precompile\seeds.seeds"
 if (Test-Path $seeds) { Copy-Item $seeds $Out } else { Write-Host "$seeds is missing: the package has no precompile" }
+# The game's own specializations from recorded play (precompile.py recorded-seeds), precompiled with them.
+$recorded = "$PSScriptRoot\_Build\static-precompile\recorded.seeds"
+if (Test-Path $recorded) { Copy-Item $recorded $Out }
 # The VC++ runtime next to the exe (Microsoft's redistributable files), so nothing has to be installed.
 $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
 $crt = Get-Item "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" | Where-Object { $_.Parent.Parent.Name -match '^\d+\.' } |

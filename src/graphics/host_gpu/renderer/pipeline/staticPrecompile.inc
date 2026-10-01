@@ -288,7 +288,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	// Pipelines into the static cache, or a share's into a cache of its own; the objects themselves
 	// are not kept. The static cache is looked up first (CreatePipelineInternal): a rerun compiles
 	// only what it misses. With pipeline binaries every pipeline's binaries go to a shard file
-	// (.shard<i>of<n>, merged by --merge --prune), copied from the store when it holds them, else captured
+	// (.shard<i>of<n>-<seeds>, merged by --merge --prune), copied from the store when it holds them, else captured
 	// (from the static cache, else compiled through a cache of the shard's own).
 	const bool                            binaries = create_pipelines && m_graphics.pipeline_binaries_enabled;
 	std::unique_ptr<PipelineBinaryWriter> writer;
@@ -302,7 +302,9 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		if (m_graphics.device.createPipelineCache(&info, nullptr, &target) != vk::Result::eSuccess) target = nullptr;
 	}
 	auto target_file = binaries ? StaticBinariesPath() : StaticCachePath();
-	if (shards > 1 || binaries) target_file += fmt::format(".shard{}of{}", shard, shards);
+	// Named after the seed file too: a run shards several (precompile-windows.ps1: seeds and recorded).
+	if (shards > 1 || binaries)
+		target_file += fmt::format(".shard{}of{}-{}", shard, shards, Common::PathToString(args.seeds.stem()));
 	const auto save = [&] {
 		if (!binaries) return SaveStaticCache(target, target_file);
 		auto temporary = target_file;
