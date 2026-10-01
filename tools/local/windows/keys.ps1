@@ -48,12 +48,15 @@ $events = foreach ($item in $Plan -split ',') {
 $held = @{}
 $lost = 0
 function Keep-Focus {
-	if ([KS]::GetForegroundWindow() -eq $p.MainWindowHandle) { return }
+	if ([KS]::GetForegroundWindow() -eq $p.MainWindowHandle) { return $true }
 	$script:lost++
 	[KS]::keybd_event(0x12, 0, 0, [IntPtr]::Zero); [KS]::keybd_event(0x12, 0, 2, [IntPtr]::Zero)
 	[KS]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
 	Start-Sleep -Milliseconds 50
+	# Keys sent while another window is in front would type into it (a chat box, an editor).
+	if ([KS]::GetForegroundWindow() -ne $p.MainWindowHandle) { return $false }
 	foreach ($h in $held.Values) { [KS]::Send($h.Code, $false, $h.Ext) }
+	return $true
 }
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
 $away = $false
@@ -62,7 +65,7 @@ foreach ($e in ($events | Sort-Object At)) {
 		if ([KS]::GetForegroundWindow() -ne $p.MainWindowHandle) { $away = $true }
 		Start-Sleep -Milliseconds 5
 	}
-	Keep-Focus
+	if (!(Keep-Focus)) { "emulator window lost the foreground; plan stopped"; exit 1 }
 	[KS]::Send($e.Code, $e.Up, $e.Ext)
 	if ($e.Up) { $held.Remove($e.Code) } else { $held[$e.Code] = $e }
 }
