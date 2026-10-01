@@ -818,6 +818,21 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return true;
 	}
 
+	// The game's debug break after a failed assertion (an audio plugin's assert(0) ended 4 of ~420 runs):
+	// no debugger, so the guest goes on.
+	if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    info->access_violation_vaddr == UINT64_MAX && g_faulting_linker != nullptr &&
+	    g_faulting_linker->FindProgramByAddr(info->exception_address) != nullptr &&
+	    Loader::X64InstructionEmulator::TrySkipDebugBreak(info->native_context)) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("Guest debug break (int 0x41) at %s skipped: no debugger\n",
+			            DescribeGuestAddress(info->exception_address).c_str());
+			std::fflush(stdout);
+		}
+		return true;
+	}
+
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
