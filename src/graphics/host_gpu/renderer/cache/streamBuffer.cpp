@@ -162,13 +162,18 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
-	if (result != vk::Result::eSuccess) {
-		graphics.LogMemoryBudget();
+	const auto        create        = [&] {
+		return vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                       &allocation_info, &native_buffer, &m_allocation, &allocation_result) == VK_SUCCESS;
+	};
+	// Over the video memory budget VMA places it in system memory; when even that fails, without
+	// the images kept for reuse and over budget.
+	if (!create()) {
+		graphics.TrimImagePool();
+		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+		if (!create()) graphics.ReportMemoryFallback("a buffer could not be created", size);
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(native_buffer == VK_NULL_HANDLE);
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -181,6 +186,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	if (usage == MemoryUsage::DeviceLocal && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+		graphics.ReportMemoryFallback("a GPU buffer is in system memory", size);
+	}
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};

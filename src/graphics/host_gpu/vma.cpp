@@ -36,6 +36,8 @@ void FlushBufferReclaimer(); // streamBuffer.cpp (KYTY_BUFFER_RECLAIM)
 
 // Local diagnostic (live `vma <path>`): VMA is thread-safe, so the live thread writes it.
 static VmaAllocator g_report_allocator = nullptr;
+// Freed images kept for reuse (KYTY_IMAGE_POOL): at most 1 GiB, and a 16th of the GPU's memory budget.
+static uint64_t g_image_pool_limit = 1024ull << 20;
 static void WriteVmaReport(const char* path) {
 	if (g_report_allocator == nullptr) return;
 	char* json = nullptr;
@@ -74,6 +76,7 @@ bool GraphicContext::CreateAllocator() {
 	}
 	g_report_allocator          = allocator;
 	LiveCounters::g_vma_report = WriteVmaReport;
+	g_image_pool_limit         = std::min<uint64_t>(1024ull << 20, GetTotalMemoryBudget() / 16);
 	return true;
 }
 
@@ -178,7 +181,6 @@ struct PooledImage {
 std::mutex               g_image_pool_mutex;
 std::vector<PooledImage> g_image_pool;
 uint64_t                 g_image_pool_bytes = 0;
-constexpr uint64_t       ImagePoolBudget    = 1024ull << 20;
 
 std::array<uint32_t, 10> ImagePoolKey(const vk::ImageCreateInfo& info) {
 	return {static_cast<uint32_t>(static_cast<VkImageCreateFlags>(info.flags)), static_cast<uint32_t>(info.imageType),
@@ -209,6 +211,24 @@ static void DestroyImagePool(VmaAllocator allocator) {
 	}
 	g_image_pool.clear();
 	g_image_pool_bytes = 0;
+}
+
+void GraphicContext::TrimImagePool() {
+	if (allocator != nullptr) DestroyImagePool(allocator);
+}
+
+// Out of video memory: the first few times say so in the log, with the heaps' budgets.
+void GraphicContext::ReportMemoryFallback(const char* what, uint64_t bytes) const {
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+	std::printf("Vulkan: video memory full, %s (%" PRIu64 " bytes)\n", what, bytes);
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	for (uint32_t i = 0; i < GetPhysicalDeviceMemoryProperties().memoryHeapCount; i++) {
+		std::printf("  heap %u: usage %" PRIu64 " MiB of budget %" PRIu64 " MiB\n", i, budgets[i].usage >> 20u,
+		            budgets[i].budget >> 20u);
+	}
+	std::fflush(stdout);
 }
 
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
@@ -244,15 +264,28 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
-	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
-	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
-		return false;
+	const auto create = [&] {
+		vk::Image::CType native_image = VK_NULL_HANDLE;
+		const auto       result       = static_cast<vk::Result>(
+		    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+		                   &alloc_info, &native_image, &image.allocation, nullptr));
+		image.image = native_image;
+		return result == vk::Result::eSuccess;
+	};
+	// Out of video memory: without the freed images kept for reuse, then in system memory (slower
+	// to sample, but the game goes on).
+	if (!create()) {
+		TrimImagePool();
+		if (!create()) {
+			alloc_info.requiredFlags  = 0;
+			alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+			const bool created        = create();
+			VmaAllocationInfo allocated {};
+			if (created) vmaGetAllocationInfo(allocator, image.allocation, &allocated);
+			ReportMemoryFallback(created ? "an image is in system memory" : "an image could not be created",
+			                     allocated.size);
+			if (!created) return false;
+		}
 	}
 
 	image.format     = image_info.format;
@@ -279,7 +312,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		std::scoped_lock lock(g_image_pool_mutex);
 		g_image_pool.push_back({ImagePoolKey(image), image.image, image.allocation, allocation_info.size});
 		g_image_pool_bytes += allocation_info.size;
-		while (g_image_pool_bytes > ImagePoolBudget && !g_image_pool.empty()) {
+		while (g_image_pool_bytes > g_image_pool_limit && !g_image_pool.empty()) {
 			auto& oldest = g_image_pool.front();
 			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
 			g_image_pool_bytes -= oldest.bytes;

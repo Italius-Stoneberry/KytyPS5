@@ -117,6 +117,9 @@ struct GraphicContext {
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+	// Frees the images kept for reuse (KYTY_IMAGE_POOL): video memory ran out.
+	void                   TrimImagePool();
+	void                   ReportMemoryFallback(const char* what, uint64_t bytes) const;
 	void                   AppendHardwareRayTracingDeviceExtensions(
 	    const std::vector<vk::ExtensionProperties>& available_extensions,
 	    std::vector<const char*>&                   device_extensions);
