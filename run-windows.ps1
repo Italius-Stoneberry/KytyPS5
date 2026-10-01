@@ -192,9 +192,12 @@ if (!$environment.Contains('KYTY_ASYNC_XPR_PIPELINES') -and !$Baseline) { $envir
 # Memory the game releases (texture pool layers, 64 KiB mappings each) is not unprotected mapping
 # by mapping before its unmap: VirtualProtect was ~15% of the render thread in the open area.
 if (!$environment.Contains('KYTY_UNMAP_PROTECT_SKIP') -and !$Baseline) { $environment['KYTY_UNMAP_PROTECT_SKIP'] = '1' }
-# The executable's SHA-256 scopes the driver pipeline cache (_PipelineCache\local\<sha>) and
-# enables the shader warmup; without it a modified source tree runs with both disabled.
-$environment['KYTY_DRIVER_CACHE_KEY'] = (Get-FileHash -Algorithm SHA256 $Exe).Hash.ToLowerInvariant()
+# The key of the driver pipeline cache (_PipelineCache\local\<key>); it also enables the shader
+# warmup, which a modified source tree runs without otherwise. One key for every build: the driver
+# finds a pipeline by its whole input (SPIR-V and state), so a new build reuses the pipelines of the
+# shaders it left alone. Keyed by the executable's SHA-256, every update compiled the ~3700 warmup
+# pipelines again (2-2.5 minutes of "Preparing pipelines").
+$environment['KYTY_DRIVER_CACHE_KEY'] = '1f3c29b70e536c8f5a5e812e793b33ac2eb6858b4810ed98ca2a51b9fa5eed97'
 if ($Precompile) {
 	# Translate every recorded shader and create every recorded pipeline on all allowed CPUs,
 	# save the driver cache, exit. Later launches warm up from that cache in seconds.
@@ -205,6 +208,10 @@ if ($Precompile) {
 } else {
 	# An earlier -Precompile in the same shell leaves this set; the game must not exit after warmup.
 	Remove-Item env:KYTY_SHADER_WARMUP_ONLY -ErrorAction SilentlyContinue
+	# At most a minute of start-up warmup: with an empty driver cache (the first launch, a driver
+	# update) its ~4400 pipelines took 4.5 minutes; the rest are built at their first use (a fast
+	# unoptimized build at once, the optimized one in the background) and cached from then on.
+	if (!$environment.Contains('KYTY_SHADER_WARMUP_SECONDS')) { $environment['KYTY_SHADER_WARMUP_SECONDS'] = '60' }
 }
 if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }

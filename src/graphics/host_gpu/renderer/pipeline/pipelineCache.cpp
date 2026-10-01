@@ -96,15 +96,16 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties,
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	const auto revision = binary_key.empty() ? std::string(KYTY_GIT_REVISION)
-	                                        : fmt::format("{}:local:{}", KYTY_GIT_REVISION, binary_key);
+	// A keyed (local) cache spans emulator builds: the driver's own UUID and version below scope
+	// its binaries, and it finds a pipeline by the pipeline's whole input.
+	const auto revision = binary_key.empty() ? std::string(KYTY_GIT_REVISION) : fmt::format("local:{}", binary_key);
 	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", revision,
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
 // Compiler inputs are portable across executable rebuilds; the schema version
-// and device capabilities still constrain them. Driver binaries remain scoped
-// to the executable SHA. Every warm program is checked against live source.
+// and device capabilities still constrain them. Driver binaries are scoped by the
+// launcher's cache key. Every warm program is checked against live source.
 std::string ShaderInputDeviceSignature(const vk::PhysicalDeviceProperties& properties) {
 	const auto signature = DriverCacheSignature(properties, {});
 	return signature.substr(signature.size() - (8 * 3 + VK_UUID_SIZE * 2 + 5));
@@ -1206,7 +1207,13 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			}
 		}
 		m_program_cache->Warm(path, title + device, std::string_view(warmup) == "1", adopt_from);
-		if (std::string_view(warmup) == "1") WarmPipelines();
+		if (std::string_view(warmup) == "1") {
+			const auto begin = std::chrono::steady_clock::now();
+			WarmPipelines();
+			// What the driver had to compile is kept at once: the cache is otherwise written only
+			// at a normal exit, so after a crash the next launch compiled it all again (2+ minutes).
+			if (std::chrono::steady_clock::now() - begin > std::chrono::seconds(5)) (void)Save();
+		}
 		m_program_cache->warmup.StartWriter();
 		if (const char* only = std::getenv("KYTY_SHADER_WARMUP_ONLY"); only && std::string_view(only) == "1") {
 			if (!Save()) {
@@ -1454,8 +1461,13 @@ void PipelineCache::InitializeDriverCache() {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_driver_cache_key);
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= std::numeric_limits<uint32_t>::max()) {
+		// The launcher keeps one cache across emulator builds: pipelines of changed shaders pile
+		// up in it, so past 1 GiB (one build's warmup is ~130 MB) it starts over.
+		if (file_size > (uint64_t {1} << 30u)) {
+			file.Close();
+			PipelineCacheLog("Vulkan pipeline cache: starting {} over ({} bytes)", path, file_size);
+		} else if (file_size >= signature.size() + sizeof(uint64_t) &&
+		           file_size <= std::numeric_limits<uint32_t>::max()) {
 			std::string cached_signature(signature.size(), '\0');
 			uint64_t    payload_hash = 0;
 			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
