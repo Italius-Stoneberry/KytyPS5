@@ -8,6 +8,8 @@
 
 The user's save is only ever moved (renamed), never deleted; `restore` refuses to run while an
 emulator process exists and checks every file's SHA-256 against the backup manifest.
+KYTY_BENCH_BASELINE=<dir> (with PPSA01341 and .kyty-capacity): another baseline for prepare/reset,
+such as a copy of a save elsewhere in the game.
 """
 import hashlib
 import json
@@ -20,7 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SAVES = ROOT / '_SaveData'
-BASELINE = ROOT / '_Build/walk-fps-20260914/save-baseline'
+BASELINE = Path(os.environ.get('KYTY_BENCH_BASELINE') or ROOT / '_Build/walk-fps-20260914/save-baseline')
 STATE = ROOT / '_Build/windows-bench'
 LIVE_FILE = STATE / 'live-commands.txt'
 ENTRIES = ('PPSA01341', '.kyty-capacity')
