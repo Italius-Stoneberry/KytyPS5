@@ -249,6 +249,11 @@ static vk::Result CapturePipelineBinaries(GraphicContext& graphics, PipelineCach
 	return result;
 }
 
+// The precompile's pipeline another of its shards holds: none is made (the caller destroys a null one).
+static bool ClaimedElsewhere(const GraphicContext& graphics, vk::Result result) {
+	return result == vk::Result::ePipelineCompileRequired && graphics.pipeline_binary_writer != nullptr;
+}
+
 // The static precompile's pipeline when it holds this one (no compilation), else built as `build` says.
 template <typename Info, typename Create>
 static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, Info info,
@@ -267,6 +272,8 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	if (build != PipelineBuild::Optimize && (store != nullptr || writer != nullptr)) {
 		PipelineBinaries::Key key;
 		if (PipelineBinaries::PipelineKey(graphics.device, &info, key)) {
+			// Another shard of this precompile holds it: no pipeline (see CreatePipelineInternal).
+			if (writer != nullptr && writer->Claimed(key)) return vk::Result::ePipelineCompileRequired;
 			if (const auto binaries = store != nullptr ? store->Load(key) : PipelineBinaries::Handles {};
 			    !binaries.binaries.empty()) {
 				vk::PipelineBinaryInfoKHR from {};
@@ -661,9 +668,8 @@ void CreatePipelineInternal(
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
+	                     (result != vk::Result::eSuccess || pipeline.pipeline == nullptr));
 
 	if (tess_control_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -736,9 +742,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                         });
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
+	                     (result != vk::Result::eSuccess || pipeline.pipeline == nullptr));
 }
 
 } // namespace Libs::Graphics

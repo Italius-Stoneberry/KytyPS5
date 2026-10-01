@@ -113,6 +113,9 @@ if ($Recorded -and (Test-Path $Recorded)) {
 	$count = [math]::Max(1, [math]::Floor($Shards / 16))
 	for ($i = 0; $i -lt $count; $i++) { $pending.Enqueue(@($Recorded, "$i/$count")) }
 }
+# The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
+# shards make (a third of them) is compiled once.
+$env:KYTY_PRECOMPILE_CLAIMS = Join-Path $nvidiaCaches 'claims'
 $running = @{}
 $finished = 0
 $split = 0
@@ -147,6 +150,7 @@ while ($pending.Count -or $running.Count) {
 			$running.Count, $pending.Count, $split)
 	}
 }
+$env:KYTY_PRECOMPILE_CLAIMS = $null
 Wait-Precompile (Start-Precompile 'merge' @('--merge', '--prune')) 'merge'
 Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
 $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.bin", "$PSScriptRoot\_PipelineCache\static\*.binaries" |
@@ -156,5 +160,6 @@ Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB; {3} shards split)" -f ((Get
 	# A failed shard ends the run: the others are stopped too.
 	if ($running) { foreach ($entry in $running.Values) { if (!$entry[2].HasExited) { $entry[2].Kill(); $entry[2].WaitForExit() } } }
 	$env:__GL_SHADER_DISK_CACHE_PATH = $null
+	$env:KYTY_PRECOMPILE_CLAIMS = $null
 	Remove-Item -Recurse -Force $nvidiaCaches -ErrorAction SilentlyContinue
 }

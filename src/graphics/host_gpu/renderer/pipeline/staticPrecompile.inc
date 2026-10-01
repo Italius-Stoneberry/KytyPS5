@@ -313,9 +313,9 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		if (!writer->Save(temporary, StaticBinariesSignature(m_graphics))) return false;
 		std::filesystem::rename(temporary, target_file, error);
 		PipelineCacheLog("Static pipeline binaries: saved {} pipelines ({} created from the store, {} captured, {} left "
-		                 "out) to {}",
+		                 "out; {} held by other shards) to {}",
 		                 writer->Pipelines(), writer->Copied(), writer->Captured(), writer->LeftOut(),
-		                 Common::PathToString(target_file));
+		                 writer->ClaimedElsewhere(), Common::PathToString(target_file));
 		return !error;
 	};
 	const auto          driver_cache = target != nullptr ? target : m_driver_cache;

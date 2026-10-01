@@ -103,7 +103,7 @@ private:
 // there anyway is split.
 class PipelineBinaryWriter {
 public:
-	explicit PipelineBinaryWriter(vk::Device device): m_device(device) {}
+	explicit PipelineBinaryWriter(vk::Device device);
 	// The binaries of a pipeline created with VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR (its captured
 	// data is released), or with `create_info` (a Vk*PipelineCreateInfo) those the driver's internal
 	// cache holds for it; false when the driver gives none.
@@ -120,6 +120,10 @@ public:
 	[[nodiscard]] size_t Copied() const { return m_copied.load(std::memory_order_relaxed); }
 	[[nodiscard]] size_t Captured() const { return m_captured.load(std::memory_order_relaxed); }
 	[[nodiscard]] size_t LeftOut() const { return m_left_out.load(std::memory_order_relaxed); }
+	// KYTY_PRECOMPILE_CLAIMS=<dir>: the shards of one precompile share the keys they hold (a file each),
+	// so a pipeline the seeds of several shards make is compiled by one of them, not by each.
+	[[nodiscard]] bool   Claimed(const PipelineBinaries::Key& key) const;
+	[[nodiscard]] size_t ClaimedElsewhere() const { return m_claimed.load(std::memory_order_relaxed); }
 
 private:
 	struct Binary {
@@ -138,13 +142,16 @@ private:
 		size_t operator()(const BinaryId& id) const { return PipelineBinaries::KeyHash {}(id.key) ^ id.hash; }
 	};
 	uint32_t AddBinary(Binary binary);
+	void     Claim(const PipelineBinaries::Key& key) const;
 
 	vk::Device                                                                  m_device;
+	std::filesystem::path                                                       m_claims;
 	mutable std::mutex                                                          m_mutex;
 	std::vector<Binary>                                                         m_binaries;
 	std::unordered_map<BinaryId, uint32_t, BinaryIdHash>                        m_binary_index;
 	std::unordered_map<PipelineBinaries::Key, std::vector<uint32_t>, PipelineBinaries::KeyHash> m_pipelines;
 	std::atomic<size_t> m_copied {0}, m_captured {0}, m_left_out {0};
+	mutable std::atomic<size_t> m_claimed {0};
 };
 
 } // namespace Libs::Graphics

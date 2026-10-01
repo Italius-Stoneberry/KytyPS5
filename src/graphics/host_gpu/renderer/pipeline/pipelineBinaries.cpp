@@ -4,6 +4,7 @@
 #include "local-platform.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <system_error>
@@ -243,6 +244,33 @@ static bool IsDictionary(const PipelineBinaries::Key& key) {
 	       key.bytes.begin() + key.size;
 }
 
+PipelineBinaryWriter::PipelineBinaryWriter(vk::Device device): m_device(device) {
+	if (const char* claims = std::getenv("KYTY_PRECOMPILE_CLAIMS"); claims != nullptr && *claims != 0) {
+		m_claims = claims;
+		std::error_code error;
+		std::filesystem::create_directories(m_claims, error);
+	}
+}
+
+static std::string ClaimName(const PipelineBinaries::Key& key) {
+	std::string name;
+	for (uint32_t i = 0; i < key.size; i++) name += fmt::format("{:02x}", key.bytes[i]);
+	return name;
+}
+
+bool PipelineBinaryWriter::Claimed(const PipelineBinaries::Key& key) const {
+	std::error_code error;
+	if (m_claims.empty() || !std::filesystem::exists(m_claims / ClaimName(key), error)) return false;
+	m_claimed.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+// After the binaries are held (never before: a shard that is split keeps what it saved, and its halves
+// compile the rest).
+void PipelineBinaryWriter::Claim(const PipelineBinaries::Key& key) const {
+	if (!m_claims.empty()) std::ofstream(m_claims / ClaimName(key), std::ios::binary);
+}
+
 bool PipelineBinaryWriter::Capture(const PipelineBinaries::Key& key, vk::Pipeline pipeline, const void* create_info) {
 	const auto&                   d = VULKAN_HPP_DEFAULT_DISPATCHER;
 	VkPipelineBinaryCreateInfoKHR create {VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR};
@@ -302,6 +330,7 @@ bool PipelineBinaryWriter::Capture(const PipelineBinaries::Key& key, vk::Pipelin
 	refs.clear();
 	for (auto& binary: binaries) refs.push_back(AddBinary(std::move(binary)));
 	m_captured.fetch_add(1, std::memory_order_relaxed);
+	Claim(key);
 	return true;
 }
 
@@ -317,6 +346,7 @@ void PipelineBinaryWriter::Copy(const PipelineBinaries::Key& key, const Pipeline
 		const auto& binary = from.m_binaries[index];
 		refs.push_back(AddBinary({.key = binary.key, .hash = binary.hash, .from = &from, .index = index}));
 	}
+	Claim(key);
 }
 
 void PipelineBinaryWriter::CopyAll(const PipelineBinaries& from) {
