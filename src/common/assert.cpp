@@ -103,6 +103,12 @@ void DbgExit(int status) {
 	}
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
+#if defined(_WIN32)
+	// Not ExitProcess (std::_Exit): it kills the other threads wherever they are and then runs the DLLs'
+	// detach routines on this one, where a driver's waited forever on what a killed thread held (a
+	// crashed emulator stayed a one-thread process, unkillable, holding its memory).
+	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
+#endif
 	std::_Exit(status);
 }
 

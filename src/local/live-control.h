@@ -17,6 +17,7 @@
 //   sleep <seconds>
 // Without KYTY_LIVE_FILE nothing runs; the flip hook is one relaxed increment.
 
+#include "common/assert.h"
 #include "frame-capture.h"
 #include "live-census.h"
 #include "live-counters.h"
@@ -420,6 +421,9 @@ inline void Run(uint64_t id, const std::string& line) {
 		// vma <path>: the GPU allocator's detailed statistics (JSON: every allocation's type and size).
 		if (LiveCounters::g_vma_report != nullptr) LiveCounters::g_vma_report(arg1);
 		std::printf("LIVE_VMA id=%" PRIu64 " path=%s written=%d\n", id, arg1, LiveCounters::g_vma_report != nullptr ? 1 : 0);
+	} else if (cmd == "fatal") {
+		// fatal: a fatal error on this thread, the path a crash takes (log, then the process ends).
+		EXIT("live fatal: a test of the fatal-error exit\n");
 	} else if (cmd == "sleep" && n >= 2) {
 		std::this_thread::sleep_for(std::chrono::duration<double>(std::strtod(arg1, nullptr)));
 	} else if (cmd == "capture" && n >= 2) {
