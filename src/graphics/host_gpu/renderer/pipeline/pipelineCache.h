@@ -30,6 +30,7 @@ struct RenderDepthInfo;
 struct LocalDescriptorPlan;
 #endif
 class CommandBuffer;
+class PipelineBinaries;
 
 namespace HW {
 class Context;
@@ -140,8 +141,10 @@ public:
 	// the static pipeline cache is this GPU's and driver's.
 	static bool StaticInputsCurrent(GraphicContext& graphics, const std::filesystem::path& seeds);
 	static bool StaticCacheCurrent(GraphicContext& graphics);
-	// The caches the shards of a precompile saved next to the static cache, merged into it.
-	static bool MergePrecompileShards(GraphicContext& graphics);
+	// The caches the shards of a precompile saved next to the static cache, merged into it. With
+	// pipeline binaries and `prune`, the store becomes the shards' pipelines only (a whole run's: what
+	// older runs left that no seed makes any more is dropped).
+	static bool MergePrecompileShards(GraphicContext& graphics, bool prune);
 #endif
 
 	// A pipeline no cache holds, compiled without optimization so its draw or dispatch need not wait:
@@ -298,6 +301,8 @@ private:
 	// The static precompile's pipelines (_PipelineCache/static), kept across emulator builds:
 	// GraphicContext::static_pipeline_cache while loaded.
 	vk::PipelineCache             m_static_cache = nullptr;
+	// Or its binaries (pipelineBinaries.h): GraphicContext::pipeline_binaries while open.
+	std::unique_ptr<PipelineBinaries> m_static_binaries;
 	std::filesystem::path         m_driver_cache_path;
 	std::string                   m_driver_cache_key;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
@@ -337,6 +342,7 @@ private:
 	void WarmPipelines();
 #ifdef KYTY_STATIC_PRECOMPILE
 	bool SaveStaticCache(vk::PipelineCache cache, const std::filesystem::path& path);
+	static bool MergeBinaryShards(GraphicContext& graphics, bool prune);
 	bool WarmSeeds(const PrecompileOptions& options);
 #endif
 };

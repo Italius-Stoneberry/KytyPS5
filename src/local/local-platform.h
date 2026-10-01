@@ -44,6 +44,8 @@ uint64_t OpenScratchFile();
 bool     WriteScratchFile(uint64_t file, uint64_t offset, const void* data, size_t size);
 bool     ReadScratchFile(uint64_t file, uint64_t offset, void* data, size_t size);
 void     CloseScratchFile(uint64_t file);
+// An existing file (a UTF-8 path) for ReadScratchFile and CloseScratchFile; 0 when it cannot be opened.
+uint64_t OpenFileForReading(const char* path);
 
 #if defined(_WIN32)
 // With its output in files (run-windows.ps1's logs), the console window a launcher gave the process

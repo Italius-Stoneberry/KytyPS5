@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1350,6 +1351,7 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	m_graphics.pipeline_binaries = nullptr;
 	for (const auto pipeline: m_replaced_pipelines) {
 		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
@@ -1370,6 +1372,16 @@ static std::string StaticCacheSignature(const vk::PhysicalDeviceProperties& prop
 
 static std::filesystem::path StaticCachePath() {
 	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheTitleId() + ".bin");
+}
+
+// Its pipelines as the driver's binaries (VK_KHR_pipeline_binary), read when needed: the driver keeps a
+// copy of a whole pipeline cache in memory. Headed by the GPU, the driver and its global pipeline key.
+static std::filesystem::path StaticBinariesPath() {
+	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheTitleId() + ".binaries");
+}
+
+static std::string StaticBinariesSignature(GraphicContext& graphics) {
+	return PipelineBinaries::Signature(graphics.device, ShaderInputDeviceSignature(graphics.GetPhysicalDeviceProperties()));
 }
 
 // A pipeline cache file (signature, XXH3 of the payload, payload): the payload, or nothing when the
@@ -1396,7 +1408,23 @@ void PipelineCache::InitializeStaticCache(bool create) {
 	if (const char* value = std::getenv("KYTY_STATIC_PIPELINE_CACHE"); !create && value != nullptr &&
 	    std::string_view(value) == "0")
 		return;
-	const auto begin   = std::chrono::steady_clock::now();
+	const auto begin = std::chrono::steady_clock::now();
+	if (m_static_binaries != nullptr) return;
+	if (m_graphics.pipeline_binaries_enabled) {
+		m_static_binaries = PipelineBinaries::Open(m_graphics.device, StaticBinariesPath(), StaticBinariesSignature(m_graphics));
+		if (m_static_binaries != nullptr) {
+			m_graphics.pipeline_binaries = m_static_binaries.get();
+			PipelineCacheLog("Static pipeline binaries: {} pipelines, {} binaries, {} MiB in {} ({} ms)",
+			                 m_static_binaries->Pipelines(), m_static_binaries->Binaries(),
+			                 m_static_binaries->DataBytes() >> 20u, Common::PathToString(StaticBinariesPath()),
+			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
+			                     .count());
+			return;
+		}
+		// None yet (or another GPU's or driver's): a static pipeline cache still serves, and in the
+		// precompile it is what the binaries are taken from without compiling.
+		create = false;
+	}
 	const auto path    = StaticCachePath();
 	const auto payload = ReadPipelineCacheFile(path, StaticCacheSignature(m_graphics.GetPhysicalDeviceProperties()));
 	if (payload.empty() && !create) return;

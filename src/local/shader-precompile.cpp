@@ -2,7 +2,7 @@
 //
 //   kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] [--threads <n>]
 //                          [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]
-//   kyty_shader_precompile --game <dir> --merge
+//   kyty_shader_precompile --game <dir> --merge [--prune]
 //   kyty_shader_precompile --game <dir> --seeds <file> --status
 //
 // compiles the shaders and pipelines of a seed file on a headless Vulkan device (the one the emulator
@@ -10,7 +10,11 @@
 // the emulator looks up before compiling. With --shard, the i-th of n shares goes into a cache file of
 // its own next to it: the NVIDIA driver compiles big shaders nearly one at a time per process, so the
 // shares are processes (precompile-windows.ps1 runs them); --merge folds their files into the static
-// cache. --out writes what was compiled as a warmup file, for precompile.py coverage; --static-inputs
+// cache. Where the driver has VK_KHR_pipeline_binary the static cache is the pipelines' binaries instead
+// (_PipelineCache/static/<title>.binaries, read by the emulator when it needs a pipeline): every share
+// writes its pipelines' binaries to a shard file, and --merge --prune makes the store of the shards' alone
+// (what no seed makes any more is dropped; without --prune the store keeps its pipelines too). --out
+// writes what was compiled as a warmup file, for precompile.py coverage; --static-inputs
 // writes it where the emulator's shader prefetch reads it (_PipelineCache/static/<title>.shaders);
 // --timings each pipeline's compile time (ms, SPIR-V words, the seeds' hashes). --status prints
 // whether those inputs and the static cache are this GPU's and driver's ("inputs current|stale",
@@ -36,7 +40,7 @@ using Libs::Graphics::PipelineCache;
 static int Usage() {
 	std::fprintf(stderr, "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] "
 	                     "[--threads <n>] [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]\n"
-	                     "       kyty_shader_precompile --game <dir> --merge\n"
+	                     "       kyty_shader_precompile --game <dir> --merge [--prune]\n"
 	                     "       kyty_shader_precompile --game <dir> --seeds <file> --status\n");
 	return 2;
 }
@@ -44,6 +48,7 @@ static int Usage() {
 int main(int argc, char* argv[]) {
 	std::filesystem::path          game;
 	bool                           merge  = false;
+	bool                           prune  = false;
 	bool                           status = false;
 	PipelineCache::PrecompileOptions options;
 	options.threads = std::max(1u, std::thread::hardware_concurrency());
@@ -52,6 +57,8 @@ int main(int argc, char* argv[]) {
 		const char*            value = i + 1 < argc ? argv[i + 1] : nullptr;
 		if (arg == "--merge") {
 			merge = true;
+		} else if (arg == "--prune") {
+			prune = true;
 		} else if (arg == "--status") {
 			status = true;
 		} else if (arg == "--no-pipelines") {
@@ -107,7 +114,8 @@ int main(int argc, char* argv[]) {
 		std::fflush(nullptr);
 		std::_Exit(0);
 	}
-	const bool done = merge ? PipelineCache::MergePrecompileShards(graphics) : PipelineCache::Precompile(graphics, options);
+	const bool done =
+	    merge ? PipelineCache::MergePrecompileShards(graphics, prune) : PipelineCache::Precompile(graphics, options);
 	std::printf("Shader precompile: %s\n", done ? "complete" : "failed");
 	std::fflush(nullptr);
 	std::_Exit(done ? 0 : 1);

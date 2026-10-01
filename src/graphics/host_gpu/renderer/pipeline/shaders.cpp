@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -18,6 +19,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <span>
 #include <vector>
@@ -218,6 +220,35 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
 }
 
+// The precompile's capture (PipelineBinaryWriter): a pipeline the static pipeline cache holds (the first
+// store is made from it), its binaries then from the driver's own cache (a pipeline created with the
+// capture flag is never a cache hit: compiled); else compiled with its binaries kept.
+template <typename Info, typename Create>
+static vk::Result CapturePipelineBinaries(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, Info info,
+                                          vk::PipelineCache driver_cache, const PipelineBinaries::Key& key,
+                                          Create create) {
+	auto* writer = graphics.pipeline_binary_writer;
+	if (graphics.static_pipeline_cache != nullptr && graphics.pipeline_cache_control_enabled) {
+		auto lookup = info;
+		lookup.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+		if (create(graphics.static_pipeline_cache, lookup) == vk::Result::eSuccess) {
+			if (writer->Capture(key, nullptr, &info)) return vk::Result::eSuccess;
+			graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+		}
+		pipeline.pipeline = nullptr;
+	}
+	vk::PipelineCreateFlags2CreateInfoKHR flags {};
+	flags.flags = vk::PipelineCreateFlags2KHR(static_cast<VkPipelineCreateFlags>(info.flags)) |
+	              vk::PipelineCreateFlagBits2KHR::eCaptureDataKHR;
+	flags.pNext       = info.pNext;
+	info.pNext        = &flags;
+	const auto result = create(driver_cache, info);
+	if (result == vk::Result::eSuccess && !writer->Capture(key, pipeline.pipeline)) {
+		std::printf("Pipeline binaries: the driver gave none for a pipeline\n");
+	}
+	return result;
+}
+
 // The static precompile's pipeline when it holds this one (no compilation), else built as `build` says.
 template <typename Info, typename Create>
 static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, Info info,
@@ -230,7 +261,31 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 		pipeline.pipeline = nullptr;
 		return false;
 	};
-	if (build != PipelineBuild::Optimize && cached(graphics.static_pipeline_cache)) return vk::Result::eSuccess;
+	// Its binaries (pipelineBinaries.h) when the store holds them; the precompile keeps every pipeline's.
+	const auto* store  = graphics.pipeline_binaries;
+	auto*       writer = graphics.pipeline_binary_writer;
+	if (build != PipelineBuild::Optimize && (store != nullptr || writer != nullptr)) {
+		PipelineBinaries::Key key;
+		if (PipelineBinaries::PipelineKey(graphics.device, &info, key)) {
+			if (const auto binaries = store != nullptr ? store->Load(key) : PipelineBinaries::Handles {};
+			    !binaries.binaries.empty()) {
+				vk::PipelineBinaryInfoKHR from {};
+				from.binaryCount       = static_cast<uint32_t>(binaries.binaries.size());
+				from.pPipelineBinaries = reinterpret_cast<const vk::PipelineBinaryKHR*>(binaries.binaries.data());
+				auto with              = info;
+				from.pNext             = with.pNext;
+				with.pNext             = &from;
+				if (create(nullptr, with) == vk::Result::eSuccess) {
+					if (writer != nullptr) writer->Copy(key, *store);
+					return vk::Result::eSuccess;
+				}
+				pipeline.pipeline = nullptr;
+			}
+			if (writer != nullptr) return CapturePipelineBinaries(graphics, pipeline, info, driver_cache, key, create);
+		}
+	}
+	if (build != PipelineBuild::Optimize && store == nullptr && cached(graphics.static_pipeline_cache))
+		return vk::Result::eSuccess;
 	if (build != PipelineBuild::Fast) return create(driver_cache, info);
 	if (cached(driver_cache)) return vk::Result::eSuccess;
 	// In no cache: NVIDIA compiles this ~100x faster, so the draw or dispatch does not stall.

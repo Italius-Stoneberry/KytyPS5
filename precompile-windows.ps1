@@ -1,7 +1,10 @@
 # Static shader and pipeline precompile (tools\local\static-precompile), a program of its own:
 #   .\precompile-windows.ps1              every shader and pipeline of the game into the static pipeline
 #                                         cache _PipelineCache\static\<title>.bin, which the emulator looks
-#                                         up before compiling (hours the first time: run it overnight)
+#                                         up before compiling (hours the first time: run it overnight); with
+#                                         a driver that has VK_KHR_pipeline_binary (NVIDIA 5xx) the pipelines'
+#                                         binaries instead, <title>.binaries, read only when a pipeline is
+#                                         needed (the driver copies a whole .bin into memory: GBs)
 #   .\precompile-windows.ps1 -Jobs 8      with 8 processes (default: 3 threads each on the allowed CPUs)
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
@@ -11,7 +14,9 @@
 # The NVIDIA driver compiles big compute shaders nearly one at a time per process, so the work is split
 # into shards, a below-normal-priority process each (kyty_shader_precompile --shard i/n), whose caches
 # are merged into the static cache at the end. An interrupted run resumes: the shards' checkpoints
-# (every ten minutes) are merged first, and what the static cache holds is not compiled again. Build the
+# (every ten minutes) are merged first, and what the static cache holds is not compiled again (binaries:
+# the final merge keeps only what this run's shards made, so pipelines no seed makes any more are dropped;
+# a .bin left from before is where the first binaries run takes them from without compiling). Build the
 # program with build-windows.cmd kyty_shader_precompile. A portable package (package-windows.ps1) has the
 # program, the seed file and launch.json next to this script (precompile.cmd).
 param(
@@ -96,7 +101,8 @@ $workers = for ($i = 0; $i -lt $Jobs; $i++) {
 	Start-Precompile "shard$i" @('--seeds', "`"$Seeds`"", '--shard', "$i/$Jobs", '--threads', "$Threads")
 }
 Wait-Precompile $workers 'shards'
-Wait-Precompile @(Start-Precompile 'merge' @('--merge')) 'merge'
+Wait-Precompile @(Start-Precompile 'merge' @('--merge', '--prune')) 'merge'
 Wait-Precompile @(Start-Precompile 'inputs' $inputs) 'inputs'
-$cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.bin" | Sort-Object LastWriteTime | Select-Object -Last 1
+$cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.bin", "$PSScriptRoot\_PipelineCache\static\*.binaries" |
+	Sort-Object LastWriteTime | Select-Object -Last 1
 Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB)" -f ((Get-Date) - $begin), $cache.FullName, ($cache.Length / 1MB))

@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <ctime>
 #include <dirent.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <string>
@@ -333,6 +334,14 @@ void CloseScratchFile(uint64_t file) {
 	if (file != 0) CloseHandle(reinterpret_cast<HANDLE>(file));
 }
 
+uint64_t OpenFileForReading(const char* path) {
+	wchar_t wide[MAX_PATH * 2] {};
+	if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH * 2) == 0) return 0;
+	HANDLE file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+	                          FILE_FLAG_RANDOM_ACCESS, nullptr);
+	return file == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(file);
+}
+
 #else
 
 void SetThreadName(const char* name) {
@@ -472,6 +481,11 @@ bool ReadScratchFile(uint64_t file, uint64_t offset, void* data, size_t size) {
 
 void CloseScratchFile(uint64_t file) {
 	if (file != 0) close(static_cast<int>(file - 1));
+}
+
+uint64_t OpenFileForReading(const char* path) {
+	const int fd = open(path, O_RDONLY | O_CLOEXEC);
+	return fd < 0 ? 0 : static_cast<uint64_t>(fd) + 1;
 }
 
 #endif
