@@ -21,7 +21,7 @@ At start-up the launcher reads the game's `sce_sys\param.json` and warns when th
 | --- | --- | --- |
 | OS | Windows 10 (1803 or later) or Windows 11, 64-bit | |
 | CPU | AVX2 required (Intel Core 4th generation / AMD Ryzen or later) | 8 cores or more recommended; the test PC has an i9-14900K |
-| RAM | **32 GB or more** | The game process uses 15–20 GB and reserves about 30 GB of virtual memory: keep the page file "system managed" |
+| RAM | **32 GB or more** | The game process keeps about 18–20 GB in RAM and needs about 34 GB of RAM plus page file: keep the page file "system managed" (the launcher warns when Windows cannot provide it) |
 | GPU | NVIDIA RTX with **12 GB of VRAM or more** | About 11 GB of VRAM in use; the test PC has an RTX 5090; AMD/Intel GPUs are untested |
 | GPU driver | The latest | The emulator uses Vulkan, which comes with the driver |
 | Disk | About 83 GB for the game, an SSD recommended | The emulator takes about 270 MB, the shader caches up to about 2.5 GB, and while playing the system temp folder needs another 4–5 GB |
@@ -89,12 +89,15 @@ There are two levels of preparation, both specific to the graphics card and driv
    half a minute on the test PC and a few minutes on PCs with fewer threads, with a high CPU load
    meanwhile. The first launch makes the input files it needs.
 2. **Full precompile (recommended once)**: compiles every shader and pipeline of the game into
-   `_PipelineCache`. Afterwards shader stutters are essentially gone; each launch first loads this
-   cache (with a progress bar).
+   `_PipelineCache`. Afterwards shader stutters are essentially gone. With a recent NVIDIA driver the
+   result is a store the game reads pipeline by pipeline (`<title>.binaries`, about 2 GB, nothing to
+   load at launch); with other drivers a cache each launch loads (with a progress bar).
    - Choose "Precompile first" in the dialog at launch, or double-click `precompile.cmd` on its own.
    - The time depends on the CPU threads: about 45 minutes with 22 threads, about 1 hour with 16,
      about 2 hours with 8. The CPU is fully loaded meanwhile: running it overnight is a good idea.
    - Closing the window stops it; running it again continues where it stopped.
+   - Coming from an older package with a precompiled `_PipelineCache\static\<title>.bin`: the precompile
+     turns it into the store in a few minutes; the `.bin` is then unused and can be deleted (about 4 GB).
    - **After a graphics driver update or a new graphics card it has to be done again**; the launcher
      asks again.
    - To stop being asked: tick "Don't ask about precompiling again" (delete

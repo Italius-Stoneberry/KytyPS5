@@ -306,7 +306,7 @@ if ($shaders) {
 	# A precompile that stopped before its last merge keeps its shards' checkpoints (small ones stay
 	# behind after a merge).
 	$cacheReady = $status -match 'static cache current' -and
-		!(Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.bin.shard*" -ErrorAction SilentlyContinue | Where-Object Length -gt 1MB)
+		!(Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.shard*" -ErrorAction SilentlyContinue | Where-Object Length -gt 1MB)
 	Write-Host "shaders:  prefetch inputs $(if ($inputsReady) { 'ready' } else { 'to be made' }), static pipeline cache $(if ($cacheReady) { 'ready' } else { 'not made (precompile-windows.ps1)' })"
 }
 
@@ -338,6 +338,34 @@ if ($Prompt -and ($offer -or !$tested)) {
 		if ($choice -ne 0) { Write-Host 'cancelled'; return }
 	}
 }
+# Memory: Windows ends a program that asks for more than RAM and the page file can hold. The emulator
+# commits about 34 GB (the game's 13.5 GiB of PS5 memory, about 11 GB Windows sets aside to back the
+# video memory in use, the emulator's own) and keeps about 20 GB in RAM.
+$os = Get-CimInstance Win32_OperatingSystem
+[double]$ram = $os.TotalVisibleMemorySize * 1KB
+[double]$commit = $os.FreeVirtualMemory * 1KB
+if ((Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile) {
+	# A system-managed page file grows to 3 x RAM (at most an eighth of its disk) while the disk has room.
+	$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
+	[double]$paged = (Get-CimInstance Win32_PageFileUsage | Measure-Object AllocatedBaseSize -Sum).Sum * 1MB
+	[double]$room = [math]::Min([math]::Min(3 * $ram, [double]$disk.Size / 8) - $paged, [double]$disk.FreeSpace - 5GB)
+	$commit += [math]::Max([double]0, $room)
+}
+$memory = @()
+if ($ram -lt 24GB) {
+	$memory += "This PC has {0:N0} GB of RAM and the emulator keeps about 20 GB in use (32 GB recommended): expect long stutters." -f ($ram / 1GB)
+}
+if ($commit -lt 34GB) {
+	$memory += ("Windows can give programs only {0:N0} GB more memory (RAM plus page file) and the emulator needs about 34 GB: " +
+		"it may close in the middle of the game. Close other programs, or set the page file to 'System managed size' " +
+		"(Settings > System > About > Advanced system settings > Performance > Settings > Advanced > Virtual memory).") -f ($commit / 1GB)
+}
+foreach ($line in $memory) { Write-Host "memory:   $line" }
+if ($memory -and $Prompt) {
+	$choice, $never = Show-Choice ($memory -join "`n`n") @('Start the game anyway', 'Quit')
+	if ($choice -ne 0) { Write-Host 'cancelled'; return }
+}
+
 if ($shaders -and !$inputsReady) {
 	Write-Host 'shaders:  making the background shader preparation inputs for this graphics card (first run or after a driver update: about a minute)'
 	if ((Invoke-Tool @('--no-pipelines', '--static-inputs', '--threads', "$cpus")) -ne 0) {
