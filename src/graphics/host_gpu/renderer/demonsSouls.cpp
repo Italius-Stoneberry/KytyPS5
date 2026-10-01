@@ -14,10 +14,8 @@ namespace Libs::Graphics::DemonsSouls {
 bool IsSupportedGame() {
 	// Called by the dispatch path after game metadata has been loaded.
 	static const bool supported = [] {
-		std::string title, version;
-		return Loader::SystemContentParamSfoGetString("TITLE_ID", &title) &&
-		       Loader::SystemContentParamSfoGetString("APP_VER", &version) &&
-		       IsSupportedVersion(title, version);
+		std::string title;
+		return Loader::SystemContentParamSfoGetString("TITLE_ID", &title) && IsSupportedTitle(title);
 	}();
 	return supported;
 }

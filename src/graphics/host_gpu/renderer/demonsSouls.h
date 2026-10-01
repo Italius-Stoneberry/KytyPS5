@@ -7,10 +7,11 @@ namespace Libs::Graphics {
 class BufferCache;
 struct ShaderComputeInputInfo;
 namespace DemonsSouls {
-// Compatibility policy for the title/version whose explicit compute boundaries
-// and periodic-copy kernel have been checked. Unknown versions use the emulator.
-constexpr bool IsSupportedVersion(std::string_view title, std::string_view version) {
-	return title == "PPSA01341" && version == "01.007.000";
+// Demon's Souls in the regions seen (PPSA01341 01.007.000, PPSA01340 01.005.000), any version: each
+// code patch checks the bytes it replaces (or finds the same code elsewhere), the periodic copy its
+// shader hash, and the explicit compute boundaries are the engine's.
+constexpr bool IsSupportedTitle(std::string_view title) {
+	return title == "PPSA01340" || title == "PPSA01341";
 }
 bool IsSupportedGame();
 bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint32_t x, uint32_t y,

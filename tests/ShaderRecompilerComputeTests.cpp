@@ -31974,11 +31974,10 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--demons-compute-chain-only") == 0) {
-    Require("DemonsSoulsProfile", "version isolation",
-            DemonsSouls::IsSupportedVersion("PPSA01341", "01.007.000") &&
-            !DemonsSouls::IsSupportedVersion("PPSA01341", "01.008.000") &&
-            !DemonsSouls::IsSupportedVersion("PPSA01340", "01.007.000") &&
-            !DemonsSouls::IsSupportedVersion("", ""), "unknown title/version enabled the profile");
+    Require("DemonsSoulsProfile", "title isolation",
+            DemonsSouls::IsSupportedTitle("PPSA01341") && DemonsSouls::IsSupportedTitle("PPSA01340") &&
+            !DemonsSouls::IsSupportedTitle("PPSA01342") && !DemonsSouls::IsSupportedTitle(""),
+            "another title enabled the profile");
     VulkanHarness vulkan;
     vulkan.CheckStreamingCompute(true);
     return 0;
