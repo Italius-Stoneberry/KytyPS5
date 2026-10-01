@@ -67,6 +67,7 @@ void EmitMemoryOffsets(EmitterState& state) {
 	for (uint32_t i = 0; i < state.program.bindings.buffer_word_count; i++) {
 		state.buffer_words[i] = EmitShaderDataDwordLoad(state, state.program.bindings.BufferWordDword() + i);
 	}
+	EmitRuntimeFormats(state);
 }
 
 uint32_t RuntimeBufferWord(const EmitterState& state, const IR::MemoryInfo& mem) {

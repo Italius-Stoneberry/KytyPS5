@@ -360,6 +360,20 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
+// A buffer's runtime format (IR::BufferWord fields; spirvEmitterMemory.cpp), decoded once at the entry.
+struct RuntimeFormat {
+	uint32_t word         = 0;
+	uint32_t layout       = 0;
+	uint32_t type         = 0; // Format::ComponentType
+	uint32_t packed       = 0; // bool: a packed bit-field layout
+	uint32_t count        = 0; // components
+	uint32_t log_bytes    = 0; // log2 of a byte-aligned layout's component bytes
+	uint32_t packed_shift = 0; // a packed layout's component bit offsets, a byte each
+	uint32_t packed_bits  = 0; // and widths
+	uint32_t one          = 0; // the value of dst_sel 1 for this type
+	uint32_t is_signed    = 0; // bool: Sint, Snorm or Sscaled (the even types)
+};
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -376,6 +390,7 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> buffer_words {}; // IR::BufferWord, when used
+	std::array<RuntimeFormat, IR::ShaderInfo::MaxBuffers> runtime_formats {}; // by buffer word
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -671,6 +686,9 @@ void EmitMemoryOffsets(EmitterState& state);
 
 // The buffer word (IR::BufferWord) of a buffer access's resource, loaded at function entry.
 uint32_t RuntimeBufferWord(const EmitterState& state, const IR::MemoryInfo& mem);
+
+// At function entry: the runtime formats of the buffers that decode theirs (spirvEmitterMemory.cpp).
+void EmitRuntimeFormats(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 uint32_t LdsStorageDwordCount(const EmitterState& state);

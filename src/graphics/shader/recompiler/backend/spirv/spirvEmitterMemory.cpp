@@ -504,35 +504,62 @@ uint32_t EmitSwitchValue(EmitterState& state, uint32_t type, uint32_t selector, 
 	return phi_words[2];
 }
 
-struct RuntimeFormat {
-	uint32_t word      = 0;
-	uint32_t layout    = 0;
-	uint32_t type      = 0; // Format::ComponentType
-	uint32_t packed    = 0; // bool: a packed bit-field layout
-	uint32_t count     = 0; // components
-	uint32_t log_bytes = 0; // log2 of a byte-aligned layout's component bytes
-};
-
 uint32_t WordField(EmitterState& state, uint32_t word, uint32_t shift, uint32_t bits) {
 	return EmitAndConstant(state, EmitShiftRightConstant(state, word, shift), (1u << bits) - 1u);
 }
 
-RuntimeFormat LoadRuntimeFormat(EmitterState& state, const IR::MemoryInfo& mem) {
-	RuntimeFormat format;
-	format.word   = RuntimeBufferWord(state, mem);
-	format.layout = WordField(state, format.word, IR::BufferWord::LayoutShift, 4);
-	format.type   = WordField(state, format.word, IR::BufferWord::TypeShift, 3);
-	format.packed =
-	    EmitCompareU32Constant(state, OpUGreaterThanEqual, format.layout, IR::BufferWord::PackedLayouts);
-	// 11_11_10 and 10_11_11 have three components, 2_10_10_10 and 10_10_10_2 four.
-	const auto packed_count = Select(
-	    state, TypeU32(state),
-	    EmitCompareU32Constant(state, OpULessThan, format.layout, IR::BufferWord::PackedLayouts + 2u),
-	    ConstantU32(state, 3), ConstantU32(state, 4));
-	format.count     = Select(state, TypeU32(state), format.packed, packed_count,
-	                          EmitAddU32(state, EmitAndConstant(state, format.layout, 3), ConstantU32(state, 1)));
-	format.log_bytes = EmitShiftRightConstant(state, format.layout, 2);
-	return format;
+// A packed layout's table (a byte per component), by layout: 11_11_10, 10_11_11, 2_10_10_10, 10_10_10_2.
+uint32_t PackedLayoutTable(EmitterState& state, uint32_t layout, const std::array<uint32_t, 4>& tables) {
+	auto value = ConstantU32(state, tables[3]);
+	for (uint32_t index = 3; index-- > 0;) {
+		value = Select(state, TypeU32(state),
+		               EmitCompareU32Constant(state, OpIEqual, layout, IR::BufferWord::PackedLayouts + index),
+		               ConstantU32(state, tables[index]), value);
+	}
+	return value;
+}
+
+} // namespace
+
+// Once per buffer at the entry, instead of again at each component of each formatted load (a shader with
+// hundreds of formatted loads compiled for minutes).
+void EmitRuntimeFormats(EmitterState& state) {
+	const auto* descriptor = IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::Buffers);
+	if (descriptor == nullptr) return;
+	for (uint32_t index = 0; index < state.program.bindings.buffer_word_count && index < descriptor->resources.size();
+	     index++) {
+		const auto resource = descriptor->resources[index];
+		if (resource >= state.program.info.buffers.size()) continue;
+		const auto& buffer = state.program.info.buffers[resource];
+		if (!IR::RuntimeBufferFormat(buffer) || buffer.descriptor_format != Prospero::BufferFormat::kInvalid) continue;
+		auto& format  = state.runtime_formats[index];
+		format.word   = state.buffer_words[index];
+		format.layout = WordField(state, format.word, IR::BufferWord::LayoutShift, 4);
+		format.type   = WordField(state, format.word, IR::BufferWord::TypeShift, 3);
+		format.packed =
+		    EmitCompareU32Constant(state, OpUGreaterThanEqual, format.layout, IR::BufferWord::PackedLayouts);
+		// 11_11_10 and 10_11_11 have three components, 2_10_10_10 and 10_10_10_2 four.
+		const auto packed_count = Select(
+		    state, TypeU32(state),
+		    EmitCompareU32Constant(state, OpULessThan, format.layout, IR::BufferWord::PackedLayouts + 2u),
+		    ConstantU32(state, 3), ConstantU32(state, 4));
+		format.count = Select(state, TypeU32(state), format.packed, packed_count,
+		                      EmitAddU32(state, EmitAndConstant(state, format.layout, 3), ConstantU32(state, 1)));
+		format.log_bytes    = EmitShiftRightConstant(state, format.layout, 2);
+		format.packed_shift = PackedLayoutTable(state, format.layout, {0x00160b00u, 0x00150a00u, 0x160c0200u, 0x1e140a00u});
+		format.packed_bits  = PackedLayoutTable(state, format.layout, {0x000a0b0bu, 0x000b0b0au, 0x0a0a0a02u, 0x020a0a0au});
+		const auto integer  = EmitLogicalOrBool(
+            state, EmitCompareU32Constant(state, OpIEqual, format.type, uint32_t(Format::ComponentType::Uint)),
+            EmitCompareU32Constant(state, OpIEqual, format.type, uint32_t(Format::ComponentType::Sint)));
+		format.one = Select(state, TypeU32(state), integer, ConstantU32(state, 1), ConstantU32(state, 0x3f800000u));
+		format.is_signed = EmitCompareU32Constant(state, OpIEqual, EmitAndConstant(state, format.type, 1), 0);
+	}
+}
+
+namespace {
+
+const RuntimeFormat& LoadRuntimeFormat(EmitterState& state, const IR::MemoryInfo& mem) {
+	return state.runtime_formats[ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource)];
 }
 
 // dst_sel of an output component: 0 zero, 1 one, 4-7 a memory component (2 and 3 reserved).
@@ -544,13 +571,6 @@ uint32_t RuntimeSelector(EmitterState& state, const RuntimeFormat& format, uint3
 // element's components before the swizzle.
 uint32_t RuntimeSourceComponent(EmitterState& state, const RuntimeFormat& format, uint32_t selector) {
 	return Binary(state, OpUMod, TypeU32(state), EmitAndConstant(state, selector, 3), format.count);
-}
-
-uint32_t RuntimeOneBits(EmitterState& state, const RuntimeFormat& format) {
-	const auto integer = EmitLogicalOrBool(
-	    state, EmitCompareU32Constant(state, OpIEqual, format.type, uint32_t(Format::ComponentType::Uint)),
-	    EmitCompareU32Constant(state, OpIEqual, format.type, uint32_t(Format::ComponentType::Sint)));
-	return Select(state, TypeU32(state), integer, ConstantU32(state, 1), ConstantU32(state, 0x3f800000u));
 }
 
 // The byte address of a buffer access with `extra` bytes added to its offset operand (as the
@@ -582,23 +602,16 @@ RuntimeComponent LocateRuntimeComponent(ValueEmitContext& ctx, const IR::Inst& i
 	// Byte-aligned layouts: components of 1, 2 or 4 bytes, one after another.
 	const auto aligned_offset = Binary(state, OpShiftLeftLogical, TypeU32(state), component, format.log_bytes);
 	const auto aligned_bits   = Binary(state, OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 8), format.log_bytes);
-	// Packed layouts: bit fields of one dword, by layout (12-15) a byte per component.
-	const auto by_layout = [&](std::array<uint32_t, 4> tables) {
-		auto value = ConstantU32(state, tables[3]);
-		for (uint32_t layout = 3; layout-- > 0;) {
-			value = Select(state, TypeU32(state),
-			               EmitCompareU32Constant(state, OpIEqual, format.layout,
-			                                      IR::BufferWord::PackedLayouts + layout),
-			               ConstantU32(state, tables[layout]), value);
-		}
+	// Packed layouts: bit fields of one dword, a byte per component in the layout's table.
+	const auto by_layout = [&](uint32_t table) {
 		return EmitAndConstant(state,
-		                       Binary(state, OpShiftRightLogical, TypeU32(state), value,
+		                       Binary(state, OpShiftRightLogical, TypeU32(state), table,
 		                              Binary(state, OpShiftLeftLogical, TypeU32(state), component,
 		                                     ConstantU32(state, 3))),
 		                       0xffu);
 	};
-	const auto packed_shift = by_layout({0x00160b00u, 0x00150a00u, 0x160c0200u, 0x1e140a00u});
-	const auto packed_bits  = by_layout({0x000a0b0bu, 0x000b0b0au, 0x0a0a0a02u, 0x020a0a0au});
+	const auto packed_shift = by_layout(format.packed_shift);
+	const auto packed_bits  = by_layout(format.packed_bits);
 
 	RuntimeComponent located;
 	located.address = BufferAddressPlus(ctx, inst, mem,
@@ -618,11 +631,14 @@ RuntimeComponent LocateRuntimeComponent(ValueEmitContext& ctx, const IR::Inst& i
 	return located;
 }
 
-// The component's value in its dword, converted as its format says (NormalizeFormatComponent).
+// The component's value in its dword, converted as its format says (NormalizeFormatComponent). Every
+// conversion is computed and the format's picked: branches per component made the portable module of a
+// shader with hundreds of formatted loads tens of thousands of blocks (minutes to compile), and only a
+// first encounter runs it (the next start compiles the specialized module).
 uint32_t DecodeRuntimeComponent(EmitterState& state, const RuntimeFormat& format,
                                 const RuntimeComponent& located, uint32_t dword) {
 	using Format::ComponentType;
-	// Its bits, zero- or sign-extended (Sint, Snorm and Sscaled are the even types).
+	// Its bits, zero- or sign-extended.
 	const auto unused  = Binary(state, OpISub, TypeU32(state), ConstantU32(state, 32), located.bits);
 	const auto shifted = Binary(state, OpShiftLeftLogical, TypeU32(state),
 	                            Binary(state, OpShiftRightLogical, TypeU32(state), dword, located.shift), unused);
@@ -631,53 +647,38 @@ uint32_t DecodeRuntimeComponent(EmitterState& state, const RuntimeFormat& format
 	    Binary(state, OpShiftRightArithmetic, TypeI32(state), Unary(state, OpBitcast, TypeI32(state), shifted),
 	           unused));
 	const auto zero_extended = Binary(state, OpShiftRightLogical, TypeU32(state), shifted, unused);
-	const auto is_signed =
-	    EmitCompareU32Constant(state, OpIEqual, EmitAndConstant(state, format.type, 1), 0);
-	const auto raw = Select(state, TypeU32(state), is_signed, sign_extended, zero_extended);
+	const auto raw = Select(state, TypeU32(state), format.is_signed, sign_extended, zero_extended);
 	const auto max_value = [&](uint32_t all_ones) {
 		return Unary(state, OpConvertUToF, TypeF32(state),
 		             Binary(state, OpShiftRightLogical, TypeU32(state), ConstantU32(state, all_ones), unused));
 	};
 	const auto float_bits = [&](uint32_t value) { return EmitBitcastF32ToU32(state, value); };
-	return EmitSwitchValue(
-	    state, TypeU32(state), format.type,
-	    {
-	        {uint32_t(ComponentType::Unorm),
-	         [&] {
-		         return float_bits(Binary(state, OpFDiv, TypeF32(state),
-		                                  Unary(state, OpConvertUToF, TypeF32(state), raw), max_value(0xffffffffu)));
-	         }},
-	        {uint32_t(ComponentType::Snorm),
-	         [&] {
-		         const auto normalized =
-		             Binary(state, OpFDiv, TypeF32(state),
-		                    Unary(state, OpConvertSToF, TypeF32(state), EmitTBufferBitcastU32ToI32(state, raw)),
-		                    max_value(0x7fffffffu));
-		         const auto clamped = state.builder.AllocateId();
-		         state.builder.AddFunction({OpExtInst, TypeF32(state), clamped, GlslStd450(state), GlslFMax,
-		                                    normalized, ConstantF32Value(state, -1.0f)});
-		         return float_bits(clamped);
-	         }},
-	        {uint32_t(ComponentType::Uscaled),
-	         [&] { return float_bits(Unary(state, OpConvertUToF, TypeF32(state), raw)); }},
-	        {uint32_t(ComponentType::Sscaled),
-	         [&] {
-		         return float_bits(
-		             Unary(state, OpConvertSToF, TypeF32(state), EmitTBufferBitcastU32ToI32(state, raw)));
-	         }},
-	        {uint32_t(ComponentType::Float),
-	         [&] {
-		         return EmitSwitchValue(
-		             state, TypeU32(state), located.bits,
-		             {
-		                 {16u, [&] { return EmitBitcastF32ToU32(state, EmitF16BitsToF32(state, raw)); }},
-		                 {11u, [&] { return EmitUFloatToF32Bits(state, raw, 11); }},
-		                 {10u, [&] { return EmitUFloatToF32Bits(state, raw, 10); }},
-		             },
-		             [&] { return raw; });
-	         }},
-	    },
-	    [&] { return raw; });
+	const auto unorm      = float_bits(Binary(state, OpFDiv, TypeF32(state),
+	                                          Unary(state, OpConvertUToF, TypeF32(state), raw), max_value(0xffffffffu)));
+	const auto normalized =
+	    Binary(state, OpFDiv, TypeF32(state),
+	           Unary(state, OpConvertSToF, TypeF32(state), EmitTBufferBitcastU32ToI32(state, raw)), max_value(0x7fffffffu));
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction({OpExtInst, TypeF32(state), clamped, GlslStd450(state), GlslFMax, normalized,
+	                           ConstantF32Value(state, -1.0f)});
+	const auto snorm   = float_bits(clamped);
+	const auto uscaled = float_bits(Unary(state, OpConvertUToF, TypeF32(state), raw));
+	const auto sscaled = float_bits(Unary(state, OpConvertSToF, TypeF32(state), EmitTBufferBitcastU32ToI32(state, raw)));
+	const auto pick    = [&](uint32_t condition, uint32_t value, uint32_t otherwise) {
+		return Select(state, TypeU32(state), condition, value, otherwise);
+	};
+	const auto bits_are = [&](uint32_t bits) { return EmitCompareU32Constant(state, OpIEqual, located.bits, bits); };
+	auto       floating = pick(bits_are(10u), EmitUFloatToF32Bits(state, raw, 10), raw);
+	floating            = pick(bits_are(11u), EmitUFloatToF32Bits(state, raw, 11), floating);
+	floating            = pick(bits_are(16u), EmitBitcastF32ToU32(state, EmitF16BitsToF32(state, raw)), floating);
+	const auto type_is  = [&](ComponentType type) {
+		return EmitCompareU32Constant(state, OpIEqual, format.type, uint32_t(type));
+	};
+	auto value = pick(type_is(ComponentType::Float), floating, raw);
+	value      = pick(type_is(ComponentType::Sscaled), sscaled, value);
+	value      = pick(type_is(ComponentType::Uscaled), uscaled, value);
+	value      = pick(type_is(ComponentType::Snorm), snorm, value);
+	return pick(type_is(ComponentType::Unorm), unorm, value);
 }
 
 // The value of an output component: its selector's constant, or its decoded memory component.
@@ -686,7 +687,7 @@ uint32_t SelectRuntimeOutput(EmitterState& state, const RuntimeFormat& format, u
 	const auto memory = EmitCompareU32Constant(state, OpUGreaterThanEqual, selector, 4);
 	const auto one    = EmitCompareU32Constant(state, OpIEqual, selector, 1);
 	return Select(state, TypeU32(state), memory, decoded,
-	              Select(state, TypeU32(state), one, RuntimeOneBits(state, format), ConstantU32(state, 0)));
+	              Select(state, TypeU32(state), one, format.one, ConstantU32(state, 0)));
 }
 
 // A single formatted load (FormattedLoadPrepared): each component's dword checked on its own, zero
