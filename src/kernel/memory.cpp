@@ -1096,11 +1096,25 @@ void MappedParts(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, 
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
-	if (!TryWriteBacking(vaddr, data, size)) {
-		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
+	if (TryWriteBacking(vaddr, data, size)) {
+		return;
 	}
+	// GPU results (readbacks, downloads) for memory the guest unmapped meanwhile have nowhere to
+	// go: the parts still mapped are written, and only a failure there is an error.
+	std::vector<std::pair<uint64_t, uint64_t>> parts;
+	MappedParts(vaddr, size, &parts);
+	uint64_t written = 0;
+	for (const auto& [address, bytes]: parts) {
+		if (!TryWriteBacking(address, static_cast<const uint8_t*>(data) + (address - vaddr), bytes)) {
+			EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     " (mapped part 0x%016" PRIx64 " size=0x%016" PRIx64 ")\n",
+			     vaddr, size, address, bytes);
+		}
+		written += bytes;
+	}
+	std::printf("Memory: GPU data for unmapped guest memory dropped, addr=0x%016" PRIx64 " size=0x%" PRIx64
+	            " (0x%" PRIx64 " bytes still mapped) caller=%p\n",
+	            vaddr, size, written, __builtin_return_address(0));
 }
 
 void InvalidateMemory(uint64_t vaddr, uint64_t size) {

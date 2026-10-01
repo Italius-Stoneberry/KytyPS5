@@ -12,6 +12,11 @@
 #if defined(__linux__)
 #include <execinfo.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 namespace Common {
@@ -28,7 +33,8 @@ RecoverableExitScope::~RecoverableExitScope() {
 	t_recoverable = false;
 }
 
-// The raw return addresses of a fatal error (resolve with addr2line against the executable).
+// The raw return addresses of a fatal error (resolve with addr2line against the executable;
+// Windows: llvm-symbolizer --obj=kyty_emulator.exe with the build's PDB next to it).
 static void WriteFatalBacktrace() {
 #if defined(__linux__)
 	void*     frames[48];
@@ -36,6 +42,12 @@ static void WriteFatalBacktrace() {
 	std::fflush(nullptr);
 	(void)!write(STDOUT_FILENO, "--- Backtrace ---\n", 18);
 	backtrace_symbols_fd(frames, count, STDOUT_FILENO);
+#elif defined(_WIN32)
+	void*      frames[48];
+	const auto count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+	std::printf("--- Backtrace --- (exe base %p)\n", static_cast<void*>(GetModuleHandleW(nullptr)));
+	for (USHORT i = 0; i < count; ++i) std::printf("  %p\n", frames[i]);
+	std::fflush(nullptr);
 #endif
 }
 
