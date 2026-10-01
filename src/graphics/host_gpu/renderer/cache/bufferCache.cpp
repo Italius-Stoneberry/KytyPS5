@@ -1521,7 +1521,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		               "map=%.1f\n",
 		               ms, static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size), path,
 		               at(1), at(2), at(3));
-    });
+    }, SlowLog::HitchThreshold());
 	DrainGuestReadback(vaddr, size);
 	marks[1] = Clock::now();
 	if (!GuestRange {vaddr, size}.Valid()) {

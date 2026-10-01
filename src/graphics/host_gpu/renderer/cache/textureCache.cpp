@@ -1357,7 +1357,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - plan_start).count() - ms,
 			            static_cast<unsigned long long>(info.data.address), static_cast<unsigned long long>(info.data.size),
 			            plan.regions.size(), plan.tiles.size(), static_cast<unsigned long long>(plan.LinearSize()));
-		});
+		}, SlowLog::HitchThreshold());
 		if (!plan.valid) {
 			EXIT("TextureCache: invalid texture upload: binding=%u addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
@@ -1499,7 +1499,7 @@ void TextureCache::InitializeImage(ImageId id) {
 		               ms, static_cast<unsigned long long>(image.info.data.address),
 		               static_cast<unsigned long long>(image.info.data.size), image.info.resources.levels,
 		               image.info.resources.layers, kind, at(1), at(2), g_partial_fail);
-    });
+    }, SlowLog::HitchThreshold());
 	if (image.info.data.Empty()) {
 		return;
 	}
@@ -3095,7 +3095,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		            ms, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), slow_deleted,
 		            static_cast<unsigned long long>(slow_bytes), static_cast<unsigned long long>(slow_largest),
 		            static_cast<unsigned long long>(slow_largest_address), slow_partial);
-	});
+	}, SlowLog::HitchThreshold());
 	std::scoped_lock lock {m_lock};
 	const auto       end = address + size;
 	bool             erased_metadata = false;

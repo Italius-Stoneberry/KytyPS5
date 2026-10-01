@@ -295,7 +295,7 @@ bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferI
 	SlowLog::Scope slow([&](double ms) {
 		std::printf("SLOW TextureBuildGpuTileInfos %.1f ms tiled_size=0x%llx regions=%zu levels=%u tiles=%zu\n", ms,
 		            static_cast<unsigned long long>(tiled_size), regions.size(), levels, out_tile_infos.size());
-	});
+	}, SlowLog::HitchThreshold());
 	const auto& description    = layout.surface.description;
 	const bool  volume_texture = description.dimension == TileSurfaceDimension::Dim3D;
 	const auto  depth          = volume_texture ? description.depth : description.layers;

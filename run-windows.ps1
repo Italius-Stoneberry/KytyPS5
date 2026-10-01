@@ -214,6 +214,9 @@ if ($Precompile) {
 	if (!$environment.Contains('KYTY_SHADER_WARMUP_SECONDS')) { $environment['KYTY_SHADER_WARMUP_SECONDS'] = '60' }
 }
 if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
+# Stutters in the log: frames, shader translations and pipeline creations of 100 ms or more (SLOW lines;
+# what runs per frame or on a cache miss only, so nothing measurable).
+if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '100' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
 # -Set KEY=VALUE overrides a switch of the config; KEY= drops it. Several: -Set A=1,B=2 (a comma

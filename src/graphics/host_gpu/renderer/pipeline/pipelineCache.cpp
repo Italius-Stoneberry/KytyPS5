@@ -753,7 +753,7 @@ struct PipelineCache::ProgramCache {
 				std::printf("SLOW TranslateProgram %.1f ms %s hash=0x%016llx front=%.1f ms %s\n", ms, label,
 				            static_cast<unsigned long long>(params.hash), front_ms,
 				            known_program ? "specialization" : "program");
-			});
+			}, SlowLog::HitchThreshold());
 			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			if (entry == programs.end()) {
@@ -1984,7 +1984,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	SlowLog::Scope create_slow([&](double ms) {
 		std::printf("SLOW CreateGraphicsPipeline %.1f ms VS=%llu PS=%llu\n", ms,
 		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id));
-	});
+	}, SlowLog::HitchThreshold());
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
@@ -2050,7 +2050,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	SlowLog::Scope create_slow([&](double ms) {
 		std::printf("SLOW CreateComputePipeline %.1f ms CS=%llu\n", ms,
 		            static_cast<unsigned long long>(compute_program.id));
-	});
+	}, SlowLog::HitchThreshold());
 	auto cached = std::make_unique<Pipeline>();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
 	                       FirstBuild());

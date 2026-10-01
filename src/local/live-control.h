@@ -23,6 +23,7 @@
 #include "live-counters.h"
 #include "live-trace.h"
 #include "local-platform.h"
+#include "slow-log.h"
 #include "time-census.h"
 
 #include <algorithm>
@@ -65,8 +66,20 @@ inline uint64_t              g_samples[1u << 23];
 inline std::atomic<uint32_t> g_sample_count {0};
 inline std::atomic_bool      g_process {false};
 
+// Render thread. With KYTY_HITCH_LOG_MS (or KYTY_SLOW_LOG_MS), a frame (flip to flip) that long and
+// at least 50 ms is a SLOW line too, on the same TSC timeline: the hitch the slow calls before it explain.
 inline void Flip() {
 	g_flips.fetch_add(1, std::memory_order_relaxed);
+	if (SlowLog::HitchThreshold() > 0.0) {
+		static std::chrono::steady_clock::time_point last {};
+		const auto                                   now = std::chrono::steady_clock::now();
+		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(50.0, SlowLog::HitchThreshold())) {
+			std::printf("[tsc %llu] SLOW Frame %.1f ms\n", static_cast<unsigned long long>(__rdtsc()), ms);
+			std::fflush(stdout);
+		}
+		last = now;
+	}
 }
 
 inline double ThreadCpuSeconds(uint64_t thread) {

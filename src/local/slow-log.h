@@ -3,6 +3,9 @@
 // takes longer than KYTY_SLOW_LOG_MS (default off). The hitches of the walk route (hundreds of
 // milliseconds in one texture lookup, page-watcher update or tile setup) are single calls; the
 // line names the resource so the case can be reproduced.
+// KYTY_HITCH_LOG_MS (run-windows.ps1: 100) covers only what runs once per frame or on a miss (frames,
+// shader translations, pipeline creations, image uploads, unmaps), cheap enough for every session: what
+// a stutter was. Without it they follow KYTY_SLOW_LOG_MS.
 
 #include <chrono>
 #include <cstdio>
@@ -20,17 +23,26 @@ inline double Threshold() {
 	return ms;
 }
 
+inline double HitchThreshold() {
+	static const double ms = [] {
+		const char* text = std::getenv("KYTY_HITCH_LOG_MS");
+		return text != nullptr ? std::atof(text) : Threshold();
+	}();
+	return ms;
+}
+
 // Calls report(elapsed_ms) on destruction when the scope took longer than the threshold.
 template <typename Report>
 class Scope {
 public:
-	explicit Scope(Report report): m_on(Threshold() > 0.0), m_report(std::move(report)) {
-		if (m_on) m_start = std::chrono::steady_clock::now();
+	explicit Scope(Report report, double threshold = Threshold())
+	    : m_threshold(threshold), m_report(std::move(report)) {
+		if (m_threshold > 0.0) m_start = std::chrono::steady_clock::now();
 	}
 	~Scope() {
-		if (!m_on) return;
+		if (m_threshold <= 0.0) return;
 		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - m_start).count();
-		if (ms >= Threshold()) {
+		if (ms >= m_threshold) {
 			// The TSC at the end of the call places the line on the live trace's timeline.
 			std::printf("[tsc %llu] ", static_cast<unsigned long long>(__rdtsc()));
 			m_report(ms);
@@ -41,7 +53,7 @@ public:
 	Scope& operator=(const Scope&) = delete;
 
 private:
-	bool                                  m_on;
+	double                                m_threshold;
 	Report                                m_report;
 	std::chrono::steady_clock::time_point m_start {};
 };
