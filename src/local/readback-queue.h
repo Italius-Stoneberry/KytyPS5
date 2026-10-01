@@ -140,6 +140,8 @@ public:
 		return value;
 	}
 
+	// GPU thread: the value of the last copy handed to this queue.
+	[[nodiscard]] uint64_t Submitted() const { return m_submitted; }
 	// Any thread.
 	[[nodiscard]] bool Done(uint64_t value) {
 		if (m_known.load(std::memory_order_acquire) >= value) return true;
