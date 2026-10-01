@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = Path(r'C:\Users\chenxiao\Documents\KytyPS5-pr500')
+REPO = Path(__file__).resolve().parents[3]
 CACHE_ROOT = REPO / '_PipelineCache' / 'warmup-v2'
 OUT = REPO / '_Build' / 're' / 'agent-warm'
 

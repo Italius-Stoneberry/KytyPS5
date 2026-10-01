@@ -35,7 +35,7 @@ import warmfile  # noqa: E402
 import xxh3  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
-GAME = Path(r'C:\Users\chenxiao\Documents\PPSA01341-app0')
+GAME = Path.home() / 'Documents' / 'PPSA01341-app0'  # precompile-windows.ps1's default too
 STATES = Path(__file__).with_name('pass-states.json')
 HOST_SUBGROUP_SIZE = 32  # SupportsComputeWave64() is false on the NVIDIA GPU
 LOD_STATS_SUBGROUP = 1   # fragment_subgroup_reduction on the same GPU
