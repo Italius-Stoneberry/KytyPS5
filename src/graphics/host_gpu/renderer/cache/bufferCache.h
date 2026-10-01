@@ -143,7 +143,7 @@ public:
 	}
 	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
 
-	void               RunGarbageCollector();
+	void               RunGarbageCollector(bool collect = true);
 
 private:
 	friend struct BufferCacheTestAccess;

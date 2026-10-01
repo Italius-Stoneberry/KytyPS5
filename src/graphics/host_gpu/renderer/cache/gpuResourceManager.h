@@ -53,8 +53,10 @@ public:
 	[[nodiscard]] bool UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept;
 
 	bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
-	void               RunGarbageCollector();
-	void               AdvanceFrame() noexcept { m_texture_cache.AdvanceFrame(); }
+	// After each completed submission: its shaders' fault records and the image downloads.
+	void               EndSubmission();
+	// Once per flip: the frame count and the garbage collection (its ages count frames).
+	void               AdvanceFrame();
 
 private:
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);
@@ -78,6 +80,7 @@ private:
 	GuestGpu*                 m_gpu = nullptr;
 	std::atomic<uint64_t> m_preparation_alias_epoch {uint64_t{1} << 32};
 	bool                      m_fault_process_pending = false;
+	bool                      m_bda_used              = false;
 };
 
 } // namespace Libs::Graphics

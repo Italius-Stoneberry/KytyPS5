@@ -7,6 +7,7 @@
 #include <bit>
 #include <chrono>
 #include <optional>
+#include <utility>
 #include <x86intrin.h>
 
 #include "common/assert.h"
@@ -241,6 +242,7 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 		// KYTY_BDA_DIRTY_REGIONS: only regions whose bit is set can hold a stale request.
 		for (const auto range : ranges) SynchronizeDirtyBdaRegions(range);
 		m_fault_process_pending = true;
+		m_bda_used              = true;
 		return true;
 	}
 	for (const auto range : ranges) {
@@ -250,6 +252,7 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 			m_buffer_cache.SynchronizeRegionRequest(*it);
 	}
 	m_fault_process_pending = true;
+	m_bda_used              = true;
 	return true;
 }
 
@@ -287,16 +290,26 @@ void GpuResourceManager::PrepareBda() {
 	RefreshBdaRanges();
 	for (auto& request : m_bda_region_requests) m_buffer_cache.SynchronizeRegionRequest(request);
 	m_fault_process_pending = true;
+	m_bda_used              = true;
 }
 
-void GpuResourceManager::RunGarbageCollector() {
+void GpuResourceManager::EndSubmission() {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+}
+
+void GpuResourceManager::AdvanceFrame() {
+	m_texture_cache.AdvanceFrame();
+	// Collection runs per frame: per submission (dozens a frame here) its ages of 16 to 160 ticks
+	// were a few frames, and it deleted what the next frames used again.
 	m_texture_cache.RunGarbageCollector();
-	m_buffer_cache.RunGarbageCollector();
+	// A shader that reads guest memory through the BDA page table touches no buffer in the LRU: a
+	// buffer collected under it faults back at once, and each registration invalidates every BDA
+	// region proof. Buffers are collected only after a frame without such shaders.
+	m_buffer_cache.RunGarbageCollector(!std::exchange(m_bda_used, false));
 }
 
 } // namespace Libs::Graphics

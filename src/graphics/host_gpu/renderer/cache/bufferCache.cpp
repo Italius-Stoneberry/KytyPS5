@@ -1755,8 +1755,11 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
-void BufferCache::RunGarbageCollector() {
+void BufferCache::RunGarbageCollector(bool collect) {
 	const auto tick = m_gc_tick++;
+	if (!collect) {
+		return;
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -1818,8 +1821,9 @@ void BufferCache::RunGarbageCollector() {
 			EXIT("BufferCache: garbage collection retained GPU ownership\n");
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
-		Unregister(id);
-		m_slot_buffers.erase(id);
+		// Freed once the GPU is done with it: a download on the readback queue (KYTY_READBACK_QUEUE)
+		// waits only for the last write, not for the reads in flight or the commands recorded so far.
+		DeleteBuffer(id);
 	}
 }
 

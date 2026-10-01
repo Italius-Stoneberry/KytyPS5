@@ -5219,10 +5219,17 @@ public:
                   !cache.IsRegionRegistered(
                       base + starvation_offset +
                           (starvation_count - 1) * starvation_stride,
-                      sizeof(starvation_value)) &&
-                  !BufferCacheTestAccess::IsBufferAllocated(
-                      cache, starvation_retired),
-              "critical GC did not immediately free the skipped dirty owners");
+                      sizeof(starvation_value)),
+              "critical GC did not immediately retire the skipped dirty owners");
+      // A download on the readback queue waits only for the last write: commands recorded before
+      // the retirement may still read the owner, so it is freed once the GPU is done.
+      Require(name, "critical-GC deferred free",
+              BufferCacheTestAccess::IsBufferAllocated(cache, starvation_retired),
+              "critical GC freed a dirty owner before the GPU was done with it");
+      scheduler.Finish();
+      Require(name, "critical-GC free after completion",
+              !BufferCacheTestAccess::IsBufferAllocated(cache, starvation_retired),
+              "a retired dirty owner outlived the GPU work recorded before it");
 
       constexpr uint64_t lookup_only_offset = 0x218000;
       constexpr uint64_t obtained_offset = 0x220000;

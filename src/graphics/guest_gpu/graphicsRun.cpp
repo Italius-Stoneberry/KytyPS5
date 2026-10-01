@@ -708,11 +708,11 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			if (progressed) {
 				if (complete) {
-					m_renderer.GetGpuResources().RunGarbageCollector();
+					m_renderer.GetGpuResources().EndSubmission();
 				}
 				cp.BufferFlush();
 			} else if (complete) {
-				m_renderer.GetGpuResources().RunGarbageCollector();
+				m_renderer.GetGpuResources().EndSubmission();
 			}
 			break;
 		}
@@ -734,17 +734,17 @@ bool GuestGpu::Process(Submission& submission) {
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
-					m_renderer.GetGpuResources().RunGarbageCollector();
+					m_renderer.GetGpuResources().EndSubmission();
 				}
 				cp.BufferFlush();
 			} else if (complete) {
-				m_renderer.GetGpuResources().RunGarbageCollector();
+				m_renderer.GetGpuResources().EndSubmission();
 			}
 			break;
 		}
 		case SubmissionType::FlipPreparation:
+			m_renderer.GetGpuResources().EndSubmission();
 			m_renderer.GetGpuResources().AdvanceFrame();
-			m_renderer.GetGpuResources().RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 		case SubmissionType::FrameBoundary: EXIT("frame boundary already handled\n");
