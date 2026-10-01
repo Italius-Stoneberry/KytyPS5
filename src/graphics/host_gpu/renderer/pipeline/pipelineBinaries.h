@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -93,6 +94,13 @@ private:
 // The static precompile's output: pipelines' binaries, captured from pipelines created with
 // VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR or copied from another store; binaries shared by several
 // pipelines are kept once. Thread-safe.
+//
+// NVIDIA compresses binaries with a dictionary ("_NVDICT_" key) once a process has made a few hundred
+// pipelines, trained from them and kept in its disk cache; the driver then reads only binaries made with
+// the dictionary its own disk cache holds (the one among the binaries is not used): on another PC, or
+// after that cache changes, they are compiled again. Such captures are left out: the precompile runs
+// small shards, each with an empty disk cache of its own (precompile-windows.ps1), and one that gets
+// there anyway is split.
 class PipelineBinaryWriter {
 public:
 	explicit PipelineBinaryWriter(vk::Device device): m_device(device) {}
@@ -107,21 +115,36 @@ public:
 	// Written whole to a temporary file renamed to `path`.
 	bool Save(const std::filesystem::path& path, const std::string& signature) const;
 	[[nodiscard]] size_t Pipelines() const;
+	// Pipelines copied from another store, captured (compiled, or from a static cache's hit), and left out
+	// (compressed with NVIDIA's dictionary).
+	[[nodiscard]] size_t Copied() const { return m_copied.load(std::memory_order_relaxed); }
+	[[nodiscard]] size_t Captured() const { return m_captured.load(std::memory_order_relaxed); }
+	[[nodiscard]] size_t LeftOut() const { return m_left_out.load(std::memory_order_relaxed); }
 
 private:
 	struct Binary {
 		PipelineBinaries::Key   key;
+		uint64_t                hash = 0;        // XXH3 of the data: keys alone are not unique (see AddBinary)
 		std::vector<uint8_t>    data;            // captured, or
 		const PipelineBinaries* from  = nullptr; // copied: that store's binary
 		uint32_t                index = 0;
+	};
+	struct BinaryId {
+		PipelineBinaries::Key key;
+		uint64_t              hash = 0;
+		bool operator==(const BinaryId& other) const { return hash == other.hash && key == other.key; }
+	};
+	struct BinaryIdHash {
+		size_t operator()(const BinaryId& id) const { return PipelineBinaries::KeyHash {}(id.key) ^ id.hash; }
 	};
 	uint32_t AddBinary(Binary binary);
 
 	vk::Device                                                                  m_device;
 	mutable std::mutex                                                          m_mutex;
 	std::vector<Binary>                                                         m_binaries;
-	std::unordered_map<PipelineBinaries::Key, uint32_t, PipelineBinaries::KeyHash> m_binary_index;
+	std::unordered_map<BinaryId, uint32_t, BinaryIdHash>                        m_binary_index;
 	std::unordered_map<PipelineBinaries::Key, std::vector<uint32_t>, PipelineBinaries::KeyHash> m_pipelines;
+	std::atomic<size_t> m_copied {0}, m_captured {0}, m_left_out {0};
 };
 
 } // namespace Libs::Graphics

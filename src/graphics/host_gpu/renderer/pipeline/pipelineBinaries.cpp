@@ -226,12 +226,21 @@ PipelineBinaries::Handles PipelineBinaries::Load(const Key& key) const {
 	return handles;
 }
 
+// Kept once per key and content: a key alone is not unique (NVIDIA's compression dictionary has one key
+// whatever its content).
 uint32_t PipelineBinaryWriter::AddBinary(Binary binary) {
-	if (const auto found = m_binary_index.find(binary.key); found != m_binary_index.end()) return found->second;
+	const BinaryId id {binary.key, binary.hash};
+	if (const auto found = m_binary_index.find(id); found != m_binary_index.end()) return found->second;
 	const auto index = static_cast<uint32_t>(m_binaries.size());
-	m_binary_index.emplace(binary.key, index);
+	m_binary_index.emplace(id, index);
 	m_binaries.push_back(std::move(binary));
 	return index;
+}
+
+static bool IsDictionary(const PipelineBinaries::Key& key) {
+	static constexpr char tag[] = "_NVDICT_";
+	return std::search(key.bytes.begin(), key.bytes.begin() + key.size, tag, tag + sizeof(tag) - 1) !=
+	       key.bytes.begin() + key.size;
 }
 
 bool PipelineBinaryWriter::Capture(const PipelineBinaries::Key& key, vk::Pipeline pipeline, const void* create_info) {
@@ -276,25 +285,37 @@ bool PipelineBinaryWriter::Capture(const PipelineBinaries::Key& key, vk::Pipelin
 			return false;
 		}
 		out.data.resize(size);
-		out.key = KeyOf(binary_key);
+		out.key  = KeyOf(binary_key);
+		out.hash = XXH3_64bits(out.data.data(), out.data.size());
 		binaries.push_back(std::move(out));
+	}
+	if (std::any_of(binaries.begin(), binaries.end(), [](const Binary& binary) { return IsDictionary(binary.key); })) {
+		if (m_left_out.fetch_add(1, std::memory_order_relaxed) == 0) {
+			std::printf("Pipeline binaries: the driver compresses with its dictionary from here on (after %zu captured, "
+			            "%zu created from a store); the rest is left out\n",
+			            m_captured.load(), m_copied.load());
+		}
+		return true;
 	}
 	std::lock_guard lock(m_mutex);
 	auto&           refs = m_pipelines[key];
 	refs.clear();
 	for (auto& binary: binaries) refs.push_back(AddBinary(std::move(binary)));
+	m_captured.fetch_add(1, std::memory_order_relaxed);
 	return true;
 }
 
 void PipelineBinaryWriter::Copy(const PipelineBinaries::Key& key, const PipelineBinaries& from) {
 	const auto found = from.m_pipelines.find(key);
 	if (found == from.m_pipelines.end()) return;
+	m_copied.fetch_add(1, std::memory_order_relaxed);
 	std::lock_guard lock(m_mutex);
 	auto&           refs = m_pipelines[key];
 	refs.clear();
 	for (uint32_t i = 0; i < found->second.count; i++) {
 		const auto index = from.m_refs[found->second.first + i];
-		refs.push_back(AddBinary({.key = from.m_binaries[index].key, .from = &from, .index = index}));
+		const auto& binary = from.m_binaries[index];
+		refs.push_back(AddBinary({.key = binary.key, .hash = binary.hash, .from = &from, .index = index}));
 	}
 }
 
@@ -309,6 +330,8 @@ size_t PipelineBinaryWriter::Pipelines() const {
 
 bool PipelineBinaryWriter::Save(const std::filesystem::path& file_path, const std::string& signature) const {
 	std::lock_guard lock(m_mutex);
+	std::error_code error;
+	std::filesystem::create_directories(file_path.parent_path(), error);
 	std::ofstream   file(file_path, std::ios::binary | std::ios::trunc);
 	const auto      signature_size = static_cast<uint32_t>(signature.size());
 	file.write(Magic, sizeof(Magic));
@@ -316,10 +339,21 @@ bool PipelineBinaryWriter::Save(const std::filesystem::path& file_path, const st
 	file.write(signature.data(), static_cast<std::streamsize>(signature.size()));
 	uint64_t    offset = sizeof(Magic) + sizeof(signature_size) + signature.size();
 	std::string tables;
-	Put(tables, static_cast<uint32_t>(m_binaries.size()));
+	// Only binaries a pipeline uses: one captured or copied again leaves its earlier ones unused.
+	std::vector<uint32_t> renumbered(m_binaries.size(), UINT32_MAX);
+	std::vector<uint32_t> used;
+	for (const auto& [key, list]: m_pipelines) {
+		for (const auto ref: list) {
+			if (renumbered[ref] != UINT32_MAX) continue;
+			renumbered[ref] = static_cast<uint32_t>(used.size());
+			used.push_back(ref);
+		}
+	}
+	Put(tables, static_cast<uint32_t>(used.size()));
 	std::vector<uint8_t> copied;
-	for (const auto& binary: m_binaries) {
-		const auto* data = &binary.data;
+	for (const auto ref: used) {
+		const auto& binary = m_binaries[ref];
+		const auto* data   = &binary.data;
 		if (binary.from != nullptr) {
 			if (!binary.from->ReadData(binary.from->m_binaries[binary.index], copied)) return false;
 			data = &copied;
@@ -337,7 +371,7 @@ bool PipelineBinaryWriter::Save(const std::filesystem::path& file_path, const st
 		PutKey(tables, key);
 		Put(tables, static_cast<uint32_t>(refs.size()));
 		Put(tables, static_cast<uint32_t>(list.size()));
-		refs.insert(refs.end(), list.begin(), list.end());
+		for (const auto ref: list) refs.push_back(renumbered[ref]);
 	}
 	Put(tables, static_cast<uint32_t>(refs.size()));
 	for (const auto ref: refs) Put(tables, ref);

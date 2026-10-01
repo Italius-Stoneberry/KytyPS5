@@ -116,7 +116,7 @@ static void PortableIndirectTables(const ShaderRecompiler::IR::Program&         
 // into the static pipeline cache, or a shard's (every n-th compute seed and graphics recipe) into a
 // cache of its own next to it. What was compiled can be written as a warmup file (args.out), to
 // compare with what the game compiles.
-bool PipelineCache::WarmSeeds(const PrecompileOptions& args) {
+bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	std::vector<std::vector<uint32_t>> seed_words, recipe_words;
 	if (!LocalShaderWarmup::Cache::ReadSeeds(args.seeds, seed_words, recipe_words)) {
 		PipelineCacheLog("Shader seeds: cannot read {}", Common::PathToString(args.seeds));
@@ -268,7 +268,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args) {
 	// Pipelines into the static cache, or a share's into a cache of its own; the objects themselves
 	// are not kept. The static cache is looked up first (CreatePipelineInternal): a rerun compiles
 	// only what it misses. With pipeline binaries every pipeline's binaries go to a shard file
-	// (.shard<i>, merged by --merge --prune), copied from the store when it holds them, else captured
+	// (.shard<i>of<n>, merged by --merge --prune), copied from the store when it holds them, else captured
 	// (from the static cache, else compiled through a cache of the shard's own).
 	const bool                            binaries = create_pipelines && m_graphics.pipeline_binaries_enabled;
 	std::unique_ptr<PipelineBinaryWriter> writer;
@@ -282,7 +282,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args) {
 		if (m_graphics.device.createPipelineCache(&info, nullptr, &target) != vk::Result::eSuccess) target = nullptr;
 	}
 	auto target_file = binaries ? StaticBinariesPath() : StaticCachePath();
-	if (shards > 1 || binaries) target_file += fmt::format(".shard{}", shard);
+	if (shards > 1 || binaries) target_file += fmt::format(".shard{}of{}", shard, shards);
 	const auto save = [&] {
 		if (!binaries) return SaveStaticCache(target, target_file);
 		auto temporary = target_file;
@@ -290,7 +290,9 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args) {
 		std::error_code error;
 		if (!writer->Save(temporary, StaticBinariesSignature(m_graphics))) return false;
 		std::filesystem::rename(temporary, target_file, error);
-		PipelineCacheLog("Static pipeline binaries: saved {} pipelines to {}", writer->Pipelines(),
+		PipelineCacheLog("Static pipeline binaries: saved {} pipelines ({} created from the store, {} captured, {} left "
+		                 "out) to {}",
+		                 writer->Pipelines(), writer->Copied(), writer->Captured(), writer->LeftOut(),
 		                 Common::PathToString(target_file));
 		return !error;
 	};
@@ -334,7 +336,8 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args) {
 	}
 	if (create_pipelines) {
 		parallel(seed_words.size() + recipes.size(), [&](size_t n) {
-			if (!mine(n)) return;
+			// Once binaries are left out, the rest would be too: for a smaller shard.
+			if (!mine(n) || (writer != nullptr && writer->LeftOut() != 0)) return;
 			if (n < seed_words.size()) {
 				if (stage_of(n) != ShaderType::Compute) return;
 				LocalShaderWarmup::Record input;
@@ -380,6 +383,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args) {
 	if (checkpoints.joinable()) checkpoints.join();
 
 	const bool saved_pipelines = !create_pipelines || ((target != nullptr || binaries) && save());
+	left_out                          = writer != nullptr ? writer->LeftOut() : 0;
 	m_graphics.pipeline_binary_writer = nullptr;
 	if (!args.timings.empty()) {
 		auto path = args.timings;
@@ -513,10 +517,10 @@ bool PipelineCache::SaveStaticCache(vk::PipelineCache cache, const std::filesyst
 	return !error;
 }
 
-bool PipelineCache::Precompile(GraphicContext& graphics, const PrecompileOptions& options) {
+bool PipelineCache::Precompile(GraphicContext& graphics, const PrecompileOptions& options, size_t& left_out) {
 	PipelineCache cache(graphics);
 	if (cache.m_static_cache == nullptr) cache.InitializeStaticCache(true);
-	return cache.WarmSeeds(options);
+	return cache.WarmSeeds(options, left_out);
 }
 
 // Both files are saved whole (a temporary file renamed), so their first line tells the GPU and driver.

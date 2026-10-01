@@ -5,7 +5,7 @@
 #                                         a driver that has VK_KHR_pipeline_binary (NVIDIA 5xx) the pipelines'
 #                                         binaries instead, <title>.binaries, read only when a pipeline is
 #                                         needed (the driver copies a whole .bin into memory: GBs)
-#   .\precompile-windows.ps1 -Jobs 8      with 8 processes (default: 3 threads each on the allowed CPUs)
+#   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 3 threads each on the allowed CPUs)
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
 #   .\precompile-windows.ps1 -InputsOnly  only the compiled inputs the emulator's shader prefetch
@@ -13,17 +13,21 @@
 #                                         every full run writes them too)
 # The NVIDIA driver compiles big compute shaders nearly one at a time per process, so the work is split
 # into shards, a below-normal-priority process each (kyty_shader_precompile --shard i/n), whose caches
-# are merged into the static cache at the end. An interrupted run resumes: the shards' checkpoints
-# (every ten minutes) are merged first, and what the static cache holds is not compiled again (binaries:
-# the final merge keeps only what this run's shards made, so pipelines no seed makes any more are dropped;
-# a .bin left from before is where the first binaries run takes them from without compiling). Build the
-# program with build-windows.cmd kyty_shader_precompile. A portable package (package-windows.ps1) has the
-# program, the seed file and launch.json next to this script (precompile.cmd).
+# are merged into the static cache at the end. The shards are small (-Shards, about 100 pipelines each):
+# after a few hundred pipelines NVIDIA compresses binaries with a dictionary of its own, which only that
+# PC reads (pipelineBinaries.h); a shard that got there anyway left the rest out (exit code 3) and runs
+# again as two. An interrupted run resumes: finished shards are merged first, and what the static cache
+# holds is not compiled again (binaries: the final merge keeps only what this run's shards made, so
+# pipelines no seed makes any more are dropped; a .bin left from before is where the first binaries run
+# takes them from without compiling). Build the program with build-windows.cmd kyty_shader_precompile.
+# A portable package (package-windows.ps1) has the program, the seed file and launch.json next to this
+# script (precompile.cmd).
 param(
 	[string]$Game = '',
 	[string]$Seeds = $(if (Test-Path "$PSScriptRoot\seeds.seeds") { "$PSScriptRoot\seeds.seeds" } else { "$PSScriptRoot\_Build\static-precompile\seeds.seeds" }),
 	[int]$Jobs = 0,
 	[int]$Threads = 3,
+	[int]$Shards = 512,
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
 	[switch]$Coverage,
 	[switch]$InputsOnly,
@@ -52,37 +56,37 @@ $cpus = 0
 for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $cpus++ } }
 # A process scales to a few threads (4: 85%), and each translates the programs its share needs.
 if ($Jobs -le 0) { $Jobs = [math]::Max(1, [math]::Ceiling($cpus / $Threads)) }
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logs = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\run-logs" } else { "$PSScriptRoot\logs" }
+$logs = "$logs\$stamp-precompile"
 $logName = $logs.Substring($PSScriptRoot.Length + 1)
 New-Item -ItemType Directory -Force $logs | Out-Null
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $begin = Get-Date
 
+# Each process gets an empty NVIDIA disk cache of its own (nothing trained yet), removed when it is done.
+$nvidiaCaches = Join-Path ([IO.Path]::GetTempPath()) "kyty-precompile-$stamp"
 function Start-Precompile([string]$name, [string[]]$arguments) {
+	$env:__GL_SHADER_DISK_CACHE_PATH = Join-Path $nvidiaCaches $name
+	New-Item -ItemType Directory -Force $env:__GL_SHADER_DISK_CACHE_PATH | Out-Null
 	$process = Start-Process -FilePath $Exe -ArgumentList (@('--game', "`"$Game`"") + $arguments) -NoNewWindow -PassThru `
-		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$stamp-precompile-$name.out.log" `
-		-RedirectStandardError "$logs\$stamp-precompile-$name.err.log"
+		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$name.out.log" -RedirectStandardError "$logs\$name.err.log"
 	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
 	$process.ProcessorAffinity = [IntPtr]$mask
 	$null = $process.Handle # keeps the exit code readable after the process ends
-	$process
+	$process | Add-Member NoteProperty NvidiaCache $env:__GL_SHADER_DISK_CACHE_PATH -PassThru
 }
-function Wait-Precompile([System.Diagnostics.Process[]]$processes, [string]$what) {
-	$shown = Get-Date
-	while (($left = @($processes | Where-Object { !$_.HasExited }).Count)) {
-		Start-Sleep -Seconds 1
-		if (((Get-Date) - $shown).TotalSeconds -lt 60) { continue }
-		$shown = Get-Date
-		Write-Host ("  {0:hh\:mm\:ss} {1}: {2} of {3} running" -f ((Get-Date) - $begin), $what, $left, $processes.Count)
-	}
-	$failed = @($processes | Where-Object { $_.ExitCode -ne 0 }).Count
-	if ($failed) { throw "$what`: $failed process(es) failed; logs: $logName\$stamp-precompile-*" }
+function Remove-NvidiaCache($process) { Remove-Item -Recurse -Force $process.NvidiaCache -ErrorAction SilentlyContinue }
+function Wait-Precompile($process, [string]$what) {
+	$process.WaitForExit()
+	Remove-NvidiaCache $process
+	if ($process.ExitCode -ne 0) { throw "$what failed; logs: $logName" }
 }
 
-Write-Host "precompile: $Seeds, $Jobs shards, affinity 0x$('{0:X}' -f $mask); logs $logName\$stamp-precompile-*"
+Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time, affinity 0x$('{0:X}' -f $mask); logs $logName"
+try {
 if ($Coverage) {
 	$out = [IO.Path]::ChangeExtension($Seeds, '.compiled.shaders')
-	Wait-Precompile @(Start-Precompile 'coverage' @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$cpus",
+	Wait-Precompile (Start-Precompile 'coverage' @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$cpus",
 		'--out', "`"$out`"")) 'coverage'
 	Write-Host "wrote $out"
 	return
@@ -91,18 +95,55 @@ if ($Coverage) {
 # without pipelines (half a minute).
 $inputs = @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$cpus", '--static-inputs')
 if ($InputsOnly) {
-	Wait-Precompile @(Start-Precompile 'inputs' $inputs) 'inputs'
+	Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
 	Write-Host 'wrote _PipelineCache\static\<title>.shaders'
 	return
 }
-# Checkpoints of an interrupted run first: what they hold is not compiled again.
-Wait-Precompile @(Start-Precompile 'merge-before' @('--merge')) 'merge'
-$workers = for ($i = 0; $i -lt $Jobs; $i++) {
-	Start-Precompile "shard$i" @('--seeds', "`"$Seeds`"", '--shard', "$i/$Jobs", '--threads', "$Threads")
+# The shards an interrupted run finished first: what they hold is not compiled again.
+Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
+$pending = [System.Collections.Generic.Queue[string]]::new()
+for ($i = 0; $i -lt $Shards; $i++) { $pending.Enqueue("$i/$Shards") }
+$running = @{}
+$finished = 0
+$split = 0
+$shown = Get-Date
+while ($pending.Count -or $running.Count) {
+	while ($pending.Count -and $running.Count -lt $Jobs) {
+		$shard = $pending.Dequeue()
+		$running[$shard] = Start-Precompile ('shard' + ($shard -replace '/', 'of')) @('--seeds', "`"$Seeds`"", '--shard', $shard, '--threads', "$Threads")
+	}
+	Start-Sleep -Milliseconds 250
+	foreach ($shard in @($running.Keys)) {
+		$process = $running[$shard]
+		if (!$process.HasExited) { continue }
+		$running.Remove($shard)
+		Remove-NvidiaCache $process
+		if ($process.ExitCode -eq 3) {
+			$i, $n = [int[]]($shard -split '/')
+			if ($n -ge 65536) { throw "shard $shard cannot be split further; logs: $logName" }
+			$pending.Enqueue("$i/$(2 * $n)")
+			$pending.Enqueue("$($i + $n)/$(2 * $n)")
+			$split++
+		} elseif ($process.ExitCode -ne 0) {
+			throw "shard $shard failed; logs: $logName"
+		} else {
+			$finished++
+		}
+	}
+	if (((Get-Date) - $shown).TotalSeconds -ge 60) {
+		$shown = Get-Date
+		Write-Host ("  {0:hh\:mm\:ss} shards: {1} done, {2} running, {3} waiting ({4} split)" -f ((Get-Date) - $begin), $finished,
+			$running.Count, $pending.Count, $split)
+	}
 }
-Wait-Precompile $workers 'shards'
-Wait-Precompile @(Start-Precompile 'merge' @('--merge', '--prune')) 'merge'
-Wait-Precompile @(Start-Precompile 'inputs' $inputs) 'inputs'
+Wait-Precompile (Start-Precompile 'merge' @('--merge', '--prune')) 'merge'
+Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
 $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\*.bin", "$PSScriptRoot\_PipelineCache\static\*.binaries" |
 	Sort-Object LastWriteTime | Select-Object -Last 1
-Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB)" -f ((Get-Date) - $begin), $cache.FullName, ($cache.Length / 1MB))
+Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB; {3} shards split)" -f ((Get-Date) - $begin), $cache.FullName, ($cache.Length / 1MB), $split)
+} finally {
+	# A failed shard ends the run: the others are stopped too.
+	if ($running) { foreach ($process in $running.Values) { if (!$process.HasExited) { $process.Kill(); $process.WaitForExit() } } }
+	$env:__GL_SHADER_DISK_CACHE_PATH = $null
+	Remove-Item -Recurse -Force $nvidiaCaches -ErrorAction SilentlyContinue
+}

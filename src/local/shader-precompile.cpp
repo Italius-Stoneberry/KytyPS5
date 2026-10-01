@@ -13,7 +13,9 @@
 // cache. Where the driver has VK_KHR_pipeline_binary the static cache is the pipelines' binaries instead
 // (_PipelineCache/static/<title>.binaries, read by the emulator when it needs a pipeline): every share
 // writes its pipelines' binaries to a shard file, and --merge --prune makes the store of the shards' alone
-// (what no seed makes any more is dropped; without --prune the store keeps its pipelines too). --out
+// (what no seed makes any more is dropped; without --prune the store keeps its pipelines too); exit code
+// 3: binaries were left out (the driver began compressing with its own dictionary), to be made by two
+// shards (2n) instead. --out
 // writes what was compiled as a warmup file, for precompile.py coverage; --static-inputs
 // writes it where the emulator's shader prefetch reads it (_PipelineCache/static/<title>.shaders);
 // --timings each pipeline's compile time (ms, SPIR-V words, the seeds' hashes). --status prints
@@ -114,9 +116,11 @@ int main(int argc, char* argv[]) {
 		std::fflush(nullptr);
 		std::_Exit(0);
 	}
-	const bool done =
-	    merge ? PipelineCache::MergePrecompileShards(graphics, prune) : PipelineCache::Precompile(graphics, options);
-	std::printf("Shader precompile: %s\n", done ? "complete" : "failed");
+	size_t     left_out = 0;
+	const bool done     = merge ? PipelineCache::MergePrecompileShards(graphics, prune)
+	                            : PipelineCache::Precompile(graphics, options, left_out);
+	std::printf("Shader precompile: %s\n", !done ? "failed" : left_out != 0 ? "partial" : "complete");
 	std::fflush(nullptr);
-	std::_Exit(done ? 0 : 1);
+	// 3: pipelines' binaries were left out (PipelineBinaryWriter): run this shard as two.
+	std::_Exit(!done ? 1 : left_out != 0 ? 3 : 0);
 }

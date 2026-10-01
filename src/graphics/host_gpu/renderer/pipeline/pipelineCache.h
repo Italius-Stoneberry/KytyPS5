@@ -136,7 +136,8 @@ public:
 		uint32_t              threads = 1;
 		bool                  pipelines = true;
 	};
-	static bool Precompile(GraphicContext& graphics, const PrecompileOptions& options);
+	// left_out: pipelines whose binaries were left out (PipelineBinaryWriter), for a smaller shard.
+	static bool Precompile(GraphicContext& graphics, const PrecompileOptions& options, size_t& left_out);
 	// The shader prefetch's inputs (--static-inputs) are this GPU's and driver's, newer than the seeds;
 	// the static pipeline cache is this GPU's and driver's.
 	static bool StaticInputsCurrent(GraphicContext& graphics, const std::filesystem::path& seeds);
@@ -343,7 +344,7 @@ private:
 #ifdef KYTY_STATIC_PRECOMPILE
 	bool SaveStaticCache(vk::PipelineCache cache, const std::filesystem::path& path);
 	static bool MergeBinaryShards(GraphicContext& graphics, bool prune);
-	bool WarmSeeds(const PrecompileOptions& options);
+	bool WarmSeeds(const PrecompileOptions& options, size_t& left_out);
 #endif
 };
 
