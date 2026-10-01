@@ -1345,7 +1345,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 
 // The CPU-dirty pages of a mapped range copied into the buffer (the written ones then GPU-owned).
 void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written) {
-	std::vector<vk::BufferCopy> copies;
+	// Reused per thread: the memory tracker refuses a nested upload (CheckNotInUploadCallback).
+	thread_local std::vector<vk::BufferCopy> copies;
+	copies.clear();
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
 	m_memory_tracker.ForEachUploadRange(

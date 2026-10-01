@@ -130,7 +130,9 @@ public:
 		// KYTY_ASYNC_REPROTECT: the pages this upload marks clean get their write protection
 		// from the upload worker, queued ahead of their copies (see TakeDeferredProtects).
 		const bool defer = !is_written && kyty_local_async_reprotect_mode.load(std::memory_order_relaxed) != 0;
-		std::vector<PageManager::DeferredRange> ranges;
+		// Reused per thread (no nested upload, see CheckNotInUploadCallback above).
+		thread_local std::vector<PageManager::DeferredRange> ranges;
+		ranges.clear();
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			if (defer) PageManager::SetDeferredWriteProtectSink(&ranges);

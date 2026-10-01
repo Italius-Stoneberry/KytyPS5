@@ -116,7 +116,7 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
-Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
+const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
@@ -132,7 +132,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
 
-	Barriers barriers;
+	// Reused per thread (each caller records the barriers before the next transition): a vector
+	// per transition was one of the render thread's most frequent allocations.
+	thread_local Barriers barriers;
+	barriers.clear();
 	if (partial || has_subresource_states) {
 		if (!has_subresource_states) {
 			subresource_states.resize(info.resources.levels * info.resources.layers, state);
@@ -187,7 +190,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    (!repeated_write || (DedupeTransitGroups() && g_transit_group != 0 &&
 		                         transit_group == g_transit_group))) {
-			return {};
+			return barriers;
 		}
 
 		vk::ImageMemoryBarrier2 barrier {};
@@ -244,7 +247,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		destination_stage |=
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
-	const auto barriers =
+	const auto& barriers =
 	    GetBarriers(destination_layout, destination_access, destination_stage, range);
 	if (barriers.empty()) {
 		return;
@@ -270,7 +273,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	buffer_barrier.buffer              = buffer;
 	buffer_barrier.offset              = offset;
 	buffer_barrier.size                = size;
-	const auto image_barriers =
+	const auto& image_barriers =
 	    GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
 	                vk::PipelineStageFlagBits2::eCopy, {});
 	vk::DependencyInfo dependency {};
@@ -310,7 +313,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	buffer_barrier.buffer              = buffer;
 	buffer_barrier.offset              = offset;
 	buffer_barrier.size                = size;
-	const auto image_barriers =
+	const auto& image_barriers =
 	    GetBarriers(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	                vk::PipelineStageFlagBits2::eCopy, {});
 	vk::DependencyInfo dependency {};

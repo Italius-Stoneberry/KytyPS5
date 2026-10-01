@@ -70,7 +70,7 @@ public:
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
-	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
+	[[nodiscard]] const Barriers& GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
 	                                   std::optional<ImageSubresourceRange> range);
