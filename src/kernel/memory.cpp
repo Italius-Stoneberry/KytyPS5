@@ -505,9 +505,13 @@ public:
 		return clamped_size;
 	}
 
-	// The committed parts of [virtual_addr, virtual_addr + size) as (address, size), in order,
-	// adjacent ones merged.
-	void CommittedParts(uint64_t virtual_addr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* out) {
+	struct Part {
+		uint64_t address        = 0;
+		uint64_t size           = 0;
+		bool     private_memory = false; // stacks, code, runtime memory: no backing view
+	};
+	// The committed parts of [virtual_addr, virtual_addr + size), in order, adjacent ones of a kind merged.
+	void CommittedParts(uint64_t virtual_addr, uint64_t size, std::vector<Part>* out) {
 		out->clear();
 		if (size == 0 || size > UINT64_MAX - virtual_addr) {
 			return;
@@ -524,12 +528,14 @@ public:
 			if (range_end <= virtual_addr || !IsCommittedRangeType(range->type)) {
 				continue;
 			}
-			const auto begin  = std::max(range->start, virtual_addr);
-			const auto finish = std::min(range_end, end);
-			if (!out->empty() && out->back().first + out->back().second == begin) {
-				out->back().second += finish - begin;
+			const auto begin          = std::max(range->start, virtual_addr);
+			const auto finish         = std::min(range_end, end);
+			const bool private_memory = IsPrivateCommittedRangeType(range->type);
+			if (!out->empty() && out->back().address + out->back().size == begin &&
+			    out->back().private_memory == private_memory) {
+				out->back().size += finish - begin;
 			} else {
-				out->emplace_back(begin, finish - begin);
+				out->push_back({begin, finish - begin, private_memory});
 			}
 		}
 	}
@@ -1094,33 +1100,65 @@ bool IsFullyMapped(uint64_t vaddr, uint64_t size) {
 }
 
 void MappedParts(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* parts) {
+	parts->clear();
 	if (g_virtual_ranges == nullptr) {
-		parts->assign(1, {vaddr, size});
+		parts->emplace_back(vaddr, size);
 		return;
 	}
-	g_virtual_ranges->CommittedParts(vaddr, size, parts);
+	std::vector<VirtualRanges::Part> committed;
+	g_virtual_ranges->CommittedParts(vaddr, size, &committed);
+	for (const auto& part: committed) {
+		if (!parts->empty() && parts->back().first + parts->back().second == part.address) {
+			parts->back().second += part.size;
+		} else {
+			parts->emplace_back(part.address, part.size);
+		}
+	}
+}
+
+// Private memory has no backing view: written at its own address, each page made writable for the
+// copy (and executable: it may be code another thread runs) and given its protection back.
+static bool WritePrivate(uint64_t vaddr, const uint8_t* data, uint64_t size) {
+	constexpr uint64_t PageSize = 0x1000;
+	for (uint64_t at = vaddr, end = vaddr + size; at < end;) {
+		const auto          next = std::min((at & ~(PageSize - 1)) + PageSize, end);
+		VirtualMemory::Mode mode = VirtualMemory::Mode::NoAccess;
+		if (!VirtualMemory::Protect(at, next - at, VirtualMemory::Mode::ExecuteReadWrite, &mode)) {
+			return false;
+		}
+		std::memcpy(reinterpret_cast<void*>(at), data + (at - vaddr), next - at);
+		if (mode != VirtualMemory::Mode::ExecuteReadWrite) VirtualMemory::Protect(at, next - at, mode);
+		at = next;
+	}
+	return true;
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 	if (TryWriteBacking(vaddr, data, size)) {
 		return;
 	}
-	// GPU results (readbacks, downloads) for memory the guest unmapped meanwhile have nowhere to
-	// go: the parts still mapped are written, and only a failure there is an error.
-	std::vector<std::pair<uint64_t, uint64_t>> parts;
-	MappedParts(vaddr, size, &parts);
+	// GPU results (readbacks, downloads) the backing view does not take whole: private memory (a
+	// thread's stack or TLS, where the game can have the GPU write a fence or a result) is written at
+	// its own address. What the guest unmapped meanwhile, or what takes neither write, is dropped.
+	std::vector<VirtualRanges::Part> parts;
+	if (g_virtual_ranges != nullptr) g_virtual_ranges->CommittedParts(vaddr, size, &parts);
 	uint64_t written = 0;
-	for (const auto& [address, bytes]: parts) {
-		if (!TryWriteBacking(address, static_cast<const uint8_t*>(data) + (address - vaddr), bytes)) {
-			EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64 " size=0x%016" PRIx64
-			     " (mapped part 0x%016" PRIx64 " size=0x%016" PRIx64 ")\n",
-			     vaddr, size, address, bytes);
+	for (const auto& part: parts) {
+		const auto* source = static_cast<const uint8_t*>(data) + (part.address - vaddr);
+		if (part.private_memory ? WritePrivate(part.address, source, part.size)
+		                        : TryWriteBacking(part.address, source, part.size)) {
+			written += part.size;
 		}
-		written += bytes;
 	}
-	std::printf("Memory: GPU data for unmapped guest memory dropped, addr=0x%016" PRIx64 " size=0x%" PRIx64
-	            " (0x%" PRIx64 " bytes still mapped) caller=%p\n",
-	            vaddr, size, written, __builtin_return_address(0));
+	if (written == size) {
+		return;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+		std::printf("Memory: GPU data for guest memory dropped, addr=0x%016" PRIx64 " size=0x%" PRIx64
+		            " (0x%" PRIx64 " bytes written; committed parts %zu) caller=%p\n",
+		            vaddr, size, written, parts.size(), __builtin_return_address(0));
+	}
 }
 
 void InvalidateMemory(uint64_t vaddr, uint64_t size) {
