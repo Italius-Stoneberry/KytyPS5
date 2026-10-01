@@ -120,6 +120,8 @@ inline std::atomic<uint64_t> g_render_values[Count];
 inline thread_local bool     g_single_writer = false; // set on the render thread (live-control.h Start)
 // Local diagnostic (KYTY_DISPATCH_KEYS): classify every dispatch against last frame's (renderCompute.cpp).
 inline std::atomic_bool g_dispatch_keys_on {std::getenv("KYTY_DISPATCH_KEYS") != nullptr};
+// Live `vma <path>`: writes the GPU allocator's detailed statistics (set by vma.cpp).
+inline void (*g_vma_report)(const char* path) = nullptr;
 // Render thread: the last draw (0) or dispatch shader address.
 inline uint64_t g_last_dispatch_shader = 0;
 

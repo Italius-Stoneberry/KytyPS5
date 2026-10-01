@@ -416,6 +416,10 @@ inline void Run(uint64_t id, const std::string& line) {
 		const int result = __llvm_profile_write_file();
 		std::printf("LIVE_PGO id=%" PRIu64 " path=%s result=%d\n", id, arg1, result);
 #endif
+	} else if (cmd == "vma" && n >= 2) {
+		// vma <path>: the GPU allocator's detailed statistics (JSON: every allocation's type and size).
+		if (LiveCounters::g_vma_report != nullptr) LiveCounters::g_vma_report(arg1);
+		std::printf("LIVE_VMA id=%" PRIu64 " path=%s written=%d\n", id, arg1, LiveCounters::g_vma_report != nullptr ? 1 : 0);
 	} else if (cmd == "sleep" && n >= 2) {
 		std::this_thread::sleep_for(std::chrono::duration<double>(std::strtod(arg1, nullptr)));
 	} else if (cmd == "capture" && n >= 2) {

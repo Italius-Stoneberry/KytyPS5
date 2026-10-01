@@ -23,6 +23,9 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "live-counters.h"
+
+#include <cstdio>
 
 #include <algorithm>
 #include <cinttypes>
@@ -30,6 +33,19 @@
 namespace Libs::Graphics {
 
 void FlushBufferReclaimer(); // streamBuffer.cpp (KYTY_BUFFER_RECLAIM)
+
+// Local diagnostic (live `vma <path>`): VMA is thread-safe, so the live thread writes it.
+static VmaAllocator g_report_allocator = nullptr;
+static void WriteVmaReport(const char* path) {
+	if (g_report_allocator == nullptr) return;
+	char* json = nullptr;
+	vmaBuildStatsString(g_report_allocator, &json, VK_TRUE);
+	if (FILE* file = std::fopen(path, "wb"); file != nullptr) {
+		std::fputs(json, file);
+		std::fclose(file);
+	}
+	vmaFreeStatsString(g_report_allocator, json);
+}
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -56,6 +72,8 @@ bool GraphicContext::CreateAllocator() {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
+	g_report_allocator          = allocator;
+	LiveCounters::g_vma_report = WriteVmaReport;
 	return true;
 }
 
@@ -65,6 +83,8 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	LiveCounters::g_vma_report = nullptr;
+	g_report_allocator         = nullptr;
 	FlushBufferReclaimer();
 	DestroyImagePool(allocator);
 	vmaDestroyAllocator(allocator);
