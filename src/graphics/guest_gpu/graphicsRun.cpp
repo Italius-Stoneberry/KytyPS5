@@ -560,7 +560,9 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				LiveTrace::Event(LiveTrace::RenderIdle, 1, 0);
+				const auto idle = std::chrono::steady_clock::now();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				LiveControl::g_render_idle_ns += (std::chrono::steady_clock::now() - idle).count();
 				LiveTrace::Event(LiveTrace::RenderIdle, 0, 0);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -585,7 +587,9 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					LiveTrace::Event(LiveTrace::RenderIdle, 1, 1);
+					const auto idle = std::chrono::steady_clock::now();
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					LiveControl::g_render_idle_ns += (std::chrono::steady_clock::now() - idle).count();
 					LiveTrace::Event(LiveTrace::RenderIdle, 0, 1);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {

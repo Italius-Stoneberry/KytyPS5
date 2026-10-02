@@ -37,6 +37,7 @@
 #include "frame-capture.h"
 #include "frame-gen.h"
 #include "native-preparation-state.h"
+#include "slow-log.h"
 #include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-draw-packet.h"

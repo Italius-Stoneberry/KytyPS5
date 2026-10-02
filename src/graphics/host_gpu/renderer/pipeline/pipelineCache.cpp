@@ -777,6 +777,7 @@ struct PipelineCache::ProgramCache {
 				            static_cast<unsigned long long>(params.hash), front_ms,
 				            known_program ? "specialization" : "program");
 			}, SlowLog::HitchThreshold());
+			LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			if (entry == programs.end()) {
@@ -2016,6 +2017,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		std::printf("SLOW CreateGraphicsPipeline %.1f ms VS=%llu PS=%llu\n", ms,
 		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id));
 	}, SlowLog::HitchThreshold());
+	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
@@ -2082,6 +2084,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 		std::printf("SLOW CreateComputePipeline %.1f ms CS=%llu\n", ms,
 		            static_cast<unsigned long long>(compute_program.id));
 	}, SlowLog::HitchThreshold());
+	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	auto cached = std::make_unique<Pipeline>();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
 	                       FirstBuild());

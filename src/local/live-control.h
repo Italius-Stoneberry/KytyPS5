@@ -37,9 +37,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #include <pthread.h>
@@ -55,6 +57,9 @@ extern "C" int  __llvm_profile_write_file(void);
 namespace LiveControl {
 
 inline std::atomic_uint64_t g_flips {0};
+// The steady-clock time (ns) of flip n at [n % FlipTimes], for frame-time percentiles (Measure).
+constexpr size_t             FlipTimes = 8192;
+inline std::atomic<int64_t>  g_flip_times[FlipTimes] {};
 inline std::atomic_bool     g_render_known {false};
 // pthread_t on Linux, a thread HANDLE on Windows (LocalPlatform::CurrentThreadHandle).
 inline uint64_t              g_render_thread {};
@@ -63,22 +68,51 @@ inline std::atomic<uint32_t> g_render_tid {0};
 inline uint64_t             g_stack_low = 0, g_stack_high = 0;
 constexpr size_t             SampleWords = 16;
 inline uint64_t              g_samples[1u << 23];
+inline uint64_t              g_sample_tsc[(1u << 23) / SampleWords]; // Windows: each sample's TSC
 inline std::atomic<uint32_t> g_sample_count {0};
 inline std::atomic_bool      g_process {false};
 
+// The render thread's time waiting for guest work (GuestGpu::ThreadRun), in steady-clock ns.
+inline int64_t g_render_idle_ns = 0;
+
 // Render thread. With KYTY_HITCH_LOG_MS (or KYTY_SLOW_LOG_MS), a frame (flip to flip) that long and
 // at least 50 ms is a SLOW line too, on the same TSC timeline: the hitch the slow calls before it explain.
+// The line also has the frame's render-thread wait for guest work and what some counters did in it.
 inline void Flip() {
-	g_flips.fetch_add(1, std::memory_order_relaxed);
+	const auto flip = g_flips.load(std::memory_order_relaxed);
+	g_flip_times[flip % FlipTimes].store(std::chrono::steady_clock::now().time_since_epoch().count(),
+	                                     std::memory_order_relaxed);
+	g_flips.store(flip + 1, std::memory_order_release);
 	if (SlowLog::HitchThreshold() > 0.0) {
-		static std::chrono::steady_clock::time_point last {};
-		const auto                                   now = std::chrono::steady_clock::now();
+		using C = LiveCounters::Id;
+		static constexpr std::array counted {C::XprStores, C::XprStored, C::XprMissValidate, C::XprMissUnseen, C::XprMissBudget,
+		                                     C::UploadBytes, C::AsyncImageBytes, C::FullUploadBytes,
+		                                     C::BufferRegistrations, C::RegionSyncs, C::SyncDownloads, C::AsyncReadbacks,
+		                                     C::ReadbackParts, C::ReadbackRegions, C::GuestCommands, C::TextureUnmaps, C::AsyncPipelines};
+		static constexpr const char* waits[] = {"gpu_wait", "readback_wait", "download_wait", "compile"};
+		static std::chrono::steady_clock::time_point     last {};
+		static int64_t                                   last_idle = 0;
+		static std::array<int64_t, LiveCensus::Waits>    last_waits {};
+		static std::array<uint64_t, counted.size()>      last_counts {};
+		const auto                                       now = std::chrono::steady_clock::now();
 		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
 		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(50.0, SlowLog::HitchThreshold())) {
-			std::printf("[tsc %llu] SLOW Frame %.1f ms\n", static_cast<unsigned long long>(__rdtsc()), ms);
+			std::printf("[tsc %llu] SLOW Frame %.1f ms idle=%.1f", static_cast<unsigned long long>(__rdtsc()), ms,
+			            static_cast<double>(g_render_idle_ns - last_idle) / 1e6);
+			for (size_t i = 0; i < LiveCensus::Waits; ++i)
+				if (const auto ns = LiveCensus::g_waits_ns[i] - last_waits[i]; ns != 0)
+					std::printf(" %s=%.1f", waits[i], static_cast<double>(ns) / 1e6);
+			for (size_t i = 0; i < counted.size(); ++i) {
+				const auto delta = LiveCounters::Value(counted[i]) - last_counts[i];
+				if (delta != 0) std::printf(" %s=%llu", LiveCounters::Names[counted[i]], static_cast<unsigned long long>(delta));
+			}
+			std::printf("\n");
 			std::fflush(stdout);
 		}
-		last = now;
+		last      = now;
+		last_idle = g_render_idle_ns;
+		for (size_t i = 0; i < LiveCensus::Waits; ++i) last_waits[i] = LiveCensus::g_waits_ns[i];
+		for (size_t i = 0; i < counted.size(); ++i) last_counts[i] = LiveCounters::Value(counted[i]);
 	}
 }
 
@@ -199,24 +233,35 @@ inline void Profile(uint64_t id, double seconds, const char* path, bool process,
 		return rate >= 100 && rate <= 20000 ? rate : 4000;
 	}();
 	const auto period = std::chrono::nanoseconds(1000000000L / hz);
-	const auto end    = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
-	auto       next   = std::chrono::steady_clock::now();
+	const auto begin  = std::chrono::steady_clock::now();
+	const auto end    = begin + std::chrono::duration<double>(seconds);
+	const auto tsc0   = __rdtsc();
+	auto       next   = begin;
 	while (next < end) {
 		const auto idx = g_sample_count.load(std::memory_order_relaxed);
 		if (SampleWords * (size_t(idx) + 1) > std::size(g_samples)) break;
 		if (LocalPlatform::SampleThread(thread, stack_low, stack_high, g_samples + SampleWords * size_t(idx),
-		                                SampleWords))
+		                                SampleWords)) {
+			g_sample_tsc[idx] = __rdtsc();
 			g_sample_count.store(idx + 1, std::memory_order_relaxed);
+		}
 		next += period;
 		while (std::chrono::steady_clock::now() < next) _mm_pause();
 	}
+	const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+	const double tsc_hz  = static_cast<double>(__rdtsc() - tsc0) / elapsed;
 	if (tid != 0) LocalPlatform::CloseThreadForSampling(thread);
 	const auto count = std::min<uint32_t>(g_sample_count.load(), std::size(g_samples) / SampleWords);
 	if (auto* out = std::fopen(path, "wb")) {
 		std::fwrite(g_samples, sizeof(uint64_t), SampleWords * size_t(count), out);
 		std::fclose(out);
 	}
-	std::printf("LIVE_PROF id=%" PRIu64 " samples=%u path=%s\n", id, count, path);
+	// <path>.tsc: each sample's TSC (slow-frame lines carry TSC stamps: hitch-prof.py picks their samples).
+	if (auto* out = std::fopen((std::string(path) + ".tsc").c_str(), "wb")) {
+		std::fwrite(g_sample_tsc, sizeof(uint64_t), size_t(count), out);
+		std::fclose(out);
+	}
+	std::printf("LIVE_PROF id=%" PRIu64 " samples=%u path=%s tsc_hz=%.0f\n", id, count, path, tsc_hz);
 }
 #endif
 
@@ -233,10 +278,25 @@ inline void Measure(uint64_t id, double seconds, const char* label) {
 	const double render  = (g_render_known ? ThreadCpuSeconds(g_render_thread) : 0) - render0;
 	const double record  = NamedThreadsCpuSeconds("Kyty.Record") - record0;
 	const double per     = frames ? 1000.0 / static_cast<double>(frames) : 0;
+	// Frame times (flip to flip) of the window: the worst 1% as fps (1% low), the 99th percentile, the
+	// longest and the frames of 50 ms or more and of 100 ms or more.
+	std::vector<double> times;
+	for (auto flip = flips0 + 1; flip < flips0 + frames && flip + FlipTimes > flips0 + frames; ++flip)
+		times.push_back(static_cast<double>(g_flip_times[flip % FlipTimes].load(std::memory_order_relaxed) -
+		                                    g_flip_times[(flip - 1) % FlipTimes].load(std::memory_order_relaxed)) / 1e6);
+	std::sort(times.begin(), times.end(), std::greater<>());
+	const size_t worst = (times.size() + 99) / 100;
+	double       sum   = 0;
+	for (size_t i = 0; i < worst; ++i) sum += times[i];
+	const double low1 = worst ? 1000.0 * static_cast<double>(worst) / sum : 0;
+	const double p99  = times.empty() ? 0 : times[std::min(times.size() - 1, times.size() / 100)];
+	const auto   over = [&](double ms) { return std::ranges::count_if(times, [&](double t) { return t >= ms; }); };
 	std::printf("LIVE_MEASURE id=%" PRIu64 " label=%s seconds=%.2f frames=%" PRIu64
-	            " fps=%.2f render_ms=%.2f record_ms=%.2f render_busy=%.1f%%\n",
+	            " fps=%.2f render_ms=%.2f record_ms=%.2f render_busy=%.1f%% low1=%.2f p99_ms=%.1f max_ms=%.1f"
+	            " over50=%lld over100=%lld\n",
 	            id, label, elapsed, frames, static_cast<double>(frames) / elapsed, render * per, record * per,
-	            100.0 * render / elapsed);
+	            100.0 * render / elapsed, low1, p99, times.empty() ? 0 : times.front(),
+	            static_cast<long long>(over(50)), static_cast<long long>(over(100)));
 	std::string counters;
 	for (size_t i = 0; i < counters0.size(); ++i) {
 		char text[96];

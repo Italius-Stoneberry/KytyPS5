@@ -47,6 +47,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	LiveCensus::Scope census(LiveCensus::GpuWait, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
 	                         reinterpret_cast<uint64_t>(__builtin_return_address(1)));
+	LiveCensus::WaitScope waiting(LiveCensus::WaitGpu);
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;

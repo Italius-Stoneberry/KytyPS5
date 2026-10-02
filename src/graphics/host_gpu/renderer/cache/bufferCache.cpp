@@ -511,6 +511,7 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 	if (!request->copied.load(std::memory_order_acquire)) {
 		LiveCensus::Scope census(LiveCensus::ReadbackWait, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
 		                         reinterpret_cast<uint64_t>(__builtin_return_address(1)));
+		LiveCensus::WaitScope waiting(LiveCensus::WaitReadback);
 		while (!request->copied.load(std::memory_order_acquire)) request->copied.wait(false);
 	}
 	LiveCounters::Add(LiveCounters::ReadbackParts, request->parts.size());
@@ -1182,6 +1183,7 @@ void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
 	LiveCensus::Scope census(LiveCensus::SyncDownload, vaddr >> 20u << 20u, is_write);
+	LiveCensus::WaitScope waiting(LiveCensus::WaitDownload);
 	DrainGuestReadback();
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;

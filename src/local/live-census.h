@@ -4,6 +4,7 @@
 // by the render thread; the live thread reads it after switching the census off.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <x86intrin.h>
 
@@ -77,6 +78,27 @@ private:
 	bool     m_on;
 	uint32_t m_kind  = 0;
 	uint64_t m_a     = 0, m_b = 0, m_start = 0;
+};
+
+// Render-thread waits, always summed (the slow-frame lines, LiveControl::Flip): for GPU work, for a guest
+// readback's copy, in a synchronous download, in shader translation and pipeline creation. Steady-clock ns.
+enum Wait : uint32_t { WaitGpu, WaitReadback, WaitDownload, WaitCompile, Waits };
+inline int64_t g_waits_ns[Waits] {};
+class WaitScope {
+public:
+	explicit WaitScope(Wait wait): m_wait(wait), m_on(g_render) {
+		if (m_on) m_start = std::chrono::steady_clock::now();
+	}
+	~WaitScope() {
+		if (m_on) g_waits_ns[m_wait] += (std::chrono::steady_clock::now() - m_start).count();
+	}
+	WaitScope(const WaitScope&)            = delete;
+	WaitScope& operator=(const WaitScope&) = delete;
+
+private:
+	Wait                                  m_wait;
+	bool                                  m_on;
+	std::chrono::steady_clock::time_point m_start {};
 };
 
 // Phases of one normal-path draw: the draw's scope starts phase 0, every LogDrawPhase marker

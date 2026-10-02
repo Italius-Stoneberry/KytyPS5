@@ -1737,6 +1737,11 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 			record->word_patch.assign(record->words.size(), -1);
 	}
 	if (cache.records.size() >= 65536) {
+		if (SlowLog::HitchThreshold() > 0.0) {
+			std::printf("[tsc %llu] SLOW XprReset 0.0 ms records=%zu\n", static_cast<unsigned long long>(__rdtsc()),
+			            cache.records.size());
+			std::fflush(stdout);
+		}
 		for (auto& [key, value]: cache.records) NativeXprRetire(std::move(value), false);
 		cache.records.clear();
 		cache.index.assign(8192, {});
