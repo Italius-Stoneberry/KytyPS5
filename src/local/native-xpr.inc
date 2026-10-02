@@ -522,6 +522,16 @@ struct RenderExecutor::NativeXprCache {
 		uint64_t           tick = 0;
 	};
 	std::vector<RetiredSet> retired;
+	// Sets the GPU is done with, by layout, for that layout's next allocation (a driver allocation and
+	// free are a call each); the layout of every set allocated here.
+	struct FreeSet {
+		vk::DescriptorPool pool;
+		vk::DescriptorSet  set;
+	};
+	static constexpr size_t FreeSetsPerLayout = 32, FreeSetsMax = 2048;
+	std::unordered_map<VkDescriptorSetLayout, std::vector<FreeSet>> free_sets;
+	std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout>      set_layouts;
+	size_t                                                          free_count = 0;
 	std::vector<vk::DescriptorPool>                                pools;
 	std::vector<uint32_t>                                          key;
 	// Store request: the reads of the normal draw's SRT evaluation.
@@ -734,6 +744,14 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
                                                        vk::DescriptorPool& pool_out) {
 	auto&      cache  = NativeXprState();
 	const auto device = cache.device;
+	if (const auto found = cache.free_sets.find(static_cast<VkDescriptorSetLayout>(layout));
+	    found != cache.free_sets.end() && !found->second.empty()) {
+		const auto item = found->second.back();
+		found->second.pop_back();
+		--cache.free_count;
+		pool_out = item.pool;
+		return item.set;
+	}
 	vk::DescriptorSetAllocateInfo allocate {};
 	allocate.descriptorSetCount = 1;
 	allocate.pSetLayouts        = &layout;
@@ -744,6 +762,7 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
 		allocate.descriptorPool = pool;
 		if (device.allocateDescriptorSets(&allocate, &set) == vk::Result::eSuccess) {
 			pool_out = pool;
+			cache.set_layouts[static_cast<VkDescriptorSet>(set)] = static_cast<VkDescriptorSetLayout>(layout);
 			return set;
 		}
 	}
@@ -766,6 +785,7 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
 	allocate.descriptorPool = pool;
 	EXIT_IF(device.allocateDescriptorSets(&allocate, &set) != vk::Result::eSuccess);
 	pool_out = pool;
+	cache.set_layouts[static_cast<VkDescriptorSet>(set)] = static_cast<VkDescriptorSetLayout>(layout);
 	return set;
 }
 
@@ -792,8 +812,8 @@ void RenderExecutor::NativeXprRetire(std::unique_ptr<NativeXprRecord> record, bo
 	cache.stale[hash] = std::move(record);
 }
 
-// Once per frame: free the retired sets the GPU is done with, one call per pool
-// (each call drains the recording queue).
+// Once per frame: the retired sets the GPU is done with are kept for reuse or freed, one call per
+// pool (each call drains the recording queue).
 void RenderExecutor::NativeXprCollect() {
 	if (!m_native_xpr) return;
 	auto&      cache = *m_native_xpr;
@@ -824,6 +844,16 @@ void RenderExecutor::NativeXprCollect() {
 	std::vector<NativeXprCache::RetiredSet> done;
 	std::erase_if(cache.retired, [&](const NativeXprCache::RetiredSet& item) {
 		if (!scheduler.IsFree(item.tick)) return false;
+		const auto layout = cache.set_layouts.find(static_cast<VkDescriptorSet>(item.set));
+		if (layout != cache.set_layouts.end() && cache.free_count < NativeXprCache::FreeSetsMax) {
+			auto& sets = cache.free_sets[layout->second];
+			if (sets.size() < NativeXprCache::FreeSetsPerLayout) {
+				sets.push_back({item.pool, item.set});
+				++cache.free_count;
+				return true;
+			}
+		}
+		if (layout != cache.set_layouts.end()) cache.set_layouts.erase(layout);
 		done.push_back(item);
 		return true;
 	});
