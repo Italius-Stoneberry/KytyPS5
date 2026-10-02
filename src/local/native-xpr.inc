@@ -2915,15 +2915,24 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	if (found == nullptr || !found->SameKey(cache.key)) {
 		LiveCounters::Add(LiveCounters::XprMissKey);
 		if (!relocating) pair = cache.pairs.find(NativeXprPairKey(cache.key));
-		if (pair != cache.pairs.end() && (pair->second.blocked || pair->second.unstorable)) return false;
+		if (pair != cache.pairs.end() && (pair->second.blocked || pair->second.unstorable)) {
+			LiveCounters::Add(LiveCounters::XprMissBlocked);
+			return false;
+		}
 		cache.tried_hash = hash;
 		// The first store of a pair learns its pointer words.
 		if (relocating && (pair == cache.pairs.end() || !pair->second.relocation_known)) {
 			m_native_xpr_store = true;
 			return false;
 		}
-		if (cache.tried_relocate != 0 && cache.Refused(hash, m_context.FrameNumber())) return false;
-		if (!cache.SeenAgain(hash, m_context.FrameNumber())) return false;
+		if (cache.tried_relocate != 0 && cache.Refused(hash, m_context.FrameNumber())) {
+			LiveCounters::Add(LiveCounters::XprMissRefused);
+			return false;
+		}
+		if (!cache.SeenAgain(hash, m_context.FrameNumber())) {
+			LiveCounters::Add(LiveCounters::XprMissUnseen);
+			return false;
+		}
 		m_native_xpr_store = true;
 		return false;
 	}
