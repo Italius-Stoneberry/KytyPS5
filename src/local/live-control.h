@@ -85,7 +85,8 @@ inline void Flip() {
 	g_flips.store(flip + 1, std::memory_order_release);
 	if (SlowLog::HitchThreshold() > 0.0) {
 		using C = LiveCounters::Id;
-		static constexpr std::array counted {C::XprStores, C::XprStored, C::XprMissValidate, C::XprMissUnseen, C::XprMissBudget,
+		static constexpr std::array counted {C::XprStores, C::XprStored, C::XprStorePending, C::XprRefuseBind,
+		                                     C::XprMissRefused, C::XprMissValidate, C::XprMissUnseen, C::XprMissBudget,
 		                                     C::UploadBytes, C::AsyncImageBytes, C::FullUploadBytes,
 		                                     C::BufferRegistrations, C::RegionSyncs, C::SyncDownloads, C::AsyncReadbacks,
 		                                     C::ReadbackParts, C::ReadbackRegions, C::GuestCommands, C::TextureUnmaps, C::AsyncPipelines};
