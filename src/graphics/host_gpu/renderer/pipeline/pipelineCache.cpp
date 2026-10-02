@@ -165,6 +165,18 @@ bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t co
 	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
 }
 
+// Native XPR records evaluate their SRT again over memory the guest may have reused since: a stale
+// pointer on the way fails the evaluation instead of faulting.
+bool ReadMappedRawGuestMemory(void* userdata, uint64_t address, uint32_t* value) {
+	return Libs::LibKernel::Memory::IsFullyMapped(address, sizeof(*value)) &&
+	       ReadShaderRawGuestMemory(userdata, address, value);
+}
+
+bool ReadMappedMemorySpan(void* userdata, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
+	return Libs::LibKernel::Memory::IsFullyMapped(address, uint64_t {count} * 4u) &&
+	       ReadShaderMemorySpan(userdata, address, values, count, clean);
+}
+
 void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
                            const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
 	if (!ok) {
@@ -1637,12 +1649,20 @@ bool PipelineCache::TraceStage(const ShaderRecompiler::IR::CompiledShaderInfo& p
 	const ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
 	    .shader_base                = shader_base,
-	    .read_memory                = ReadShaderRawGuestMemory,
+	    .read_memory                = ReadMappedRawGuestMemory,
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .sync_memory                = SyncShaderGuestMemory,
-	    .try_read_memory_span       = ReadShaderMemorySpan,
+	    .try_read_memory_span       = ReadMappedMemorySpan,
 	};
 	return ShaderRecompiler::IR::TraceLinearSrtReads(found->second.first->resource_plan, runtime, trace);
+}
+
+ShaderRecompiler::IR::SrtUserDataUse PipelineCache::UserDataUse(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	Common::LockGuard lock(m_mutex);
+	auto&             cache = *m_program_cache;
+	const auto        found = FindProgramSource(cache, program);
+	return found == cache.by_program.end() ? ShaderRecompiler::IR::SrtUserDataUse {}
+	                                       : ShaderRecompiler::IR::UserDataUse(found->second.first->resource_plan);
 }
 
 bool PipelineCache::RematerializeStage(const ShaderRecompiler::IR::CompiledShaderInfo& program,
@@ -1656,10 +1676,10 @@ bool PipelineCache::RematerializeStage(const ShaderRecompiler::IR::CompiledShade
 	const ShaderRecompiler::IR::SrtRuntime input_runtime {
 	    .user_data                  = user_data,
 	    .shader_base                = shader_base,
-	    .read_memory                = ReadShaderRawGuestMemory,
+	    .read_memory                = ReadMappedRawGuestMemory,
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .sync_memory                = SyncShaderGuestMemory,
-	    .try_read_memory_span       = ReadShaderMemorySpan,
+	    .try_read_memory_span       = ReadMappedMemorySpan,
 	};
 	ShaderReadObserver::Runtime observed_runtime(input_runtime);
 	ShaderRecompiler::IR::ResourceSpecialization        specialization;

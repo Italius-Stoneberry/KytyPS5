@@ -2193,6 +2193,31 @@ bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
 	return true;
 }
 
+bool TextureCache::IsTargetCurrent(ImageId id, const ImageInfo& requested, uint64_t& epoch) {
+	std::scoped_lock lock {m_lock};
+	const auto current = m_resolution_epoch.load(std::memory_order_relaxed);
+	// FindImage takes the last owner with the requested backing (on the first page or in the region);
+	// only without one does it resolve an overlap (a target found as part of another image).
+	if (epoch != current && RegistrationsSince(requested.data.address, 1, epoch)) {
+		const auto* target = m_slot_images.try_get(id);
+		ImageId     last {};
+		const auto  same = [&](ImageId owner) {
+			const auto* image = m_slot_images.try_get(owner);
+			if (image != nullptr && SameBacking(image->info, requested, false)) last = owner;
+		};
+		ImagePageTable::PageRange pages {};
+		if (kyty_local_preparation_lookup_mode.load(std::memory_order_relaxed) != 0 &&
+		    ImagePageTable::TryGetPageRange(requested.data.address, requested.data.size, pages)) {
+			if (const auto* owners = m_image_page_table.Find(pages.first)) owners->ForEach(same);
+		} else {
+			for (const auto owner: FindImagesInRegion(requested.data.address, requested.data.size, false)) same(owner);
+		}
+		if (target == nullptr || last != (SameBacking(target->info, requested, false) ? id : ImageId {})) return false;
+	}
+	epoch = current;
+	return true;
+}
+
 bool TextureCache::TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t& epoch) {
 	std::scoped_lock lock {m_lock};
 	const auto current = m_resolution_epoch.load(std::memory_order_relaxed);

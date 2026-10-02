@@ -217,6 +217,8 @@ public:
 	[[nodiscard]] bool TraceStage(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                              std::span<const uint32_t> user_data, uint64_t shader_base,
 	                              ShaderRecompiler::IR::SrtReadTrace& trace);
+	// How its SRT evaluation uses user data (ShaderRecompiler::IR::UserDataUse).
+	[[nodiscard]] ShaderRecompiler::IR::SrtUserDataUse UserDataUse(const ShaderRecompiler::IR::CompiledShaderInfo& program);
 
 	// The shader prefetch (ProgramCache::Prefetch): programs translated or taken over, of `total`;
 	// all zero while it loads its inputs or when it does not run. Any thread.

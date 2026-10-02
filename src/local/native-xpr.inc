@@ -48,6 +48,10 @@ extern "C" {
 // 1: a store whose pipeline variant is not compiled yet hands it to the compile workers and
 // is skipped; the draw takes the normal path until a later store finds the variant ready.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_xpr_pipelines_mode {0};
+// 1: relocation. Objects whose user data points at a new copy of the same tables every frame (a ring)
+// had keys new every frame, so no record; the pointer words (user data pairs the SRT reads through and
+// uses for nothing else) leave the key, and the record reads the same offsets from the new base.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_relocate_mode {0};
 }
 namespace {
 // word_patch value of a logged word whose change reaches nothing the evaluation produces.
@@ -61,6 +65,9 @@ constexpr std::array<uint32_t, 8> NativeXprLodStatsMask {0, 0, 0, 0, 0, (0xfffu 
 // Gather feed kind of a flattened-SRT copy of a structural word (beside the
 // SrtReadTrace::Kind descriptor kinds).
 constexpr uint32_t NativeXprFlatFeed = 0xf;
+
+// A gather run or span read at a fixed address (not relative to a relocated root).
+constexpr uint8_t NativeXprNoRoot = 0xff;
 
 // Longest gather span, in words.
 constexpr uint32_t NativeXprSpanWords = 256;
@@ -142,6 +149,7 @@ struct RenderExecutor::NativeXprDrawState {
 		uint64_t              metadata = 0; // surface metadata (HTile/DCC) address, 0 none
 		uint32_t              slice    = 0;
 		uint64_t              serial   = 0; // the image object the attachment views belong to
+		ImageInfo             requested;    // what the registers ask for (TextureCache::IsTargetCurrent)
 	};
 	RenderState                      rendering;       // reopened: loads
 	RenderState                      first_rendering; // as the stored draw began it
@@ -149,6 +157,8 @@ struct RenderExecutor::NativeXprDrawState {
 	LocalDrawRecording::DynamicState dynamic;
 	// Metadata epoch under which no target had a pending fast clear.
 	mutable uint64_t                 meta_epoch = 0;
+	// Texture cache resolution epoch under which the targets were what a lookup finds (0: not yet).
+	mutable uint64_t                 targets_epoch = 0;
 };
 
 // One object: its resources under the compiled programs it was translated with.
@@ -200,6 +210,23 @@ struct RenderExecutor::NativeXprRecord {
 		for (const auto& dep: images) image_ids.push_back(dep.id);
 	}
 	std::vector<uint32_t> key;
+	// Relocation: a stage's user data pair (user, user + 1) the key leaves out (its words low_word and
+	// high_word), whose reads the gather keeps as offsets from `base`, the pointer the record now holds.
+	struct Root {
+		uint8_t stage = 0, user = 0, low_word = 0, high_word = 0;
+		// The pair's shader data words (user data the shader gets), or NativeXprNoRoot.
+		uint8_t low_data = NativeXprNoRoot, high_data = NativeXprNoRoot;
+		// An earlier root this one equals (the stages get the same pointer): reads through either
+		// are one read, so the record holds while they stay equal.
+		uint8_t  same = NativeXprNoRoot;
+		uint64_t base = 0; // 48 bits, dword aligned
+	};
+	std::vector<Root> roots;
+	// Relocation: user data words nothing reads (the key leaves them out; the record copies them).
+	struct Unread {
+		uint8_t stage = 0, user = 0, word = 0;
+	};
+	std::vector<Unread> unread;
 	// The first key words again, inline: a lookup compares most keys without
 	// the vector's cache miss.
 	static constexpr uint32_t KeyHead = 36;
@@ -287,6 +314,7 @@ struct RenderExecutor::NativeXprRecord {
 			uint32_t count   = 0;
 			uint32_t first   = 0; // into values (structural) / targets_at (data)
 			bool     clean   = false;
+			uint8_t  root    = NativeXprNoRoot; // into roots: the address is an offset from its base
 		};
 		std::vector<Run>      structural;
 		std::vector<uint32_t> values;
@@ -302,15 +330,25 @@ struct RenderExecutor::NativeXprRecord {
 		// (small gaps included). `words` is what the record currently holds for
 		// them: a validation handles only the words that differ.
 		struct Span {
-			uint64_t address = 0;
+			uint64_t address = 0; // an offset from the base of `root`, if any
 			uint32_t count   = 0;
 			uint32_t first   = 0; // into words
+			uint8_t  root    = NativeXprNoRoot;
+			uint8_t  level   = 0; // read after every span of a lower one (pointers it is read through)
 		};
 		std::vector<Span>     spans;
 		std::vector<uint32_t> words;
 		std::vector<int32_t>  word_value; // structural value index, or -1
 		std::vector<int32_t>  word_data;  // data dword index (targets_at), or -1
 		std::vector<uint32_t> value_word; // per non-clean structural value: its index in words
+		// Relocation: pointers read from memory that later spans are read through (a span root past
+		// the record's roots), as the structural values of their halves; per structural value, whether
+		// it is such a half, read for nothing else (a change moves what is read through it).
+		struct Pointer {
+			uint32_t low = 0, high = 0;
+		};
+		std::vector<Pointer> pointers;
+		std::vector<uint8_t> pointer_value;
 		// The clean structural words, as page-local spans; per span word its
 		// structural value index, or -1 for a gap.
 		std::vector<Span>    clean_spans;
@@ -319,7 +357,48 @@ struct RenderExecutor::NativeXprRecord {
 };
 
 namespace {
-// (A template: the record type is private to RenderExecutor.)
+// A root's base: its pointer as the SRT's pointer reads take it (LinearSrtPlan::ReadAddress).
+uint64_t NativeXprBase(uint32_t low, uint32_t high) {
+	return ((uint64_t {high} << 32u) | low) & 0x0000fffffffffffcull;
+}
+
+// Where a gather run or span is now: its address, or its offset from its root's current base (a
+// record root, or a pointer the gather read). (Templates: the record type is private to RenderExecutor.)
+template <typename Record, typename Span>
+uint64_t NativeXprAddress(const Record& record, const Span& span) {
+	if (span.root == NativeXprNoRoot) return span.address;
+	if (span.root < record.roots.size()) return record.roots[span.root].base + span.address;
+	const auto& gather  = record.gather;
+	const auto& pointer = gather.pointers[span.root - record.roots.size()];
+	return NativeXprBase(gather.values[pointer.low], gather.values[pointer.high]) + span.address;
+}
+
+// A program's user data (bit k: user[k]) a record may take from each draw: the pairs (user[k],
+// user[k + 1]) its SRT only reads through, and the words nothing reads (not the SRT, the shader or
+// the draw offsets). Recorded programs make no address loads: the shader gets user data only as
+// shader data, which a relocation updates.
+struct NativeXprUserData {
+	uint32_t pointers = 0, unread = 0;
+};
+NativeXprUserData NativeXprUserDataOf(PipelineCache& pipelines, const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	const auto use    = pipelines.UserDataUse(program);
+	const auto base   = int64_t {program.user_data_base};
+	uint32_t   offset = 0, shader = 0;
+	for (const auto reg: {int64_t {program.info.vertex_offset_sgpr} - base, int64_t {program.info.instance_offset_sgpr} - base})
+		if (reg >= 0 && reg < 32) offset |= 1u << reg;
+	for (const auto reg: program.bindings.user_data_registers)
+		if (reg >= base && reg - base < 32) shader |= 1u << (reg - base);
+	return {use.pointers & ~offset & ~(offset >> 1), ~(use.read | shader | offset)};
+}
+
+// Where the shader data holds user data `user` of the program, or NativeXprNoRoot.
+uint8_t NativeXprUserDataWord(const ShaderRecompiler::IR::CompiledShaderInfo& program, uint32_t user) {
+	const auto& registers = program.bindings.user_data_registers;
+	const auto  found     = std::ranges::find(registers, program.user_data_base + user);
+	const auto  index     = found - registers.begin();
+	return found == registers.end() || index >= NativeXprNoRoot ? NativeXprNoRoot : static_cast<uint8_t>(index);
+}
+
 // The lines of the record's fields a use reads (addresses only: no load waits).
 template <typename Record>
 void NativeXprPrefetchFields(const Record& record) {
@@ -480,6 +559,11 @@ struct RenderExecutor::NativeXprCache {
 		uint64_t stored = 0, wasted = 0;
 		bool     blocked = false;
 		bool     unstorable = false; // a program writes memory or uses DMA/GDS (NativeXprStore)
+		// Relocation: the key words the pair's records leave out (bit i: word i), known once a store
+		// looked at the pair's programs (NativeXprStore).
+		bool     relocation_known = false;
+		bool     pointers_off     = false; // a record could not be traced through its pointers
+		uint64_t relocate         = 0;
 	};
 	std::unordered_map<uint64_t, PairStats> pairs;
 	// Keys that missed, with the frame of their latest miss. A record pays off only
@@ -505,6 +589,58 @@ struct RenderExecutor::NativeXprCache {
 		}
 		*(empty != nullptr ? empty : &seen[hash & mask]) = {hash, frame};
 		return false;
+	}
+	// Relocation (direct draws: an indirect run that misses is tried again per draw, so its uses
+	// would not count the same in every frame): the latest try's key before its pointer words left
+	// it, the words it left out, which use of the rest in the frame it was and its hash (for the
+	// store a miss requests); per program, the user data a record may take from each draw.
+	std::vector<uint32_t> full_key;
+	uint64_t              tried_relocate   = 0;
+	uint32_t              tried_occurrence = 0;
+	uint64_t              tried_hash       = 0;
+	// Relocated keys whose store was refused: the same refusal would come every frame.
+	static constexpr uint64_t RefuseFrames = 64;
+	std::vector<SeenKey>      refused      = std::vector<SeenKey>(4096);
+	[[nodiscard]] bool        Refused(uint64_t hash, uint64_t frame) const {
+		hash            = IndexHash(hash);
+		const auto mask = refused.size() - 1;
+		for (uint64_t i = 0, at = hash & mask; i < 8; ++i, at = (at + 1) & mask)
+			if (refused[at].hash == hash) return refused[at].frame + RefuseFrames > frame;
+		return false;
+	}
+	void Refuse(uint64_t hash, uint64_t frame) {
+		hash            = IndexHash(hash);
+		const auto mask = refused.size() - 1;
+		auto*      slot = &refused[hash & mask];
+		for (uint64_t i = 0, at = hash & mask; i < 8; ++i, at = (at + 1) & mask)
+			if (refused[at].hash == hash || refused[at].hash == 0 || refused[at].frame + RefuseFrames <= frame) {
+				slot = &refused[at];
+				break;
+			}
+		*slot = {hash, frame};
+	}
+	std::unordered_map<const ShaderRecompiler::IR::CompiledShaderInfo*, NativeXprUserData> user_data;
+	// Uses of each relocated key in the frame: the n-th use finds the n-th record (objects that differ
+	// only in their pointers keep their own records).
+	struct Occurrence {
+		uint64_t hash  = 0;
+		uint32_t frame = 0, count = 0;
+	};
+	std::vector<Occurrence> occurrences = std::vector<Occurrence>(8192);
+	uint32_t                NextOccurrence(uint64_t hash, uint64_t frame) {
+		hash            = IndexHash(hash);
+		const auto mask = occurrences.size() - 1;
+		const auto now  = static_cast<uint32_t>(frame);
+		// Entries of earlier frames are free: within a frame none is freed, so a probe run never breaks.
+		for (uint64_t i = 0, at = hash & mask; i < 16; ++i, at = (at + 1) & mask) {
+			auto& entry = occurrences[at];
+			if (entry.hash == 0 || entry.frame != now) {
+				entry = {hash, now, 1};
+				return 0;
+			}
+			if (entry.hash == hash) return entry.count++;
+		}
+		return UINT32_MAX;
 	}
 	uint64_t                                swept_frame = UINT64_MAX;
 	// Draw-state key of the latest draw (native or normal), for clean draws.
@@ -1308,6 +1444,68 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 	auto       record    = std::make_unique<NativeXprRecord>();
 	const auto state_key = NativeXprStateKey(buffer);
 	auto&      pipelines = m_context.GetPipelineCache();
+	NativeXprKey(buffer, record->key);
+	auto& pair_stats = cache.pairs[NativeXprPairKey(record->key)];
+	// A refused relocated key is not requested again for a while (NativeXprCache::Refused).
+	const auto refuse = [&] {
+		if (cache.tried_relocate != 0) cache.Refuse(cache.tried_hash, m_context.FrameNumber());
+	};
+	// Relocation (NativeXprTry): the key words of user data pairs the SRTs only read through
+	// (pointers to a new copy of the same tables every frame) and of user data nothing reads leave
+	// the key; the gather reads through the pointers. The VS's user data are the GS SGPRs (NGG ones
+	// from s8); the vertex tables a static vertex input reads (ShaderGetStaticInputInfoVS) stay.
+	std::vector<NativeXprRecord::Root>   roots;
+	std::vector<NativeXprRecord::Unread> unread;
+	if (kyty_local_native_xpr_relocate_mode.load(std::memory_order_relaxed) != 0) {
+		const auto&    key   = record->key;
+		const uint32_t hs    = key[4], gs = key[5 + hs], ps = key[6 + hs + gs];
+		const uint32_t shift = (buffer.GetRegisters().GetShaderStages() & 0x20u) != 0 ? 8 : 0;
+		uint64_t       words = 0;
+		for (uint32_t st = 0; st < stages.size(); ++st) {
+			const auto* program   = stages[st]->runtime->program;
+			auto [use, unknown]   = cache.user_data.try_emplace(program);
+			if (unknown) use->second = NativeXprUserDataOf(pipelines, *program);
+			uint32_t fetch = 0;
+			if (st == 0 && state.vs_input_info.fetch_embedded)
+				for (const auto reg: {state.vs_input_info.fetch_attrib_reg, state.vs_input_info.fetch_buffer_reg})
+					if (reg >= 0 && reg + shift < 31) fetch |= 3u << (reg + shift);
+			// The key word of the stage's user data k, or -1.
+			const auto word_of = [&](uint32_t k) {
+				const auto j    = st == 0 ? int64_t {k} - shift : int64_t {k};
+				const auto word = (st == 0 ? 6 + hs : 7 + hs + gs) + j;
+				return j < 0 || j >= (st == 0 ? gs : ps) || word >= 64 ? int64_t {-1} : word;
+			};
+			for (auto pairs = pair_stats.pointers_off ? 0u : use->second.pointers & ~fetch & ~(fetch >> 1); pairs != 0;
+			     pairs &= pairs - 1) {
+				const auto k = static_cast<uint32_t>(std::countr_zero(pairs));
+				const auto w = word_of(k);
+				if (w < 0 || word_of(k + 1) < 0) continue;
+				words |= 3ull << w;
+				roots.push_back({static_cast<uint8_t>(st), static_cast<uint8_t>(k), static_cast<uint8_t>(w),
+				                 static_cast<uint8_t>(w + 1), NativeXprUserDataWord(*program, k),
+				                 NativeXprUserDataWord(*program, k + 1)});
+			}
+			for (auto bits = use->second.unread & ~fetch; bits != 0; bits &= bits - 1) {
+				const auto k = static_cast<uint32_t>(std::countr_zero(bits));
+				const auto w = word_of(k);
+				if (w < 0) continue;
+				words |= 1ull << w;
+				unread.push_back({static_cast<uint8_t>(st), static_cast<uint8_t>(k), static_cast<uint8_t>(w)});
+			}
+		}
+		if (!pair_stats.relocation_known) {
+			pair_stats.relocation_known = true;
+			pair_stats.relocate         = words;
+		}
+		// A relocated record comes from a try under the same words (its use in the frame); other tries
+		// (indirect runs, a pair's first) store whole keys.
+		if (cache.tried_relocate == 0) {
+			roots.clear();
+			unread.clear();
+		} else if (words != cache.tried_relocate) {
+			return refuse();
+		}
+	}
 	const auto colors    = std::span {state.color_info, state.color_count};
 	const auto* pixel    = state.ps_active ? &state.ps_input_info : nullptr;
 	auto* const variant  = kyty_local_async_xpr_pipelines_mode.load(std::memory_order_relaxed) != 0
@@ -1332,11 +1530,16 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 	if (runtime) {
 		uint64_t total_words = 0;
 		for (const auto& [address, size]: cache.reads) {
-			if (address % 4 != 0 || size % 4 != 0 || size == 0 || size > 4096)
+			if (address % 4 != 0 || size % 4 != 0 || size == 0 || size > 4096) {
+				refuse();
 				return LiveCounters::Add(LiveCounters::XprRefuseReads);
+			}
 			total_words += size / 4;
 		}
-		if (total_words > 2048) return LiveCounters::Add(LiveCounters::XprRefuseReads);
+		if (total_words > 2048) {
+			refuse();
+			return LiveCounters::Add(LiveCounters::XprRefuseReads);
+		}
 		record->reads.reserve(cache.reads.size());
 		record->words.reserve(total_words);
 		for (const auto& [address, size]: cache.reads) {
@@ -1363,9 +1566,44 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 			record->stages[1].shader_base = pixel_params.Base();
 		}
 	}
-	if (NativeXprBindResources(*record, stages, pipeline.descriptor_set_layout, runtime) != nullptr)
+	if (NativeXprBindResources(*record, stages, pipeline.descriptor_set_layout, runtime) != nullptr) {
+		refuse();
 		return LiveCounters::Add(LiveCounters::XprRefuseBind);
+	}
+	// The roots' pointers: the user data the SRTs were evaluated with, as the key and the shader data
+	// hold them.
+	for (auto& root: roots) {
+		const auto& stage = record->stages[root.stage];
+		const auto& user  = stage.user_data;
+		const auto  held  = [&](uint8_t data, uint32_t value) {
+			return data == NativeXprNoRoot || (data < stage.shader_data.size() && stage.shader_data[data] == value);
+		};
+		if (!runtime || root.user + 1u >= user.size() || user != stage.snapshot.user_data ||
+		    user[root.user] != record->key[root.low_word] || user[root.user + 1] != record->key[root.high_word] ||
+		    !held(root.low_data, user[root.user]) || !held(root.high_data, user[root.user + 1]))
+			return refuse();
+		root.base = NativeXprBase(user[root.user], user[root.user + 1]);
+		for (size_t r = 0; r < static_cast<size_t>(&root - roots.data()) && root.same == NativeXprNoRoot; ++r)
+			if (roots[r].same == NativeXprNoRoot && record->key[roots[r].low_word] == record->key[root.low_word] &&
+			    record->key[roots[r].high_word] == record->key[root.high_word])
+				root.same = static_cast<uint8_t>(r);
+	}
+	// Unread words past the stage's user data reach no part of the draw.
+	for (const auto& word: unread) {
+		const auto& stage = record->stages[word.stage];
+		if (!runtime || stage.user_data != stage.snapshot.user_data ||
+		    (word.user < stage.user_data.size() && stage.user_data[word.user] != record->key[word.word]))
+			return refuse();
+	}
+	record->roots  = std::move(roots);
+	record->unread = std::move(unread);
 	if (runtime) NativeXprRetrace(*record);
+	if (!record->roots.empty() && !record->gather.traced) {
+		// Without the reads through them the pointers stay in the pair's keys.
+		pair_stats.pointers_off = true;
+		for (const auto& root: record->roots) pair_stats.relocate &= ~(3ull << root.low_word);
+		return refuse();
+	}
 
 	// Render targets as this draw left them; a reopened rendering loads.
 	NativeXprDrawState draw_state;
@@ -1386,7 +1624,7 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 		                              rendering.color_attachments[i].image_layout,
 		                              image.binding.attachment_access,
 		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
-		                              metadata_of(desc), view.base_layer, image.serial});
+		                              metadata_of(desc), view.base_layer, image.serial, desc.info});
 	}
 	if (state.depth_info.image_id) {
 		const auto& desc  = state.depth_info.desc;
@@ -1396,7 +1634,7 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 		                              rendering.depth_stencil_attachment.image_layout,
 		                              image.binding.attachment_access,
 		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
-		                              metadata_of(desc), view.base_layer, image.serial});
+		                              metadata_of(desc), view.base_layer, image.serial, desc.info});
 	}
 	draw_state.meta_epoch = 0;
 	draw_state.dynamic = LocalDrawRecording::Capture(
@@ -1412,11 +1650,16 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 	*slot = std::move(draw_state);
 	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
 
-	NativeXprKey(buffer, record->key);
+	// A relocated key: without the roots' and the unread words, with the use in the frame (NativeXprTry).
+	if (!record->roots.empty() || !record->unread.empty()) {
+		for (const auto& root: record->roots) record->key[root.low_word] = record->key[root.high_word] = 0;
+		for (const auto& word: record->unread) record->key[word.word] = 0;
+		record->key.push_back(cache.tried_occurrence);
+		LiveCounters::Add(LiveCounters::XprRelocatedStored);
+	}
 	record->HoldKey();
 	const auto hash    = XXH3_64bits(record->key.data(), record->key.size() * sizeof(uint32_t));
 	record->used_frame = m_context.FrameNumber();
-	auto& pair_stats   = cache.pairs[NativeXprPairKey(record->key)];
 	++pair_stats.stored;
 	if (auto old = cache.records.find(hash); old != cache.records.end()) {
 		// Pipelines depend on the programs and the draw state only; direct-draw offsets also on
@@ -1497,35 +1740,71 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 	auto& gather  = record.gather;
 	gather.traced = false;
 	if (record.stages[0].shader_base == 0) return;
+	// `root`: the record root the address is relative to (relocation), or NativeXprNoRoot.
 	struct StructuralRead {
 		uint64_t address;
 		uint32_t value;
 		uint8_t  use;
+		uint8_t  root;
 		bool     operator<(const StructuralRead& other) const { return address < other.address; }
+	};
+	struct DataRead {
+		uint64_t address;
+		uint32_t target; // stage << 24 | flat
+		uint8_t  root;
+		bool     operator<(const DataRead& other) const {
+			return address != other.address ? address < other.address : target < other.target;
+		}
 	};
 	// Spans over the non-clean structural words and the data words.
 	struct Word {
 		uint64_t address;
 		int32_t  value;
 		int32_t  data;
+		uint8_t  root;
+		uint8_t  level;
 	};
+	// Relocated records: a pointer read from memory (its halves' addresses and the roots they are read
+	// through), whether what is read through it moves with it, and its root and level as a span root.
+	struct Pointer {
+		uint64_t low, high;
+		uint8_t  low_root, high_root;
+		bool     usable = true;
+		uint8_t  root = NativeXprNoRoot, level = 0;
+	};
+	using Trace = ShaderRecompiler::IR::SrtReadTrace;
 	// Scratch kept across calls (a retrace per stored record: tens to hundreds a frame
 	// while walking, each with some twenty temporary vectors otherwise).
 	thread_local struct {
 		std::vector<StructuralRead>                structural, clean, unique;
-		std::vector<std::pair<uint64_t, uint32_t>> feeds, data, index_of;
+		std::vector<std::pair<uint64_t, uint32_t>> feeds, index_of;
+		std::vector<DataRead>                      data;
+		std::vector<std::pair<uint64_t, uint8_t>>  roots;
 		std::vector<uint32_t>                      feed_value, cursor;
 		std::vector<Word>                          words;
-		ShaderRecompiler::IR::SrtReadTrace         trace;
+		std::vector<Pointer>                       pointers;
+		std::vector<uint8_t>                       read_root, levels;
+		Trace                                      trace;
 	} scratch;
 	auto& structural = scratch.structural;
 	auto& clean      = scratch.clean;
 	auto& feeds      = scratch.feeds; // (address, packed feed)
-	auto& data       = scratch.data;  // (address, stage << 24 | flat)
+	auto& data       = scratch.data;
+	auto& pointers   = scratch.pointers;
 	structural.clear();
 	clean.clear();
 	feeds.clear();
 	data.clear();
+	pointers.clear();
+	const auto user_roots = static_cast<uint8_t>(record.roots.size());
+	// The record root of stage `st`'s reads through user data pair `user`.
+	const auto root_of = [&](uint32_t st, uint8_t user) {
+		for (size_t r = 0; user != Trace::NoRoot && r < record.roots.size(); ++r) {
+			const auto& root = record.roots[r];
+			if (root.stage == st && root.user == user) return root.same != NativeXprNoRoot ? root.same : static_cast<uint8_t>(r);
+		}
+		return NativeXprNoRoot;
+	};
 	auto& pipelines   = m_context.GetPipelineCache();
 	auto& untraceable = m_native_xpr->untraceable;
 	for (uint32_t st = 0; st < record.stage_count; ++st)
@@ -1537,12 +1816,32 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 			untraceable.insert(stage.program);
 			return;
 		}
-		if (trace.flat_words != stage.flattened.size()) {
+		if (trace.flat_words != stage.flattened.size() || (trace.unrooted && !record.roots.empty())) {
 			return;
 		}
-		for (const auto& [flat, address]: trace.data) data.emplace_back(address, st << 24u | flat);
-		for (const auto& read: trace.structural)
-			(read.clean ? clean : structural).push_back({read.address, read.value, read.use});
+		// A read's root: a user data pair's, or (relocated records) the pointer two earlier reads make.
+		auto&      read_root = scratch.read_root;
+		const auto base_of   = [&](const Trace::Base& base) {
+			if (base.root != Trace::NoRoot) return root_of(st, base.root);
+			if (base.low == Trace::NoBase || user_roots == 0) return NativeXprNoRoot;
+			const auto& low  = trace.structural[base.low];
+			const auto& high = trace.structural[base.high];
+			if (low.clean || high.clean) return NativeXprNoRoot;
+			for (size_t p = 0; p < pointers.size(); ++p)
+				if (pointers[p].low == low.address && pointers[p].high == high.address)
+					return static_cast<uint8_t>(user_roots + p);
+			if (user_roots + pointers.size() >= NativeXprNoRoot) return NativeXprNoRoot;
+			pointers.push_back({low.address, high.address, read_root[base.low], read_root[base.high]});
+			return static_cast<uint8_t>(user_roots + pointers.size() - 1);
+		};
+		read_root.assign(trace.structural.size(), NativeXprNoRoot);
+		for (size_t i = 0; i < trace.structural.size(); ++i) read_root[i] = base_of(trace.structural[i].base);
+		for (size_t i = 0; i < trace.data.size(); ++i)
+			data.push_back({trace.data[i].second, st << 24u | trace.data[i].first, base_of(trace.data_bases[i])});
+		for (size_t i = 0; i < trace.structural.size(); ++i) {
+			const auto& read = trace.structural[i];
+			(read.clean ? clean : structural).push_back({read.address, read.value, read.use, read_root[i]});
+		}
 		for (const auto& feed: trace.feeds) {
 			if (feed.index >= 0x10000 || feed.dword >= 8) continue;
 			feeds.emplace_back(trace.structural[feed.read].address,
@@ -1553,6 +1852,53 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 			if (flat >= 0x1000000) continue;
 			feeds.emplace_back(trace.structural[read].address, st << 28u | NativeXprFlatFeed << 24u | flat);
 		}
+	}
+	// A pointer moves what is read through it when its halves are read for nothing else (no other
+	// address, descriptor or predicate use, no clean read; flattened copies follow); else those reads
+	// stay at their addresses, and a change of the pointer evaluates again.
+	auto& levels = scratch.levels;
+	levels.clear();
+	if (!pointers.empty()) {
+		for (auto& pointer: pointers) {
+			const auto half = [&](uint64_t address) { return address == pointer.low || address == pointer.high; };
+			for (const auto& read: structural)
+				if (half(read.address) && read.use != Trace::Pointer) pointer.usable = false;
+			for (const auto& read: clean)
+				if (half(read.address)) pointer.usable = false;
+			for (const auto& [address, packed]: feeds)
+				if (half(address) && ((packed >> 24u) & 0xfu) != NativeXprFlatFeed) pointer.usable = false;
+		}
+		// The levels (a pointer's halves are read at a lower one) and roots of the usable ones.
+		uint8_t    next     = user_roots;
+		const auto level_of = [&](uint8_t root) {
+			return root != NativeXprNoRoot && root >= user_roots && pointers[root - user_roots].usable
+			           ? pointers[root - user_roots].level
+			           : uint8_t {0};
+		};
+		for (auto& pointer: pointers) {
+			pointer.level = static_cast<uint8_t>(1 + std::max(level_of(pointer.low_root), level_of(pointer.high_root)));
+			if (!pointer.usable) continue;
+			pointer.root = next++;
+			levels.push_back(pointer.level);
+		}
+		const auto remap = [&](uint8_t& root) {
+			if (root != NativeXprNoRoot && root >= user_roots) root = pointers[root - user_roots].root;
+		};
+		for (auto* reads: {&structural, &clean})
+			for (auto& read: *reads) remap(read.root);
+		for (auto& read: data) remap(read.root);
+	}
+	// A word read both at a fixed address and through a root (or through two roots) would part on
+	// relocation: such a record is not traced.
+	if (!record.roots.empty()) {
+		auto& roots = scratch.roots;
+		roots.clear();
+		for (const auto* reads: {&structural, &clean})
+			for (const auto& read: *reads) roots.emplace_back(read.address, read.root);
+		for (const auto& read: data) roots.emplace_back(read.address, read.root);
+		std::ranges::sort(roots);
+		for (size_t i = 1; i < roots.size(); ++i)
+			if (roots[i].first == roots[i - 1].first && roots[i].second != roots[i - 1].second) return;
 	}
 	const auto runs_of = [&](std::vector<StructuralRead>& reads, bool is_clean) {
 		std::sort(reads.begin(), reads.end());
@@ -1565,9 +1911,10 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 		}
 		for (const auto& read: unique) {
 			if (gather.structural.empty() || gather.structural.back().clean != is_clean ||
-			    gather.structural.back().count >= 16 ||
+			    gather.structural.back().root != read.root || gather.structural.back().count >= 16 ||
 			    gather.structural.back().address + 4ull * gather.structural.back().count != read.address)
-				gather.structural.push_back({read.address, 0, static_cast<uint32_t>(gather.values.size()), is_clean});
+				gather.structural.push_back(
+				    {read.address, 0, static_cast<uint32_t>(gather.values.size()), is_clean, read.root});
 			++gather.structural.back().count;
 			gather.values.push_back(read.value);
 			gather.uses.push_back(read.use);
@@ -1578,24 +1925,35 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 	gather.uses.clear();
 	runs_of(structural, false);
 	runs_of(clean, true);
+	// Spans read through a pointer come after those its halves are in.
+	const auto level_of = [&](uint8_t root) {
+		return root != NativeXprNoRoot && root >= user_roots ? levels[root - user_roots] : uint8_t {0};
+	};
+	const auto by_level = [](const Word& a, const Word& b) {
+		return std::tie(a.level, a.root, a.address) < std::tie(b.level, b.root, b.address);
+	};
+	auto& words = scratch.words;
+	words.clear();
+	for (const auto& run: gather.structural)
+		if (run.clean)
+			for (uint32_t i = 0; i < run.count; ++i)
+				words.push_back({run.address + 4ull * i, static_cast<int32_t>(run.first + i), -1, run.root, level_of(run.root)});
+	std::ranges::sort(words, by_level);
 	gather.clean_spans.clear();
 	gather.clean_value.clear();
-	for (const auto& run: gather.structural) {
-		if (!run.clean) continue;
-		for (uint32_t i = 0; i < run.count; ++i) {
-			const auto address = run.address + 4ull * i;
-			auto*      span    = gather.clean_spans.empty() ? nullptr : &gather.clean_spans.back();
-			const auto end     = span != nullptr ? span->address + 4ull * span->count : 0;
-			// The gap words count too: a span never exceeds NativeXprSpanWords (the gather's buffer).
-			if (span == nullptr || address < end || address - end > 32 || address / 4096 != span->address / 4096 ||
-			    span->count + (address - end) / 4 + 1 > NativeXprSpanWords) {
-				gather.clean_spans.push_back({address, 0, static_cast<uint32_t>(gather.clean_value.size())});
-				span = &gather.clean_spans.back();
-			}
-			for (; span->address + 4ull * span->count < address; ++span->count) gather.clean_value.push_back(-1);
-			gather.clean_value.push_back(static_cast<int32_t>(run.first + i));
-			++span->count;
+	for (const auto& word: words) {
+		auto*      span = gather.clean_spans.empty() ? nullptr : &gather.clean_spans.back();
+		const auto end  = span != nullptr ? span->address + 4ull * span->count : 0;
+		// The gap words count too: a span never exceeds NativeXprSpanWords (the gather's buffer).
+		if (span == nullptr || span->root != word.root || word.address < end || word.address - end > 32 ||
+		    word.address / 4096 != span->address / 4096 || span->count + (word.address - end) / 4 + 1 > NativeXprSpanWords) {
+			gather.clean_spans.push_back(
+			    {word.address, 0, static_cast<uint32_t>(gather.clean_value.size()), word.root, word.level});
+			span = &gather.clean_spans.back();
 		}
+		for (; span->address + 4ull * span->count < word.address; ++span->count) gather.clean_value.push_back(-1);
+		gather.clean_value.push_back(word.value);
+		++span->count;
 	}
 	// Feeds per structural value (clean values never feed a patch).
 	auto& index_of = scratch.index_of; // (address, value index), non-clean runs
@@ -1604,6 +1962,20 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 		if (!run.clean)
 			for (uint32_t i = 0; i < run.count; ++i) index_of.emplace_back(run.address + 4ull * i, run.first + i);
 	std::ranges::sort(index_of);
+	// The usable pointers' halves as structural values.
+	const auto value_at = [&](uint64_t address) {
+		const auto it = std::ranges::lower_bound(index_of, std::pair {address, 0u});
+		return it != index_of.end() && it->first == address ? it->second : UINT32_MAX;
+	};
+	gather.pointers.clear();
+	gather.pointer_value.assign(gather.values.size(), 0);
+	for (const auto& pointer: pointers) {
+		if (!pointer.usable) continue;
+		const auto low = value_at(pointer.low), high = value_at(pointer.high);
+		if (low == UINT32_MAX || high == UINT32_MAX) return;
+		gather.pointers.push_back({low, high});
+		gather.pointer_value[low] = gather.pointer_value[high] = 1;
+	}
 	std::ranges::sort(feeds);
 	{
 		// Grouped by value in feed order: a count per value, its prefix sums as the
@@ -1625,31 +1997,30 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 		for (size_t f = 0; f < feeds.size(); ++f)
 			if (feed_value[f] != UINT32_MAX) gather.feeds[cursor[feed_value[f]]++] = feeds[f].second;
 	}
-	std::ranges::sort(data);
+	std::sort(data.begin(), data.end());
 	gather.data.clear();
 	gather.targets_at.clear();
 	gather.targets.clear();
 	for (size_t i = 0; i < data.size();) {
-		const auto address = data[i].first;
-		if (gather.data.empty() || gather.data.back().count >= 16 ||
+		const auto address = data[i].address;
+		if (gather.data.empty() || gather.data.back().root != data[i].root || gather.data.back().count >= 16 ||
 		    gather.data.back().address + 4ull * gather.data.back().count != address)
-			gather.data.push_back({address, 0, static_cast<uint32_t>(gather.targets_at.size()), false});
+			gather.data.push_back({address, 0, static_cast<uint32_t>(gather.targets_at.size()), false, data[i].root});
 		++gather.data.back().count;
 		gather.targets_at.push_back(static_cast<uint32_t>(gather.targets.size()));
-		for (; i < data.size() && data[i].first == address; ++i) gather.targets.push_back(data[i].second);
+		for (; i < data.size() && data[i].address == address; ++i) gather.targets.push_back(data[i].target);
 	}
 	gather.targets_at.push_back(static_cast<uint32_t>(gather.targets.size()));
 
-	auto& words = scratch.words;
 	words.clear();
 	for (const auto& run: gather.structural)
 		if (!run.clean)
 			for (uint32_t i = 0; i < run.count; ++i)
-				words.push_back({run.address + 4ull * i, static_cast<int32_t>(run.first + i), -1});
+				words.push_back({run.address + 4ull * i, static_cast<int32_t>(run.first + i), -1, run.root, level_of(run.root)});
 	for (const auto& run: gather.data)
 		for (uint32_t i = 0; i < run.count; ++i)
-			words.push_back({run.address + 4ull * i, -1, static_cast<int32_t>(run.first + i)});
-	std::ranges::sort(words, {}, &Word::address);
+			words.push_back({run.address + 4ull * i, -1, static_cast<int32_t>(run.first + i), run.root, level_of(run.root)});
+	std::ranges::sort(words, by_level);
 	gather.spans.clear();
 	gather.words.clear();
 	gather.word_value.clear();
@@ -1658,7 +2029,7 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 	for (const auto& word: words) {
 		auto*          span = gather.spans.empty() ? nullptr : &gather.spans.back();
 		const uint64_t end  = span != nullptr ? span->address + 4ull * span->count : 0;
-		if (span != nullptr && word.address < end) {
+		if (span != nullptr && span->root == word.root && word.address < end) {
 			// Read both structurally and as data.
 			const auto at = span->first + span->count - 1;
 			if (word.value >= 0) gather.word_value[at] = word.value;
@@ -1666,9 +2037,9 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 			continue;
 		}
 		// The gap words count too: a span never exceeds NativeXprSpanWords (the gather's buffer).
-		if (span == nullptr || word.address - end > Gap || word.address / Page != span->address / Page ||
-		    span->count + (word.address - end) / 4 + 1 > NativeXprSpanWords) {
-			gather.spans.push_back({word.address, 0, static_cast<uint32_t>(gather.words.size())});
+		if (span == nullptr || span->root != word.root || word.address - end > Gap ||
+		    word.address / Page != span->address / Page || span->count + (word.address - end) / 4 + 1 > NativeXprSpanWords) {
+			gather.spans.push_back({word.address, 0, static_cast<uint32_t>(gather.words.size()), word.root, word.level});
 			span = &gather.spans.back();
 		}
 		for (; span->address + 4ull * span->count < word.address; ++span->count) {
@@ -1714,6 +2085,10 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
 			gather.words[w]   = record.stages[target >> 24u].flattened[target & 0xffffffu];
 		}
 	}
+	// Spans through a root keep their offset from its base (NativeXprAddress).
+	for (auto* spans: {&gather.spans, &gather.clean_spans})
+		for (auto& span: *spans)
+			if (span.root != NativeXprNoRoot) span.address -= NativeXprAddress(record, NativeXprRecord::Gather::Span {0, 0, 0, span.root});
 	gather.traced = true;
 }
 
@@ -1836,55 +2211,81 @@ bool RenderExecutor::NativeXprGather(NativeXprRecord& record) {
 	NativeXprReader reader(m_context.GetGpuResources());
 	auto& changed = m_native_xpr->changed; // (value index, new value)
 	changed.clear();
-	// Clean structural reads (GPU-written memory, read as the evaluation reads
-	// it) are never patched.
-	std::array<uint32_t, NativeXprSpanWords> fresh;
-	for (const auto& item: gather.clean_spans) {
-		if (item.count > fresh.size()) return false; // never past the buffer: evaluate again
-		const auto* values = gather.clean_value.data() + item.first;
-		// A span that reads clean has clean words; otherwise each word is read
-		// as the evaluation reads it.
-		if (Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(item.address, fresh.data(), 4ull * item.count)) {
-			for (uint32_t i = 0; i < item.count; ++i)
-				if (values[i] >= 0 && fresh[i] != gather.values[values[i]]) return false;
-			continue;
-		}
-		for (uint32_t i = 0; i < item.count; ++i) {
-			if (values[i] < 0) continue;
-			uint32_t value = 0;
-			if (!NativeXprReadClean(item.address + 4ull * i, 1, &value) || value != gather.values[values[i]])
-				return false;
-		}
-	}
 	// Records are mostly used once per frame: their guest words are cold. Start
 	// every line's load before comparing any.
-	for (const auto& item: gather.spans)
-		for (uint64_t line = item.address & ~63ull; line < item.address + 4ull * item.count; line += 64)
-			__builtin_prefetch(reinterpret_cast<const void*>(line));
 	for (const auto& item: gather.spans) {
-		if (item.count > fresh.size()) return false; // never past the buffer: evaluate again
-		reader.Read(item.address, item.count, fresh.data());
-		auto* held = gather.words.data() + item.first;
-		if (std::memcmp(fresh.data(), held, item.count * 4ull) == 0) continue;
-		for (uint32_t i = 0; i < item.count; ++i) {
-			const auto value = fresh[i];
-			if (value == held[i]) continue;
-			const auto at = item.first + i;
-			if (const auto d = gather.word_data[at]; d >= 0)
-				for (auto t = gather.targets_at[d]; t < gather.targets_at[d + 1]; ++t) {
-					const auto target = gather.targets[t];
-					record.stages[target >> 24u].flattened[target & 0xffffffu] = value;
-				}
-			if (const auto v = gather.word_value[at]; v >= 0) {
-				// Only words that feed nothing but descriptor dwords may be patched;
-				// anything else is evaluated again (which traces again).
-				if ((gather.uses[v] & ~ShaderRecompiler::IR::SrtReadTrace::Descriptor) != 0 ||
-				    gather.feeds_at[v] == gather.feeds_at[v + 1])
-					return false;
-				changed.emplace_back(v, value);
-				continue; // held once the patch is done
+		const auto address = NativeXprAddress(record, item);
+		for (uint64_t line = address & ~63ull; line < address + 4ull * item.count; line += 64)
+			__builtin_prefetch(reinterpret_cast<const void*>(line));
+	}
+	std::array<uint32_t, NativeXprSpanWords> fresh;
+	// A pointer read from memory (a root past the record's) may hold anything: what is read through it
+	// must be mapped.
+	const auto readable = [&](const NativeXprRecord::Gather::Span& item, uint64_t address) {
+		return item.count <= fresh.size() && // never past the buffer: evaluate again
+		       (item.root == NativeXprNoRoot || item.root < record.roots.size() ||
+		        Libs::LibKernel::Memory::IsFullyMapped(address, 4ull * item.count));
+	};
+	// Level by level: the spans read through a pointer after those holding it.
+	size_t next_clean = 0, next = 0;
+	while (next_clean < gather.clean_spans.size() || next < gather.spans.size()) {
+		const auto level = std::min(next_clean < gather.clean_spans.size() ? gather.clean_spans[next_clean].level : 0xff,
+		                            next < gather.spans.size() ? gather.spans[next].level : 0xff);
+		// Clean structural reads (GPU-written memory, read as the evaluation reads
+		// it) are never patched.
+		for (; next_clean < gather.clean_spans.size() && gather.clean_spans[next_clean].level == level; ++next_clean) {
+			const auto& item    = gather.clean_spans[next_clean];
+			const auto* values  = gather.clean_value.data() + item.first;
+			const auto  address = NativeXprAddress(record, item);
+			if (!readable(item, address)) return false;
+			// A span that reads clean has clean words; otherwise each word is read
+			// as the evaluation reads it.
+			if (Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(address, fresh.data(), 4ull * item.count)) {
+				for (uint32_t i = 0; i < item.count; ++i)
+					if (values[i] >= 0 && fresh[i] != gather.values[values[i]]) return false;
+				continue;
 			}
-			held[i] = value;
+			for (uint32_t i = 0; i < item.count; ++i) {
+				if (values[i] < 0) continue;
+				uint32_t value = 0;
+				if (!NativeXprReadClean(address + 4ull * i, 1, &value) || value != gather.values[values[i]]) return false;
+			}
+		}
+		for (; next < gather.spans.size() && gather.spans[next].level == level; ++next) {
+			const auto& item    = gather.spans[next];
+			const auto  address = NativeXprAddress(record, item);
+			if (!readable(item, address)) return false;
+			reader.Read(address, item.count, fresh.data());
+			auto* held = gather.words.data() + item.first;
+			if (std::memcmp(fresh.data(), held, item.count * 4ull) == 0) continue;
+			for (uint32_t i = 0; i < item.count; ++i) {
+				const auto value = fresh[i];
+				if (value == held[i]) continue;
+				const auto at = item.first + i;
+				if (const auto d = gather.word_data[at]; d >= 0)
+					for (auto t = gather.targets_at[d]; t < gather.targets_at[d + 1]; ++t) {
+						const auto target = gather.targets[t];
+						record.stages[target >> 24u].flattened[target & 0xffffffu] = value;
+					}
+				if (const auto v = gather.word_value[at]; v >= 0) {
+					// A pointer's half: what later spans read through it moves (its feeds are flattened copies).
+					if (gather.pointer_value[v] != 0) {
+						for (auto f = gather.feeds_at[v]; f < gather.feeds_at[v + 1]; ++f)
+							record.stages[gather.feeds[f] >> 28u].flattened[gather.feeds[f] & 0xffffffu] = value;
+						gather.values[v] = held[i] = value;
+						continue;
+					}
+					// Only words that feed nothing but descriptor dwords may be patched;
+					// anything else is evaluated again (which traces again).
+					if ((gather.uses[v] & ~ShaderRecompiler::IR::SrtReadTrace::Descriptor) != 0 ||
+					    gather.feeds_at[v] == gather.feeds_at[v + 1]) {
+						return false;
+					}
+					changed.emplace_back(v, value);
+					continue; // held once the patch is done
+				}
+				held[i] = value;
+			}
 		}
 	}
 	if (!changed.empty()) {
@@ -2020,11 +2421,16 @@ bool RenderExecutor::NativeXprValidate(NativeXprRecord& record, uint64_t frame) 
 		const auto unmapped = [&](uint64_t address, uint32_t count) {
 			return resources.UnmappedSince(record.mapping_epoch, address, 4ull * count);
 		};
-		if (record.gather.traced
-		        ? std::ranges::any_of(record.gather.spans, [&](const auto& span) { return unmapped(span.address, span.count); })
-		        : std::ranges::any_of(record.reads, [&](const auto& read) { return unmapped(read.first, read.second); }))
+		if (record.gather.traced ? std::ranges::any_of(record.gather.spans,
+		                                               [&](const auto& span) {
+			                                               return unmapped(NativeXprAddress(record, span), span.count);
+		                                               })
+		                         : std::ranges::any_of(record.reads,
+		                                               [&](const auto& read) { return unmapped(read.first, read.second); }))
 			return false;
 	}
+	// The read log of a relocated record is at its first pointers.
+	if (!record.roots.empty() && !record.gather.traced) return false;
 	if (record.gather.traced) {
 		if (!NativeXprGather(record) && (record.gather.broken || !NativeXprReevaluate(record))) {
 			return false;
@@ -2442,20 +2848,76 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		cache.state_key_valid = true;
 	}
 	NativeXprKey(buffer, cache.key);
+	// Relocation: the pair's pointer words leave the key, and which use of the rest in the frame this
+	// is joins it.
+	const bool relocating =
+	    direct != nullptr && kyty_local_native_xpr_relocate_mode.load(std::memory_order_relaxed) != 0;
+	auto pair            = relocating ? cache.pairs.find(NativeXprPairKey(cache.key)) : cache.pairs.end();
+	cache.tried_relocate = 0;
+	if (pair != cache.pairs.end() && pair->second.relocate != 0) {
+		cache.full_key = cache.key;
+		for (auto words = pair->second.relocate; words != 0; words &= words - 1) cache.key[std::countr_zero(words)] = 0;
+		cache.tried_relocate   = pair->second.relocate;
+		cache.tried_occurrence = cache.NextOccurrence(
+		    XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t)), m_context.FrameNumber());
+		cache.key.push_back(cache.tried_occurrence);
+	}
 	const auto hash  = XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t));
 	auto* const found = cache.IndexFind(hash);
 	if (found != nullptr) NativeXprPrefetchFields(*found);
 	LiveCounters::Add(direct != nullptr ? LiveCounters::XprDirectTries : LiveCounters::XprTries);
 	if (found == nullptr || !found->SameKey(cache.key)) {
 		LiveCounters::Add(LiveCounters::XprMissKey);
-		if (const auto pair = cache.pairs.find(NativeXprPairKey(cache.key));
-		    pair != cache.pairs.end() && (pair->second.blocked || pair->second.unstorable))
+		if (!relocating) pair = cache.pairs.find(NativeXprPairKey(cache.key));
+		if (pair != cache.pairs.end() && (pair->second.blocked || pair->second.unstorable)) return false;
+		cache.tried_hash = hash;
+		// The first store of a pair learns its pointer words.
+		if (relocating && (pair == cache.pairs.end() || !pair->second.relocation_known)) {
+			m_native_xpr_store = true;
 			return false;
+		}
+		if (cache.tried_relocate != 0 && cache.Refused(hash, m_context.FrameNumber())) return false;
 		if (!cache.SeenAgain(hash, m_context.FrameNumber())) return false;
 		m_native_xpr_store = true;
 		return false;
 	}
-	auto& record      = *found;
+	auto& record = *found;
+	// A record that no longer holds: the normal path draws and stores again.
+	const auto drop = [&] {
+		LiveCounters::Add(LiveCounters::XprMissValidate);
+		cache.IndexErase(hash);
+		const auto owner = cache.records.find(hash);
+		NativeXprRetire(std::move(owner->second), true);
+		cache.records.erase(owner);
+		m_native_xpr_store = true;
+		return false;
+	};
+	// A relocated record reads through this draw's pointers (NativeXprGather) and holds its unread words.
+	if (!record.roots.empty() || !record.unread.empty()) {
+		if (cache.tried_relocate == 0) return false;
+		LiveCounters::Add(LiveCounters::XprRelocated);
+		const auto& key = cache.full_key;
+		for (const auto& word: record.unread) {
+			auto& stage = record.stages[word.stage];
+			if (word.user < stage.user_data.size())
+				stage.user_data[word.user] = stage.snapshot.user_data[word.user] = key[word.word];
+		}
+		for (const auto& root: record.roots)
+			if (root.same != NativeXprNoRoot && (key[root.low_word] != key[record.roots[root.same].low_word] ||
+			                                     key[root.high_word] != key[record.roots[root.same].high_word]))
+				return drop();
+		for (auto& root: record.roots) {
+			const auto low   = cache.full_key[root.low_word];
+			const auto high  = cache.full_key[root.high_word];
+			auto&      stage = record.stages[root.stage];
+			if (stage.user_data[root.user] == low && stage.user_data[root.user + 1] == high) continue;
+			stage.user_data[root.user] = stage.snapshot.user_data[root.user] = low;
+			stage.user_data[root.user + 1] = stage.snapshot.user_data[root.user + 1] = high;
+			if (root.low_data != NativeXprNoRoot) stage.shader_data[root.low_data] = low;
+			if (root.high_data != NativeXprNoRoot) stage.shader_data[root.high_data] = high;
+			root.base = NativeXprBase(low, high);
+		}
+	}
 	record.used_frame = m_context.FrameNumber();
 	++record.uses;
 	if (kyty_local_native_xpr_predict_mode.load(std::memory_order_relaxed) != 0) {
@@ -2517,6 +2979,20 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 			return false;
 		}
 	}
+	// A newer image with the same backing as a target is what the registers now select.
+	if (draw_state.targets_epoch != textures.ResolutionEpoch()) {
+		uint64_t proven = UINT64_MAX;
+		for (const auto& target: draw_state.targets) {
+			auto epoch = draw_state.targets_epoch;
+			if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) {
+				LiveCounters::Add(LiveCounters::XprMissTarget);
+				m_native_xpr_store = true;
+				return false;
+			}
+			proven = std::min(proven, epoch);
+		}
+		draw_state.targets_epoch = proven != UINT64_MAX ? proven : textures.ResolutionEpoch();
+	}
 	// Records are mostly used once per frame, so their data is cold: load the
 	// arrays together instead of missing on each in turn.
 	NativeXprPrefetchArrays(record);
@@ -2530,15 +3006,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	const auto frame = m_context.FrameNumber();
 	// Every use reads the SRT words again: the guest may rewrite constants between
 	// two draws of one frame (the normal path reads them at each draw).
-	if (!NativeXprValidate(record, frame)) {
-		LiveCounters::Add(LiveCounters::XprMissValidate);
-		cache.IndexErase(hash);
-		const auto owner = cache.records.find(hash);
-		NativeXprRetire(std::move(owner->second), true);
-		cache.records.erase(owner);
-		m_native_xpr_store = true;
-		return false;
-	}
+	if (!NativeXprValidate(record, frame)) return drop();
 	if (kyty_local_native_xpr_mode.load(std::memory_order_relaxed) == 2) {
 		m_native_xpr_verify = {&record, &draw_state};
 		return false;

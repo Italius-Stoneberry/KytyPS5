@@ -1445,6 +1445,26 @@ static bool EvaluateLinearSrt(const LinearSrtPlan& plan,const SrtRuntime& runtim
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
+// What a read node's address is based on (SrtReadTrace::Base): a user data pair, or two structural
+// reads (`read_index`: their indices in the trace; empty: none).
+static SrtReadTrace::Base PointerBase(const LinearSrtPlan& plan, const LinearSrtPlan::Node& node,
+                                      std::span<const uint32_t> read_index) {
+	using Kind = LinearSrtPlan::Kind;
+	SrtReadTrace::Base base;
+	if (node.op == ValueOpcode::ReadConstBuffer) return base;
+	const auto& low  = plan.nodes[node.args[0]];
+	const auto& high = plan.nodes[node.args[1]];
+	if (low.kind == Kind::User && high.kind == Kind::User && high.immediate == low.immediate + 1 &&
+	    low.immediate < SrtReadTrace::NoRoot) {
+		base.root = static_cast<uint8_t>(low.immediate);
+	} else if (low.kind == Kind::Read && high.kind == Kind::Read && !read_index.empty() &&
+	           read_index[node.args[0]] != SrtReadTrace::NoBase && read_index[node.args[1]] != SrtReadTrace::NoBase) {
+		base.low  = read_index[node.args[0]];
+		base.high = read_index[node.args[1]];
+	}
+	return base;
+}
+
 static bool TraceLinearPlan(const ResourcePlan& program, const LinearSrtPlan& plan, const SrtRuntime& runtime,
                             SrtReadTrace& trace) {
 	if (plan.function == nullptr) return false;
@@ -1463,46 +1483,55 @@ static bool TraceLinearPlan(const ResourcePlan& program, const LinearSrtPlan& pl
 	auto& structural = scratch.structural;
 	structural.assign(plan.nodes.size(), 0);
 	for (const auto& node: plan.nodes) {
-		uint32_t used = 0;
-		uint8_t  use  = SrtReadTrace::Computed;
 		switch (node.kind) {
 			case Kind::Read:
-				used = node.op == ValueOpcode::ReadConstBuffer ? 5u : 3u;
-				use  = SrtReadTrace::Address;
+				if (node.op == ValueOpcode::ReadConstBuffer) {
+					for (uint32_t i = 0; i < 5; ++i) structural[node.args[i]] |= SrtReadTrace::Address;
+				} else {
+					structural[node.args[0]] |= SrtReadTrace::Pointer;
+					structural[node.args[1]] |= SrtReadTrace::Pointer;
+					structural[node.args[2]] |= SrtReadTrace::Address;
+				}
 				break;
-			case Kind::Unary: used = 1; break;
-			case Kind::Binary: used = 2; break;
-			case Kind::Select: used = 3; break;
+			case Kind::Unary: structural[node.args[0]] |= SrtReadTrace::Computed; break;
+			case Kind::Binary:
+				for (uint32_t i = 0; i < 2; ++i) structural[node.args[i]] |= SrtReadTrace::Computed;
+				break;
+			case Kind::Select:
+				for (uint32_t i = 0; i < 3; ++i) structural[node.args[i]] |= SrtReadTrace::Computed;
+				break;
 			default: break;
 		}
-		for (uint32_t i = 0; i < used; ++i) structural[node.args[i]] |= use;
 	}
 	for (const auto node: plan.descriptor_words)
 		if (node != UINT32_MAX) structural[node] |= SrtReadTrace::Descriptor;
 	trace.flat_words = plan.flat_words.size();
+	// Anything in the flattened SRT but a plain read is an immediate, user data or computed from
+	// structural reads: its value stays, its inputs are compared.
 	auto& data = scratch.data;
 	data.assign(plan.nodes.size(), 0);
-	for (uint32_t i = 0; i < plan.flat_words.size(); ++i) {
-		const auto index = plan.flat_words[i];
-		if (index == UINT32_MAX) continue;
-		const auto& node = plan.nodes[index];
-		// Anything else in the flattened SRT is an immediate, user data or computed
-		// from structural reads: its value stays, its inputs are compared.
-		if (node.kind != Kind::Read || structural[index] || node.clean) continue;
-		uint64_t address = 0;
-		if (!LinearSrtPlan::ReadAddress(&node, values.data(), address)) return false;
-		trace.data.emplace_back(i, address);
-		data[index] = 1;
-	}
+	for (const auto index: plan.flat_words)
+		if (index != UINT32_MAX && plan.nodes[index].kind == Kind::Read && !structural[index] && !plan.nodes[index].clean)
+			data[index] = 1;
 	auto& read_index = scratch.read_index;
-	read_index.assign(plan.nodes.size(), UINT32_MAX);
+	read_index.assign(plan.nodes.size(), SrtReadTrace::NoBase);
 	for (uint32_t index = 0; index < plan.nodes.size(); ++index) {
 		const auto& node = plan.nodes[index];
 		if (node.kind != Kind::Read || data[index]) continue;
 		uint64_t address = 0;
 		if (!LinearSrtPlan::ReadAddress(&node, values.data(), address)) return false;
 		read_index[index] = static_cast<uint32_t>(trace.structural.size());
-		trace.structural.push_back({address, static_cast<uint32_t>(values[index]), node.clean, structural[index]});
+		trace.structural.push_back({address, static_cast<uint32_t>(values[index]), node.clean, structural[index],
+		                            PointerBase(plan, node, read_index)});
+	}
+	for (uint32_t i = 0; i < plan.flat_words.size(); ++i) {
+		const auto index = plan.flat_words[i];
+		if (index == UINT32_MAX || !data[index]) continue;
+		const auto& node    = plan.nodes[index];
+		uint64_t    address = 0;
+		if (!LinearSrtPlan::ReadAddress(&node, values.data(), address)) return false;
+		trace.data.emplace_back(i, address);
+		trace.data_bases.push_back(PointerBase(plan, node, read_index));
 	}
 	for (uint32_t i = 0; i < plan.flat_words.size(); ++i) {
 		const auto node = plan.flat_words[i];
@@ -1568,14 +1597,45 @@ bool TraceLinearSrtReads(const ResourcePlan& program, const SrtRuntime& runtime,
 #if defined(__x86_64__) || defined(_M_X64)
 	const auto* plan = program.linear_srt.get();
 	trace.data.clear();
+	trace.data_bases.clear();
 	trace.structural.clear();
 	trace.feeds.clear();
 	trace.flat_feeds.clear();
+	trace.unrooted = false;
+	// Nothing to read: no descriptor, flattened word, uniform fill or table.
+	if (plan == nullptr && program.srt_plan_complete && program.descriptor_sources.empty() &&
+	    program.srt_reads.empty() && program.control_flow.empty() && program.uniform_fill.fill.words == 0 &&
+	    !program.requires_specialization_memory) {
+		trace.flat_words = 0;
+		return true;
+	}
 	if (plan == nullptr || !program.srt_plan_complete ||
 	    !LinearInputsMatch(program, *plan, program.materialization_sources, program.clean_flat_slots))
 		return false;
 	if (plan->control_variants.empty()) return TraceLinearPlan(program, *plan, runtime, trace);
-	// The leaf EvaluateRuntimeSources would select, from logged predicate reads.
+	// The leaf EvaluateRuntimeSources selects: by the native predicate when it does (SelectNativePredicate),
+	// whose reads are the plan's, with their roots.
+	if (kyty_local_srt_predicate_mode.load(std::memory_order_relaxed) != 0 && plan->single_condition) {
+		const auto&               predicate = *plan->single_condition;
+		std::array<uint64_t, 128> values;
+		if (predicate.nodes.size() > values.size() || predicate.flat_words.size() != 1 ||
+		    runtime.read_specialization_memory == nullptr || !predicate.function(&runtime, values.data()))
+			return false;
+		const auto choice = uint32_t(values[predicate.flat_words[0]]) != 0 ? 0u : 1u;
+		if (!TraceLinearPlan(program, *plan->control_variants[plan->single_condition_variants[choice]], runtime, trace))
+			return false;
+		for (uint32_t index = 0; index < predicate.nodes.size(); ++index) {
+			const auto& node = predicate.nodes[index];
+			if (node.kind != LinearSrtPlan::Kind::Read) continue;
+			uint64_t address = 0;
+			if (!LinearSrtPlan::ReadAddress(&node, values.data(), address)) return false;
+			trace.structural.push_back({address, static_cast<uint32_t>(values[index]), node.clean,
+			                            SrtReadTrace::Predicate, PointerBase(predicate, node, {})});
+		}
+		return true;
+	}
+	// Else from the interpreter's logged predicate reads.
+	trace.unrooted = true;
 	if (runtime.read_memory == nullptr || runtime.read_specialization_memory == nullptr ||
 	    runtime.try_read_memory_span == nullptr || runtime.sync_memory == nullptr)
 		return false;
@@ -1602,6 +1662,71 @@ bool TraceLinearSrtReads(const ResourcePlan& program, const SrtRuntime& runtime,
 	(void)runtime;
 	(void)trace;
 	return false;
+#endif
+}
+
+SrtUserDataUse UserDataUse(const ResourcePlan& program) {
+#if defined(__x86_64__) || defined(_M_X64)
+	// The uniform fill and indirect image tables are evaluated outside the plans.
+	if (!program.srt_plan_complete || program.uniform_fill.fill.words != 0 || program.requires_specialization_memory)
+		return {};
+	const auto* root = program.linear_srt.get();
+	if (root == nullptr)
+		return program.descriptor_sources.empty() && program.srt_reads.empty() && program.control_flow.empty()
+		           ? SrtUserDataUse {0, 0}
+		           : SrtUserDataUse {};
+	// The plans an evaluation runs: the linear plan, or the predicate and the variant it selects.
+	std::vector<const LinearSrtPlan*> plans {root};
+	if (!root->control_variants.empty()) {
+		if (root->single_condition == nullptr) return {};
+		plans = {root->single_condition.get()};
+		for (const auto& variant: root->control_variants) plans.push_back(variant.get());
+	}
+	using Kind = LinearSrtPlan::Kind;
+	// By user data index: read at all, the low or the high half of a pointer read's base, or anything else.
+	uint32_t read = 0, low = 0, high = 0, other = 0;
+	for (const auto* plan: plans) {
+		const auto user = [&](uint32_t node) {
+			const auto& n = plan->nodes[node];
+			return n.kind == Kind::User && n.immediate < 31 ? static_cast<int>(n.immediate) : -1;
+		};
+		const auto any = [&](uint32_t node) {
+			if (const auto k = user(node); k >= 0) other |= 1u << k;
+		};
+		for (const auto& node: plan->nodes) {
+			if (node.kind == Kind::User) {
+				if (node.immediate >= 32) return {};
+				read |= 1u << node.immediate;
+			}
+			uint32_t used = 0;
+			switch (node.kind) {
+				case Kind::Read: used = node.op == ValueOpcode::ReadConstBuffer ? 5u : 3u; break;
+				case Kind::Unary: used = 1; break;
+				case Kind::Binary: used = 2; break;
+				case Kind::Select: used = 3; break;
+				default: break;
+			}
+			if (node.kind == Kind::Read && node.op != ValueOpcode::ReadConstBuffer) {
+				const auto k = user(node.args[0]);
+				if (k >= 0 && user(node.args[1]) == k + 1) {
+					low |= 1u << k;
+					high |= 1u << (k + 1);
+					any(node.args[2]);
+					continue;
+				}
+			}
+			for (uint32_t i = 0; i < used; ++i) any(node.args[i]);
+		}
+		for (const auto node: plan->descriptor_words)
+			if (node != UINT32_MAX) any(node);
+		for (const auto node: plan->flat_words)
+			if (node != UINT32_MAX) any(node);
+	}
+	// Each half in its role only.
+	return {read, low & (high >> 1) & ~(other | high) & ~((other | low) >> 1)};
+#else
+	(void)program;
+	return {};
 #endif
 }
 

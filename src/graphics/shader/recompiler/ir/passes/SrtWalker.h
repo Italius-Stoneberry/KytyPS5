@@ -62,14 +62,24 @@ bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
 // `structural`, with the value it had. False when the program is not evaluated
 // by a single linear plan (no plan, control-flow variants, a failed read).
 struct SrtReadTrace {
-	// Why a read is structural (bits): it feeds another read's address, a
-	// descriptor dword, a computed value, or it is a control-flow predicate input.
-	enum Use : uint8_t { Address = 1, Descriptor = 2, Computed = 4, Predicate = 8 };
+	// Why a read is structural (bits): it feeds another read's address (`Pointer`: as the low or high
+	// half of a pointer read's base, `Address`: otherwise), a descriptor dword, a computed value, or it
+	// is a control-flow predicate input.
+	enum Use : uint8_t { Address = 1, Descriptor = 2, Computed = 4, Predicate = 8, Pointer = 16 };
+	// What a pointer read's address is based on: user data pair `root` (user[k] | user[k + 1] << 32)
+	// or the values of the structural reads `low` and `high`, plus an offset that does not depend on it.
+	static constexpr uint8_t  NoRoot = 0xff;
+	static constexpr uint32_t NoBase = UINT32_MAX;
+	struct Base {
+		uint8_t  root = NoRoot;
+		uint32_t low = NoBase, high = NoBase;
+	};
 	struct Read {
 		uint64_t address = 0;
 		uint32_t value   = 0;
 		bool     clean   = false;
 		uint8_t  use     = 0;
+		Base     base;
 	};
 	// Structural reads copied unchanged into a descriptor dword of the snapshot.
 	enum class Kind : uint8_t { Buffer, Image, Sampler };
@@ -79,7 +89,9 @@ struct SrtReadTrace {
 		uint32_t index = 0; // resource index in the snapshot
 		uint32_t dword = 0;
 	};
-	std::vector<std::pair<uint32_t, uint64_t>> data; // (flat index, address)
+	std::vector<std::pair<uint32_t, uint64_t>> data;       // (flat index, address)
+	std::vector<Base>                          data_bases; // per data read
+	bool                                       unrooted = false; // reads without their roots (the interpreter's)
 	std::vector<Read>                          structural;
 	std::vector<Feed>                          feeds;
 	// Structural reads that are also copied unchanged into the flattened SRT:
@@ -88,6 +100,15 @@ struct SrtReadTrace {
 	size_t                                     flat_words = 0;
 };
 bool TraceLinearSrtReads(const ResourcePlan& program, const SrtRuntime& runtime, SrtReadTrace& trace);
+// How the SRT evaluation uses user data (bit k: user[k]): the words it may read, and the pairs
+// (user[k], user[k + 1]) its linear plan uses for nothing but the bases of its pointer reads (an
+// evaluation with another value there reads the same offsets from the new base). Every word and
+// no pair for a plan with control-flow variants, a uniform fill or indirect images.
+struct SrtUserDataUse {
+	uint32_t read     = UINT32_MAX;
+	uint32_t pointers = 0;
+};
+SrtUserDataUse UserDataUse(const ResourcePlan& program);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

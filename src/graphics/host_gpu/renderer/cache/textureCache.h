@@ -63,6 +63,10 @@ public:
 	// survive image registrations elsewhere (native XPR records): the owner is
 	// still registered, not being rebound, and has the same backing and resources.
 	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc);
+	// Whether a render target lookup of `requested` (FindImage, any format) still finds `id`: nothing
+	// registered over its first page since `epoch`, or no newer image with the requested backing there
+	// (it would take precedence). `epoch` moves to the current one when it holds.
+	[[nodiscard]] bool IsTargetCurrent(ImageId id, const ImageInfo& requested, uint64_t& epoch);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
