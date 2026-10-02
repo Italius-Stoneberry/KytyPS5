@@ -1563,6 +1563,7 @@ void PipelineCache::InitializeDriverCache() {
 		m_driver_cache = nullptr;
 		return;
 	}
+	m_driver_cache_saved_size = initial_data.size();
 	if (!initial_data.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
 		                 path);
@@ -1591,6 +1592,8 @@ bool PipelineCache::Save() {
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
 		}
+		// Nothing compiled since it was loaded or saved (the window's exit and the destructor both save).
+		if (size == m_driver_cache_saved_size) return inputs_saved;
 		payload.resize(size);
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
 		if (result != vk::Result::eIncomplete) {
@@ -1630,8 +1633,9 @@ bool PipelineCache::Save() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	// The cache stays in use: a save right after the warmup destroyed it, so nothing compiled later in that
+	// session (native XPR variants, first uses, optimized builds) was cached or saved at the exit.
+	m_driver_cache_saved_size = payload.size();
 	return inputs_saved;
 }
 

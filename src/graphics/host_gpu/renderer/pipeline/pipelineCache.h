@@ -308,6 +308,8 @@ private:
 	std::unique_ptr<PipelineBinaries> m_static_binaries;
 	std::filesystem::path         m_driver_cache_path;
 	std::string                   m_driver_cache_key;
+	// The size of the driver cache's data when it was loaded or last saved (Save skips an unchanged one).
+	size_t                        m_driver_cache_saved_size = 0;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	// Pipelines remain owned by m_graphics_pipelines until this cache is destroyed.
