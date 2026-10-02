@@ -1164,9 +1164,15 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet) {
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 1);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
+	auto& executor = m_renderer.GetRenderExecutor();
+	// A draw never tried leaves the cached draw-state key behind: the next clean draw would take it.
+	const auto skip = [&] {
+		executor.NativeXprForgetState();
+		return 0u;
+	};
 	if (FrameCapture::Active() || XprCapture::Enabled() || m_index_type_and_size > 1 ||
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
-		return 0;
+		return skip();
 	// What CpOpDrawIndex / CpOpDrawIndexOffset accept (anything else takes them).
 	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
 	uint64_t       index_address = 0;
@@ -1175,23 +1181,22 @@ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet)
 		index_address = packet[2] | (uint64_t {packet[3]} << 32u);
 		index_count   = packet[4];
 		size          = 6;
-		if (index_count > packet[1] || (packet[5] & ~0x20u) != 0) return 0;
+		if (index_count > packet[1] || (packet[5] & ~0x20u) != 0) return skip();
 	} else if (packet.size() >= 5 && packet[0] == 0xc0033500u && m_index_base_addr != 0) {
 		index_address = m_index_base_addr + uint64_t {packet[2]} * element;
 		index_count   = packet[3];
 		size          = 5;
-		if (index_count > packet[1] || (packet[4] & ~0x20u) != 0) return 0;
+		if (index_count > packet[1] || (packet[4] & ~0x20u) != 0) return skip();
 	} else {
-		return 0;
+		return skip();
 	}
 	// A zero-sized draw draws nothing on the normal path either (it returns first).
-	if (index_count == 0 || index_address == 0 || index_address % element != 0) return 0;
+	if (index_count == 0 || index_address == 0 || index_address % element != 0) return skip();
 	CheckBuffer();
 	const RenderExecutor::NativeXprDirectDraw draw {index_address, index_count, m_num_instances};
-	// The state key is hashed again: the observer's chain covers indexed indirect draws only.
-	if (!m_renderer.GetRenderExecutor().NativeXprTry(
-	        CurrentBuffer(), false, {}, index_address, uint64_t {index_count} * element,
-	        m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32, &draw))
+	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::g_shadow.last_clean, {}, index_address,
+	                           uint64_t {index_count} * element,
+	                           m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32, &draw))
 		return 0;
 	return size;
 #else

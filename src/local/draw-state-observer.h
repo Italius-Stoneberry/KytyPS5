@@ -1,10 +1,10 @@
 #ifndef EMULATOR_SRC_LOCAL_DRAW_STATE_OBSERVER_H_
 #define EMULATOR_SRC_LOCAL_DRAW_STATE_OBSERVER_H_
-// Tracks whether the graphics state changed between consecutive indexed indirect
-// draws, for the native XPR draw path: a draw is "clean" when nothing but the
-// per-draw user-data SGPRs (the XPR geometry root), the index state and the
-// indirect offset changed since the previous DRAW_INDEX_INDIRECT, so the previous
-// draw-state key still applies.
+// Tracks whether the graphics state changed between consecutive indexed draws
+// (indirect or direct), for the native XPR draw path: a draw is "clean" when nothing
+// but the per-draw user-data SGPRs (the XPR geometry root), the index state and the
+// indirect offset changed since the previous one, so the previous draw-state key
+// still applies.
 //
 // A register write only dirties the gap when it changes a value (shadow copies
 // of the CX/SH/UC spaces). Graphics user-data SGPRs (PS 0x0c-0x2b, GS 0x8c-0xab,
@@ -92,6 +92,8 @@ inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t pack
 	}
 	switch (opcode) {
 		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
 			s.last_clean = s.chain && !s.dirty;
 			s.chain      = true;
 			s.dirty      = false;

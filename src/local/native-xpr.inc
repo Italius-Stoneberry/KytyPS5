@@ -2843,6 +2843,8 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
                                   uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
                                   const NativeXprDirectDraw* direct) {
 	auto& cache = NativeXprState();
+	// A changed state leaves no key behind, even when this try stops before computing it.
+	if (!clean) cache.state_key_valid = false;
 	if (buffer.IsInvalid() || (direct == nullptr ? commands.empty() : !commands.empty()) || commands.size() > 64 ||
 	    index_base == 0 || index_bytes == 0)
 		return false;
