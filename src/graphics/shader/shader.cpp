@@ -22,7 +22,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -121,20 +123,25 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
 }
 
-static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
-	EXIT_IF(code == nullptr);
-
-	if (code[0] == 0xBEEB03FF) {
-		return reinterpret_cast<const ShaderBinaryInfo*>(code +
-		                                                 static_cast<size_t>(code[1] + 1) * 2);
-	}
-
-	return nullptr;
+// Shader memory read as HashShaderCode reads the code: GPU ownership is byte-exact, CPU protection
+// covers whole pages, so bytes that only share a page with GPU-written data come from the backing (a
+// load would fault on the page and wait for its download). GPU-written bytes are loaded.
+static void ReadShaderMemory(uint64_t address, void* out, size_t bytes) {
+	if (!LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, out, bytes))
+		std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
 }
 
 static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
-	const auto* header = GetBinaryInfo(reinterpret_cast<const uint32_t*>(shader_addr));
-	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
+	EXIT_IF(shader_addr == 0);
+	std::array<uint32_t, 2> code {};
+	ReadShaderMemory(shader_addr, code.data(), sizeof(code));
+	if (code[0] != 0xBEEB03FF) return 0;
+	// The header's hash0 and hash1 (ShaderBinaryInfo).
+	std::array<uint32_t, 2> hash {};
+	ReadShaderMemory(shader_addr + static_cast<uint64_t>(code[1] + 1u) * 2u * sizeof(uint32_t) +
+	                     offsetof(ShaderBinaryInfo, hash0),
+	                 hash.data(), sizeof(hash));
+	return (static_cast<uint64_t>(hash[1]) << 32u) | hash[0];
 }
 
 static uint64_t HashShaderCode(std::span<const uint32_t> code) {
