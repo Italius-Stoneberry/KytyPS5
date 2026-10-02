@@ -192,6 +192,9 @@ if (!$environment.Contains('KYTY_ASYNC_XPR_PIPELINES') -and !$Baseline) { $envir
 # Direct draws whose objects point at a new copy of their tables every frame keep their native XPR
 # records (the pointer leaves the key): Latria 33 -> 37 fps, Boletaria 1-1 31 -> 32.
 if (!$environment.Contains('KYTY_NATIVE_XPR_RELOCATE') -and !$Baseline) { $environment['KYTY_NATIVE_XPR_RELOCATE'] = '1' }
+# At most 256 native XPR record stores a frame (about 16 us each): walking brings a thousand or more new objects
+# and LODs a frame, and storing them all at once made 60-90 ms frames (Latria walk 1% low 14.1 -> 16.4 fps).
+if (!$environment.Contains('KYTY_NATIVE_XPR_STORE_BUDGET') -and !$Baseline) { $environment['KYTY_NATIVE_XPR_STORE_BUDGET'] = '256' }
 # Memory the game releases (texture pool layers, 64 KiB mappings each) is not unprotected mapping
 # by mapping before its unmap: VirtualProtect was ~15% of the render thread in the open area.
 if (!$environment.Contains('KYTY_UNMAP_PROTECT_SKIP') -and !$Baseline) { $environment['KYTY_UNMAP_PROTECT_SKIP'] = '1' }

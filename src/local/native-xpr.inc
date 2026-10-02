@@ -52,6 +52,10 @@ extern "C" {
 // had keys new every frame, so no record; the pointer words (user data pairs the SRT reads through and
 // uses for nothing else) leave the key, and the record reads the same offsets from the new base.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_relocate_mode {0};
+// N > 0: at most N store requests a frame. Walking brings hundreds of meshes and LODs
+// into view at once; storing them all in one frame (about 16 us each) made it a hitch. The others ask again
+// in later frames (their draws take the normal path until then).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_store_budget {0};
 }
 namespace {
 // word_patch value of a logged word whose change reaches nothing the evaluation produces.
@@ -662,6 +666,9 @@ struct RenderExecutor::NativeXprCache {
 	uint64_t                  last_state_key = 0; // the latest states lookup (entries never move)
 	const NativeXprDrawState* last_state     = nullptr;
 	uint64_t collected_frame = UINT64_MAX;
+	// Store requests in store_frame (kyty_local_native_xpr_store_budget).
+	uint64_t store_frame    = UINT64_MAX;
+	uint32_t store_requests = 0;
 	~NativeXprCache() {
 		for (auto pool: pools) device.destroyDescriptorPool(pool);
 	}
@@ -2874,6 +2881,21 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
                                   uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
                                   const NativeXprDirectDraw* direct) {
 	auto& cache = NativeXprState();
+	// Store requests within the frame's budget (kyty_local_native_xpr_store_budget); the others ask again
+	// in a later frame.
+	const auto request_store = [&] {
+		if (const auto budget = kyty_local_native_xpr_store_budget.load(std::memory_order_relaxed); budget != 0) {
+			if (cache.store_frame != m_context.FrameNumber()) {
+				cache.store_frame    = m_context.FrameNumber();
+				cache.store_requests = 0;
+			}
+			if (cache.store_requests++ >= budget) {
+				LiveCounters::Add(LiveCounters::XprMissBudget);
+				return;
+			}
+		}
+		m_native_xpr_store = true;
+	};
 	// A changed state leaves no key behind, even when this try stops before computing it.
 	if (!clean) cache.state_key_valid = false;
 	if (buffer.IsInvalid() || (direct == nullptr ? commands.empty() : !commands.empty()) || commands.size() > 64 ||
@@ -2922,7 +2944,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		cache.tried_hash = hash;
 		// The first store of a pair learns its pointer words.
 		if (relocating && (pair == cache.pairs.end() || !pair->second.relocation_known)) {
-			m_native_xpr_store = true;
+			request_store();
 			return false;
 		}
 		if (cache.tried_relocate != 0 && cache.Refused(hash, m_context.FrameNumber())) {
@@ -2933,7 +2955,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 			LiveCounters::Add(LiveCounters::XprMissUnseen);
 			return false;
 		}
-		m_native_xpr_store = true;
+		request_store();
 		return false;
 	}
 	auto& record = *found;
@@ -2944,7 +2966,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		const auto owner = cache.records.find(hash);
 		NativeXprRetire(std::move(owner->second), true);
 		cache.records.erase(owner);
-		m_native_xpr_store = true;
+		request_store();
 		return false;
 	};
 	// A relocated record reads through this draw's pointers (NativeXprGather) and holds its unread words.
@@ -2997,7 +3019,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		const auto state_it = cache.states.find(cache.state_key);
 		if (state_it == cache.states.end()) {
 			LiveCounters::Add(LiveCounters::XprMissState);
-			m_native_xpr_store = true;
+			request_store();
 			return false;
 		}
 		cache.last_state_key = cache.state_key;
@@ -3007,7 +3029,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	                                           &std::pair<uint64_t, const PipelineCache::Pipeline*>::first);
 	if (pipeline_it == record.pipelines.end()) {
 		LiveCounters::Add(LiveCounters::XprMissState);
-		m_native_xpr_store = true;
+		request_store();
 		return false;
 	}
 	// A direct draw also needs the offsets the normal path resolved under this state.
@@ -3017,7 +3039,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		    std::ranges::find(record.direct_offsets, cache.state_key, &NativeXprRecord::DirectOffsets::state);
 		if (offsets == record.direct_offsets.end()) {
 			LiveCounters::Add(LiveCounters::XprMissState);
-			m_native_xpr_store = true;
+			request_store();
 			return false;
 		}
 		direct_draw = {*direct, offsets->vertex, offsets->instance};
@@ -3030,7 +3052,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		const auto* image = textures.m_slot_images.try_get(target.id);
 		if (image == nullptr || image->serial != target.serial) {
 			LiveCounters::Add(LiveCounters::XprMissTarget);
-			m_native_xpr_store = true;
+			request_store();
 			return false;
 		}
 	}
@@ -3041,7 +3063,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 			auto epoch = draw_state.targets_epoch;
 			if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) {
 				LiveCounters::Add(LiveCounters::XprMissTarget);
-				m_native_xpr_store = true;
+				request_store();
 				return false;
 			}
 			proven = std::min(proven, epoch);
