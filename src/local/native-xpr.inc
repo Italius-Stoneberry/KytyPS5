@@ -592,12 +592,13 @@ struct RenderExecutor::NativeXprCache {
 	}
 	// Relocation (direct draws: an indirect run that misses is tried again per draw, so its uses
 	// would not count the same in every frame): the latest try's key before its pointer words left
-	// it, the words it left out, which use of the rest in the frame it was and its hash (for the
-	// store a miss requests); per program, the user data a record may take from each draw.
+	// it, the words it left out, the words that joined the rest (its mesh, which use of them in the
+	// frame it was) and its hash (for the store a miss requests); per program, the user data a record
+	// may take from each draw.
 	std::vector<uint32_t> full_key;
-	uint64_t              tried_relocate   = 0;
-	uint32_t              tried_occurrence = 0;
-	uint64_t              tried_hash       = 0;
+	uint64_t              tried_relocate = 0;
+	std::vector<uint32_t> tried_suffix;
+	uint64_t              tried_hash     = 0;
 	// Relocated keys whose store was refused: the same refusal would come every frame.
 	static constexpr uint64_t RefuseFrames = 64;
 	std::vector<SeenKey>      refused      = std::vector<SeenKey>(4096);
@@ -1651,11 +1652,11 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 	*slot = std::move(draw_state);
 	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
 
-	// A relocated key: without the roots' and the unread words, with the use in the frame (NativeXprTry).
+	// A relocated key: without the roots' and the unread words, with the words the try added (NativeXprTry).
 	if (!record->roots.empty() || !record->unread.empty()) {
 		for (const auto& root: record->roots) record->key[root.low_word] = record->key[root.high_word] = 0;
 		for (const auto& word: record->unread) record->key[word.word] = 0;
-		record->key.push_back(cache.tried_occurrence);
+		record->key.insert(record->key.end(), cache.tried_suffix.begin(), cache.tried_suffix.end());
 		LiveCounters::Add(LiveCounters::XprRelocatedStored);
 	}
 	record->HoldKey();
@@ -2866,10 +2867,16 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	if (pair != cache.pairs.end() && pair->second.relocate != 0) {
 		cache.full_key = cache.key;
 		for (auto words = pair->second.relocate; words != 0; words &= words - 1) cache.key[std::countr_zero(words)] = 0;
-		cache.tried_relocate   = pair->second.relocate;
-		cache.tried_occurrence = cache.NextOccurrence(
-		    XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t)), m_context.FrameNumber());
-		cache.key.push_back(cache.tried_occurrence);
+		cache.tried_relocate = pair->second.relocate;
+		const auto masked    = cache.key.size();
+		// The mesh (the draw's first index) joins the key, so the n-th use counts the uses of one mesh: a
+		// record keeps its object while the frame's other objects of the pair come and go (counting the
+		// pair's uses, a walk re-evaluated most relocated records every frame).
+		cache.key.push_back(static_cast<uint32_t>(index_base));
+		cache.key.push_back(static_cast<uint32_t>(index_base >> 32u));
+		cache.key.push_back(cache.NextOccurrence(XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t)),
+		                                         m_context.FrameNumber()));
+		cache.tried_suffix.assign(cache.key.begin() + static_cast<std::ptrdiff_t>(masked), cache.key.end());
 	}
 	const auto hash  = XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t));
 	auto* const found = cache.IndexFind(hash);
