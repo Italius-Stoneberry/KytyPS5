@@ -212,14 +212,36 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		if (completed) *completed = true;
 		return {};
 	}
+	// The copies' envelopes in packed regions, one region for envelopes less than 64 KiB apart (the
+	// bytes between are copied too and never written back): GPU writes split a window into up to
+	// thousands of small ranges, a copy command each otherwise (seconds of driver calls in one frame).
+	// The parts place each copy's bytes in the download.
+	struct Envelope {
+		uint64_t source, size, cursor;
+	};
+	constexpr uint64_t      Gap = 64 * 1024;
+	std::vector<Envelope>   envelopes;
+	std::vector<GuestReadback::Part> parts;
+	parts.reserve(copies.size());
 	uint64_t packed_size = 0;
 	for (const auto& copy: copies) {
-		packed_size += AlignDownload(DownloadEnvelope(copy).second);
+		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+		if (!envelopes.empty() && source_begin <= envelopes.back().source + envelopes.back().size + Gap) {
+			auto&      last = envelopes.back();
+			const auto end  = std::max(last.source + last.size, source_begin + envelope_size);
+			packed_size += AlignDownload(end - last.source) - AlignDownload(last.size);
+			last.size = end - last.source;
+		} else {
+			envelopes.push_back({source_begin, envelope_size, packed_size});
+			packed_size += AlignDownload(envelope_size);
+		}
+		parts.push_back({copy.address, copy.size, envelopes.back().cursor + copy.source_offset - envelopes.back().source});
 		if (packed_size > Capacity) {
 			LiveCounters::Add(LiveCounters::RbRejectCapacity);
 			return {};
 		}
 	}
+	LiveCounters::Add(LiveCounters::ReadbackRegions, envelopes.size());
 	// KYTY_READBACK_SLOTS: when every slot is pending, the render thread waits for the
 	// oldest copy (a GPU tick). Bursts from many guest threads fill the original eight.
 	const size_t slots = kyty_local_readback_slots_mode.load(std::memory_order_relaxed) != 0
@@ -257,14 +279,10 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		// Also after the slot's last graphics-queue copy (it is submitted: that path flushes).
 		request->producer_tick = std::max(request->producer_tick, m_download_ticks[slot]);
 		std::vector<ReadbackQueue::Queue::Region> regions;
-		regions.reserve(copies.size());
-		uint64_t cursor = 0;
-		for (const auto& copy: copies) {
-			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-			regions.push_back({copy.buffer->Handle(), {source_begin, cursor, envelope_size}});
-			request->parts.push_back({copy.address, copy.size, cursor + copy.source_offset - source_begin});
-			cursor += AlignDownload(envelope_size);
-		}
+		regions.reserve(envelopes.size());
+		for (const auto& envelope: envelopes)
+			regions.push_back({buffer.Handle(), {envelope.source, envelope.cursor, envelope.size}});
+		request->parts = std::move(parts);
 		request->queue_value = m_readback_queue->Copy(regions, download->Handle(),
 		                                              m_scheduler.GetMasterSemaphore().Handle(),
 		                                              request->producer_tick);
@@ -276,10 +294,9 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 			if (!verify)
 				verify = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 				                                  vk::BufferUsageFlagBits::eTransferDst, Capacity);
-			for (size_t i = 0; i < copies.size(); ++i)
-				verify->CopyFrom(m_scheduler.Current(), *copies[i].buffer, regions[i].copy.srcOffset,
-				                 regions[i].copy.dstOffset, regions[i].copy.size, vk::AccessFlagBits::eMemoryWrite,
-				                 vk::AccessFlagBits::eHostRead,
+			for (const auto& region: regions)
+				verify->CopyFrom(m_scheduler.Current(), buffer, region.copy.srcOffset, region.copy.dstOffset,
+				                 region.copy.size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
 				                 vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 				                 vk::AccessFlagBits::eHostRead);
 			request->verify = verify.get();
@@ -292,16 +309,12 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		LiveCounters::Add(LiveCounters::AsyncReadbacks);
 		return request;
 	}
-	uint64_t cursor = 0;
-	for (const auto& copy: copies) {
-		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-		download->CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, cursor,
-		    envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
-		    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-		    vk::AccessFlagBits::eHostRead);
-		request->parts.push_back({copy.address, copy.size, cursor + copy.source_offset - source_begin});
-		cursor += AlignDownload(envelope_size);
-	}
+	for (const auto& envelope: envelopes)
+		download->CopyFrom(m_scheduler.Current(), buffer, envelope.source, envelope.cursor, envelope.size,
+		                   vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+		                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead);
+	request->parts = std::move(parts);
 	request->tick = m_scheduler.CurrentTick();
 	m_download_ticks[slot] = request->tick;
 	if (LiveTrace::WriteTicks()) LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
