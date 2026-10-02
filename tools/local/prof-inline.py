@@ -3,13 +3,14 @@
 frames (llvm-symbolizer and the PDB of the same build, which needs line tables: -gline-tables-only),
 so time inside a big function is split by the functions and lines inlined into it.
 
-    prof-inline.py PROF EXE [--function REGEX [--callers N]] [--top 40] [--lines] [--modules MODULES]
-                   [--range 10:22]
+    prof-inline.py PROF EXE [--function REGEX [--callers N] [--depth N]] [--top 40] [--lines]
+                   [--modules MODULES] [--range 10:22]
 
 Without --function: self time by source function (innermost inlined frame) and inclusive time by
 source function (every frame of every stack, inlined ones included). With --function: the samples
-whose stack holds a frame matching REGEX, split by the innermost frame below it (--lines: by
-source line; --callers N: by the N frames above the outermost match instead). --range: only the
+whose stack holds a frame matching REGEX, split by the innermost frame below it (--depth N: by the
+chain of N frames below it; --lines: by source line; --callers N: by the N frames above the
+outermost match instead). --range: only the
 samples of that span of seconds (4 kHz). MODULES (prof-spot.ps1 writes modules.txt: base, size, name per line) names the
 frames outside the executable by module.
 """
@@ -59,6 +60,7 @@ def main():
     p.add_argument('--top', type=int, default=40)
     p.add_argument('--lines', action='store_true')
     p.add_argument('--callers', type=int, default=0)
+    p.add_argument('--depth', type=int, default=1)
     p.add_argument('--modules', default='')
     p.add_argument('--range', default='')
     p.add_argument('--hz', type=float, default=4000.0)
@@ -131,6 +133,8 @@ def main():
             continue
         leaf = f[0] if at == 0 else f[at - 1]
         key = f'{f[0][0]}  @ {f[0][1]}' if args.lines else (leaf[0] if at else '(self) ' + f[0][0])
+        if args.depth > 1 and not args.lines and at:
+            key = ' > '.join(x[0] for x in reversed(f[max(0, at - args.depth):at]))
         below[key] += 1
     print(f'{hits} samples with {args.function} ({100 * hits / max(total, 1):.2f}% of {total})')
     for key, n in below.most_common(args.top):
