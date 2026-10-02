@@ -138,7 +138,15 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::Flush();
 }
 
+// Reads through a null pointer (a draw the game leaves unset during loads): no guest memory is mapped
+// there, and the GPU reads zeros where the host would fault.
+constexpr uint64_t NullPageEnd = 0x10000;
+
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
+	if (value != nullptr && address < NullPageEnd) {
+		*value = 0;
+		return true;
+	}
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(address, value, sizeof(*value));
 }
@@ -151,7 +159,9 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	// A GPU-written neighbour may protect a clean descriptor on the same page.
 	// Reading its checked backing alias avoids an unnecessary GPU drain. Dirty,
 	// unmapped and untracked addresses retain the original load/fault behavior.
-	if (Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value, sizeof(*value))) {
+	if (address < NullPageEnd) {
+		*value = 0;
+	} else if (Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value, sizeof(*value))) {
 		LiveCounters::Add(LiveCounters::SrtWatchedReads);
 	} else {
 		std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
@@ -160,8 +170,9 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 }
 
 bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
-	// Clean spans also read whole tables (resource materialization); raw spans are SRT groups.
-	return count >= 2 && count <= (clean ? 1024u : 16u) &&
+	// Clean spans also read whole tables (resource materialization); raw spans are SRT groups. The
+	// null page goes word by word (the readers above).
+	return count >= 2 && count <= (clean ? 1024u : 16u) && address >= NullPageEnd &&
 	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
 }
 

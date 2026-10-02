@@ -1530,7 +1530,8 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 	if (runtime) {
 		uint64_t total_words = 0;
 		for (const auto& [address, size]: cache.reads) {
-			if (address % 4 != 0 || size % 4 != 0 || size == 0 || size > 4096) {
+			// (Reads of the null page are zeros the record could not read again.)
+			if (address % 4 != 0 || size % 4 != 0 || size == 0 || size > 4096 || address < 0x10000) {
 				refuse();
 				return LiveCounters::Add(LiveCounters::XprRefuseReads);
 			}
