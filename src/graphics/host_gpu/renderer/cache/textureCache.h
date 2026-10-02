@@ -62,6 +62,8 @@ public:
 	// TryReuseSampledImage without the resolution-epoch proof, for caches that must
 	// survive image registrations elsewhere (native XPR records): the owner is
 	// still registered, not being rebound, and has the same backing and resources.
+	// Also for a storage binding (an image a record's programs only write); a sampled image may have
+	// DCC metadata (whose pending fast clears FindTexture applies: the caller checks IsMetaCleared).
 	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc);
 	// Whether a render target lookup of `requested` (FindImage, any format) still finds `id`: nothing
 	// registered over its first page since `epoch`, or no newer image with the requested backing there

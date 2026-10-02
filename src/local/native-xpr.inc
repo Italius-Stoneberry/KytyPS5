@@ -2745,6 +2745,12 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	for (const auto& dep: record.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr) return false;
+		// A DCC image with a fast clear pending: the normal path's FindTexture applies it first.
+		if (dep.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+			if (image->info.IsVolume()) return false;
+			for (uint32_t layer = dep.range.base_layer; layer < dep.range.base_layer + dep.range.layer_count; ++layer)
+				if (layer >= 32 || textures.IsMetaCleared(dep.desc.info.metadata.range.address, layer)) return false;
+		}
 		image->Transit(dep.layout, vk::AccessFlagBits2::eShaderRead, dep.range, vk_buffer);
 	}
 	scheduler.BeginRendering(keep_clears ? draw_state.first_rendering : draw_state.rendering);

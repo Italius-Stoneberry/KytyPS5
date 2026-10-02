@@ -2176,14 +2176,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 
 bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
-	if (m_scheduler.Current().IsInvalid() || desc.type != BindingType::Texture ||
-	    desc.info.data.Empty() || desc.info.IsDepth() || desc.info.HasMetadata() ||
+	// A sampled DCC image keeps the metadata FindTexture gave it (its user checks for a pending clear).
+	const bool dcc = desc.type == BindingType::Texture && desc.info.metadata.kind == ImageMetadataKind::Dcc;
+	if (m_scheduler.Current().IsInvalid() || (desc.type != BindingType::Texture && desc.type != BindingType::Storage) ||
+	    desc.info.data.Empty() || desc.info.IsDepth() || (desc.info.HasMetadata() && !dcc) ||
 	    desc.info.HasStencil() || desc.info.tile_mode == Prospero::TileMode::kDepth) {
 		return false;
 	}
 	auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered || image->depth_id ||
-	    image->binding.needs_rebind || image->info.IsDepth() || image->info.HasMetadata() ||
+	    image->binding.needs_rebind || image->info.IsDepth() || (image->info.HasMetadata() && !dcc) ||
+	    (dcc && !(image->info.metadata == desc.info.metadata)) ||
 	    image->info.HasStencil() || !SameBacking(image->info, desc.info, true) ||
 	    !(image->info.resources == desc.info.resources)) {
 		return false;
