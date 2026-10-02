@@ -1228,10 +1228,12 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			}
 		}
 	}
-	results = std::move(evaluated);
-	active_sources = std::move(active);
+	// Copied, not moved: the callers' vectors are reused storage that the linear evaluation swaps
+	// with its own; a moved-in vector of exactly this size made those reallocate.
+	results.assign(evaluated.begin(), evaluated.end());
+	active_sources.assign(active.begin(), active.end());
 	if (evaluate_flat) {
-		flat = std::move(flattened);
+		flat.assign(flattened.begin(), flattened.end());
 	}
 	return true;
 }
