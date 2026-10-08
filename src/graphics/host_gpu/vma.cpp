@@ -151,6 +151,17 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	}
 	auto result = try_create(vram_info);
 
+	// Render targets and storage images are written by the GPU every frame; keeping them in
+	// system RAM is very slow, so for those let the driver exceed the budget before spilling.
+	const auto gpu_written = vk::ImageUsageFlagBits::eColorAttachment |
+	                         vk::ImageUsageFlagBits::eDepthStencilAttachment |
+	                         vk::ImageUsageFlagBits::eStorage;
+	if (result != vk::Result::eSuccess && (image_info.usage & gpu_written)) {
+		VmaAllocationCreateInfo any_vram_info {};
+		any_vram_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		result                      = try_create(any_vram_info);
+	}
+
 	// 2) VRAM is full: place the image in system RAM (GPU reads it over PCIe). Slower, but it
 	//    keeps 8 GB cards from aborting when a game needs more than the card has.
 	if (result != vk::Result::eSuccess) {
