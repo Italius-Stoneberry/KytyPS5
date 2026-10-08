@@ -8,12 +8,16 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -99,6 +103,13 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
+// What a compute pipeline's create info needs besides its flags (CreateComputePipelineHandle).
+struct ComputePipelineRecipe {
+	vk::ShaderModule   module                 = nullptr;
+	vk::PipelineLayout layout                 = nullptr;
+	uint32_t           required_subgroup_size = 0; // 0: no required subgroup size
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -106,6 +117,10 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	// Frame boundary (Thread_Gpu, render mutex held): writes the driver pipeline cache to disk at
+	// most every 90 s when pipelines were created since the last write (in the background), so a
+	// crash no longer loses the session's compiles; retires replaced fast-first pipelines.
+	void MaybeSave();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -177,7 +192,20 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
+	// Fast-first compute pipelines (KYTY_PIPELINE_FAST_FIRST): see pipelineCache.cpp.
+	struct FastFirst;
+	std::unique_ptr<FastFirst>            m_fast_first;
+	uint64_t                              m_pipelines_since_save = 0;
+	std::chrono::steady_clock::time_point m_last_save            = std::chrono::steady_clock::now();
+	std::thread                           m_save_thread;
+	std::atomic<bool>                     m_save_running {false};
+
 	void InitializeDriverCache();
+	bool ReadDriverCache(std::vector<uint8_t>& payload);
+	void CreateComputePipelineFast(Pipeline& pipeline, const ShaderComputeInputInfo& input_info,
+	                               vk::ShaderModule module);
+	void DrainFastFirst();
+	void StopBackgroundWork();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
@@ -192,6 +220,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+// Creates the descriptor set and pipeline layouts of a compute pipeline and fills `recipe` with
+// what CreateComputePipelineHandle needs (the module stays owned by the program cache, the layout
+// by `pipeline`).
+void CreateComputePipelineLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ShaderComputeInputInfo& input_info,
+                                 vk::ShaderModule compute_module, ComputePipelineRecipe& recipe);
+vk::Result CreateComputePipelineHandle(GraphicContext& graphics, const ComputePipelineRecipe& recipe,
+                                       vk::PipelineCreateFlags flags, vk::PipelineCache driver_cache,
+                                       vk::Pipeline& out);
 
 } // namespace Libs::Graphics
 
