@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -54,6 +55,9 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// Starts a new epoch for PrepareBda (see there): the next draw that reads memory through
+	// addresses uploads every CPU write made so far.
+	void AdvanceBdaEpoch() noexcept { m_bda_epoch.fetch_add(1, std::memory_order_release); }
 	void               RunGarbageCollector(bool frame_boundary = false);
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -82,6 +86,9 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	// PrepareBda's current epoch and the epoch of its last synchronization (Thread_Gpu only).
+	std::atomic<uint64_t> m_bda_epoch {1};
+	uint64_t              m_bda_synced_epoch = 0;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;
