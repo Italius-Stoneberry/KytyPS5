@@ -29,6 +29,19 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Optional log of ranges whose pages may have become CPU-dirty. Lets BDA synchronization
+	// visit only those ranges instead of every cached buffer on every dispatch.
+	void EnableCpuDirtyNotes() noexcept { m_cpu_dirty_notes_enabled.store(true, std::memory_order_release); }
+	void NoteCpuDirty(uint64_t vaddr, uint64_t size);
+	template <typename Func>
+	void TakeCpuDirtyNotes(Func&& func) {
+		RangeSet notes;
+		{
+			std::lock_guard lock(m_cpu_dirty_notes_mutex);
+			std::swap(notes, m_cpu_dirty_notes);
+		}
+		notes.ForEach(func);
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -36,6 +49,7 @@ public:
 		CheckNotInUploadCallback();
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			const auto address      = manager->GetCpuAddr() + offset;
 			const bool should_flush = [&] {
 				// Perform both the GPU modification check and CPU state change with the lock in
 				// case the GPU thread is racing to mark the page modified. If a flush is needed,
@@ -49,6 +63,8 @@ public:
 			}();
 			if (should_flush) {
 				on_flush();
+			} else {
+				NoteCpuDirty(address, bytes);
 			}
 		});
 	}
@@ -150,6 +166,9 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::atomic<bool>                              m_cpu_dirty_notes_enabled {false};
+	std::mutex                                     m_cpu_dirty_notes_mutex;
+	RangeSet                                       m_cpu_dirty_notes;
 };
 
 } // namespace Libs::Graphics
