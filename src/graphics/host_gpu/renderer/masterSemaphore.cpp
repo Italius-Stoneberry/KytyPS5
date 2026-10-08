@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 namespace Libs::Graphics {
@@ -44,6 +45,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		return;
 	}
 
+	KYTY_PROFILER_BLOCK("GPU wait (MasterSemaphore::Wait)", profiler::colors::RedA100);
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;
