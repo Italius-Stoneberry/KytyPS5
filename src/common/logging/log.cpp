@@ -5,6 +5,8 @@
 #include "common/emulatorConfig.h"
 
 #include <cstdio>
+#include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fmt/format.h>
 #include <memory>
@@ -136,7 +138,27 @@ void WriteToConsoleAndLog(std::string_view text) {
 	Flush();
 }
 
+// Fatal reports also go to _kyty_fatal.txt in the working folder, whatever the printf direction:
+// with printf_direction=Silent (the fastest setting) they used to reach only a console window that
+// closes with the emulator.
+static void AppendFatalFile(std::string_view text) {
+	static std::mutex fatal_mutex;
+	std::lock_guard   lock(fatal_mutex);
+	if (std::FILE* file = std::fopen("_kyty_fatal.txt", "ab"); file != nullptr) {
+		char             stamp[64] = {};
+		const std::time_t now      = std::time(nullptr);
+		if (const std::tm* local = std::localtime(&now); local != nullptr) {
+			std::strftime(stamp, sizeof(stamp), "=== %Y-%m-%d %H:%M:%S ===\n", local);
+		}
+		std::fwrite(stamp, 1, std::strlen(stamp), file);
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fflush(file);
+		std::fclose(file);
+	}
+}
+
 void WriteFatal(std::string_view text) {
+	AppendFatalFile(text);
 	if (g_direction == Direction::Silent || !g_initialized) {
 		WriteStdout(text);
 	} else {
@@ -147,6 +169,7 @@ void WriteFatal(std::string_view text) {
 }
 
 void WriteFatal(fmt::text_style style, std::string_view text) {
+	AppendFatalFile(text);
 	if (g_direction == Direction::Silent || !g_initialized) {
 		WriteStdout(text, style);
 	} else {
