@@ -81,6 +81,12 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// BDA helpers: the first call returns false (caller must do a full walk) and starts
+	// recording CPU-dirty ranges; later calls synchronize only the ranges recorded since.
+	bool               SynchronizeNotedCpuDirtyRanges(const RangeSet& mapped);
+	void               NoteCpuDirty(uint64_t vaddr, uint64_t size) {
+		m_memory_tracker.NoteCpuDirty(vaddr, size);
+	}
 	void               RunGarbageCollector();
 
 private:
@@ -141,6 +147,7 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	bool     m_bda_notes_active = false;
 };
 
 } // namespace Libs::Graphics
