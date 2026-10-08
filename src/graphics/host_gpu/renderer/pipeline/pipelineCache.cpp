@@ -24,8 +24,14 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -78,8 +84,27 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	// The emulator revision is not part of it: the driver validates its own cache data, and a
+	// build that emits different SPIR-V simply looks up different keys. Keeping the revision
+	// threw every compiled pipeline away with each new build.
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n", properties.vendorID,
+	                   properties.deviceID, properties.driverVersion, uuid);
+}
+
+// A cache file header written by this build, or by an older one ("KytyPC1:<revision>:" + the same
+// fields).
+bool DriverCacheHeaderMatches(std::string_view header, std::string_view signature) {
+	if (header == signature) {
+		return true;
+	}
+	constexpr std::string_view old_prefix = "KytyPC1:";
+	constexpr std::string_view new_prefix = "KytyPC2:";
+	if (!header.starts_with(old_prefix) || !signature.starts_with(new_prefix)) {
+		return false;
+	}
+	const auto revision_end = header.find(':', old_prefix.size());
+	return revision_end != std::string_view::npos &&
+	       header.substr(revision_end + 1) == signature.substr(new_prefix.size());
 }
 
 std::string PipelineCacheTitleId() {
@@ -416,14 +441,144 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    next_shader_id = 0;
 };
 
+namespace {
+
+// KYTY_PIPELINE_FAST_FIRST (default 1 in this build; 0 turns it off).
+bool FastFirstRequested() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_FAST_FIRST");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+} // namespace
+
+// Fast-first compute pipelines (the idea and the switch name come from Jetsku/KytyPS5,
+// KYTY_PIPELINE_FAST_FIRST). A compute pipeline that a dispatch needs and that neither the
+// driver's caches nor this process has compiled used to be compiled optimized while the GPU
+// thread waited: 1-4 s each for some Demon's Souls kernels on an RTX 3070 Ti. Now the driver is
+// first asked for the optimized pipeline only if it is already cached
+// (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT); when it is not, the pipeline is
+// built with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT (much faster to compile) and used at
+// once, and the optimized one is compiled on a background thread into the driver cache and
+// swapped in on the GPU thread. Replaced pipelines are destroyed 30 s later, when no command
+// buffer can still use them. Needs pipelineCreationCacheControl, so warm runs keep taking the
+// optimized pipelines straight from the cache.
+struct PipelineCache::FastFirst {
+	struct Job {
+		ComputePipelineRecipe recipe;
+		Pipeline*             target = nullptr;
+	};
+	struct Done {
+		Pipeline*    target    = nullptr;
+		vk::Pipeline optimized = nullptr;
+	};
+	struct Retired {
+		vk::Pipeline                          pipeline = nullptr;
+		std::chrono::steady_clock::time_point since;
+	};
+
+	FastFirst(GraphicContext& graphics, vk::PipelineCache cache): graphics(graphics), cache(cache) {
+		for (int i = 0; i < 2; i++) {
+			workers.emplace_back([this] { Run(); });
+		}
+	}
+	~FastFirst() { Stop(); }
+	KYTY_CLASS_NO_COPY(FastFirst);
+
+	void Stop() {
+		{
+			std::lock_guard lock(mutex);
+			stopping = true;
+			jobs.clear();
+		}
+		cv.notify_all();
+		for (auto& worker: workers) {
+			if (worker.joinable()) {
+				worker.join();
+			}
+		}
+	}
+
+	void Enqueue(const ComputePipelineRecipe& recipe, Pipeline* target) {
+		{
+			std::lock_guard lock(mutex);
+			if (stopping) {
+				return;
+			}
+			jobs.push_back({recipe, target});
+		}
+		cv.notify_one();
+	}
+
+	void Run() {
+		for (;;) {
+			Job job;
+			{
+				std::unique_lock lock(mutex);
+				cv.wait(lock, [this] { return stopping || !jobs.empty(); });
+				if (stopping) {
+					return;
+				}
+				job = jobs.front();
+				jobs.pop_front();
+			}
+			vk::Pipeline optimized = nullptr;
+			const auto   result    = CreateComputePipelineHandle(graphics, job.recipe, {}, cache,
+			                                                      optimized);
+			std::lock_guard lock(mutex);
+			if (result == vk::Result::eSuccess && optimized != nullptr) {
+				done.push_back({job.target, optimized});
+				done_count.store(done.size(), std::memory_order_release);
+			} else {
+				optimize_failed++;
+			}
+		}
+	}
+
+	GraphicContext&          graphics;
+	vk::PipelineCache        cache;
+	std::mutex               mutex;
+	std::condition_variable  cv;
+	std::deque<Job>          jobs;
+	std::vector<Done>        done;
+	std::atomic<size_t>      done_count {0};
+	bool                     stopping        = false;
+	uint64_t                 optimize_failed = 0;
+	std::vector<std::thread> workers;
+	// GPU thread only (render mutex held).
+	std::vector<Retired> retired;
+	uint64_t             probe_hits = 0;
+	uint64_t             fast       = 0;
+	uint64_t             swaps      = 0;
+	bool                 reported   = false;
+};
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	if (FastFirstRequested() && m_graphics.pipeline_creation_cache_control_enabled) {
+		m_fast_first = std::make_unique<FastFirst>(m_graphics, m_driver_cache);
+		PipelineCacheLog("Fast-first compute pipelines: on (KYTY_PIPELINE_FAST_FIRST=0 turns it off)");
+	} else {
+		PipelineCacheLog("Fast-first compute pipelines: off");
+	}
 }
 
 PipelineCache::~PipelineCache() {
 	Save();
+	StopBackgroundWork();
+	if (m_fast_first != nullptr) {
+		for (const auto& item: m_fast_first->done) {
+			m_graphics.device.destroyPipeline(item.optimized, nullptr);
+		}
+		for (const auto& item: m_fast_first->retired) {
+			m_graphics.device.destroyPipeline(item.pipeline, nullptr);
+		}
+		m_fast_first.reset();
+	}
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -472,31 +627,36 @@ void PipelineCache::InitializeDriverCache() {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= std::numeric_limits<uint32_t>::max()) {
-			std::string cached_signature(signature.size(), '\0');
-			uint64_t    payload_hash = 0;
-			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
-			uint32_t signature_read = 0;
-			uint32_t hash_read      = 0;
-			uint32_t payload_read   = 0;
-			file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
-			          &signature_read);
-			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
-			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
-			          &payload_read);
-			file.Close();
-			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
-			    payload_read != initial_data.size() || cached_signature != signature ||
-			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
-				initial_data.clear();
-				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
-				    path);
+		std::vector<uint8_t> contents;
+		uint32_t             contents_read = 0;
+		if (file_size > sizeof(uint64_t) && file_size <= std::numeric_limits<uint32_t>::max()) {
+			contents.resize(file_size);
+			file.Read(contents.data(), static_cast<uint32_t>(contents.size()), &contents_read);
+		}
+		file.Close();
+		// Header: one line (the signature), then the payload hash, then the payload.
+		const auto  header_limit = std::min<size_t>(contents.size(), 512);
+		const auto* newline      = static_cast<const uint8_t*>(
+		    header_limit != 0 ? std::memchr(contents.data(), '\n', header_limit) : nullptr);
+		bool valid = false;
+		if (contents_read == contents.size() && newline != nullptr) {
+			const auto header_size = static_cast<size_t>(newline - contents.data()) + 1;
+			const std::string_view header(reinterpret_cast<const char*>(contents.data()),
+			                              header_size);
+			if (contents.size() >= header_size + sizeof(uint64_t) &&
+			    DriverCacheHeaderMatches(header, signature)) {
+				uint64_t payload_hash = 0;
+				std::memcpy(&payload_hash, contents.data() + header_size, sizeof(payload_hash));
+				initial_data.assign(contents.begin() + static_cast<std::ptrdiff_t>(
+				                                           header_size + sizeof(payload_hash)),
+				                    contents.end());
+				valid = XXH3_64bits(initial_data.data(), initial_data.size()) == payload_hash;
 			}
-		} else {
-			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
+		}
+		if (!valid) {
+			initial_data.clear();
+			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
+			                 path);
 		}
 	}
 
@@ -525,14 +685,114 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
-void PipelineCache::Save() {
-	if (m_driver_cache == nullptr) {
+namespace {
+
+bool WriteDriverCacheFile(const std::filesystem::path& cache_path, const std::string& prefix,
+                          const std::vector<uint8_t>& payload) {
+	if (!Common::File::CreateDirectories(cache_path.parent_path())) {
+		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+		return false;
+	}
+	auto temp_path = cache_path;
+	temp_path += ".tmp";
+	Common::File file;
+	uint32_t     prefix_written  = 0;
+	uint32_t     payload_written = 0;
+	if (file.Create(temp_path)) {
+		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
+		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
+	}
+	const bool flushed = !file.IsInvalid() && file.Flush();
+	file.Close();
+	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
+	    !Common::File::RenameFile(temp_path, cache_path)) {
+		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
+		                 Common::PathToString(cache_path));
+		return false;
+	}
+	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+	                 Common::PathToString(cache_path));
+	return true;
+}
+
+
+} // namespace
+
+
+void PipelineCache::DrainFastFirst() {
+	if (m_fast_first == nullptr ||
+	    m_fast_first->done_count.load(std::memory_order_acquire) == 0) {
 		return;
 	}
+	std::vector<FastFirst::Done> done;
+	{
+		std::lock_guard lock(m_fast_first->mutex);
+		done.swap(m_fast_first->done);
+		m_fast_first->done_count.store(0, std::memory_order_release);
+	}
+	const auto now = std::chrono::steady_clock::now();
+	for (const auto& item: done) {
+		m_fast_first->retired.push_back({item.target->pipeline, now});
+		item.target->pipeline = item.optimized;
+		m_fast_first->swaps++;
+	}
+}
 
-	size_t               size = 0;
-	vk::Result           result;
-	std::vector<uint8_t> payload;
+void PipelineCache::CreateComputePipelineFast(Pipeline&                     pipeline,
+                                              const ShaderComputeInputInfo& input_info,
+                                              vk::ShaderModule              module) {
+	ComputePipelineRecipe recipe;
+	CreateComputePipelineLayout(m_graphics, pipeline, input_info, module, recipe);
+	vk::Pipeline handle = nullptr;
+	vk::Result   result = vk::Result::eErrorUnknown;
+	{
+		KYTY_PROFILER_BLOCK("Compute pipeline: driver cache probe");
+		result = CreateComputePipelineHandle(
+		    m_graphics, recipe, vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired,
+		    m_driver_cache, handle);
+	}
+	if (result == vk::Result::eSuccess && handle != nullptr) {
+		m_fast_first->probe_hits++;
+		pipeline.pipeline = handle;
+		return;
+	}
+	if (result == vk::Result::ePipelineCompileRequired) {
+		{
+			KYTY_PROFILER_BLOCK("Compute pipeline: unoptimized build");
+			result = CreateComputePipelineHandle(
+			    m_graphics, recipe, vk::PipelineCreateFlagBits::eDisableOptimization, nullptr,
+			    handle);
+		}
+		if (result == vk::Result::eSuccess && handle != nullptr) {
+			m_fast_first->fast++;
+			pipeline.pipeline = handle;
+			m_fast_first->Enqueue(recipe, &pipeline);
+			return;
+		}
+	}
+	// Anything else: the optimized pipeline, now, as without fast-first.
+	result = CreateComputePipelineHandle(m_graphics, recipe, {}, m_driver_cache, handle);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	pipeline.pipeline = handle;
+}
+
+void PipelineCache::StopBackgroundWork() {
+	if (m_fast_first != nullptr && !m_fast_first->reported) {
+		m_fast_first->Stop();
+		m_fast_first->reported = true;
+		PipelineCacheLog("Fast-first compute pipelines: {} from the driver cache, {} built "
+		                 "unoptimized first, {} optimized swaps, {} optimized builds failed",
+		                 m_fast_first->probe_hits, m_fast_first->fast, m_fast_first->swaps,
+		                 m_fast_first->optimize_failed);
+	}
+	if (m_save_thread.joinable()) {
+		m_save_thread.join();
+	}
+}
+
+bool PipelineCache::ReadDriverCache(std::vector<uint8_t>& payload) {
+	size_t     size   = 0;
+	vk::Result result = vk::Result::eErrorUnknown;
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
@@ -550,35 +810,66 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
+	return true;
+}
+
+void PipelineCache::MaybeSave() {
+	if (m_fast_first != nullptr) {
+		DrainFastFirst();
+		const auto now = std::chrono::steady_clock::now();
+		std::erase_if(m_fast_first->retired, [&](const FastFirst::Retired& item) {
+			if (now - item.since < std::chrono::seconds(30)) {
+				return false;
+			}
+			m_graphics.device.destroyPipeline(item.pipeline, nullptr);
+			return true;
+		});
+	}
+	if (m_driver_cache == nullptr || m_pipelines_since_save == 0 ||
+	    std::chrono::steady_clock::now() - m_last_save < std::chrono::seconds(90) ||
+	    m_save_running.load(std::memory_order_acquire)) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("PipelineCache::MaybeSave");
+	if (m_save_thread.joinable()) {
+		m_save_thread.join();
+	}
+	std::vector<uint8_t> payload;
+	if (!ReadDriverCache(payload)) {
+		m_last_save = std::chrono::steady_clock::now();
+		return;
+	}
+	m_pipelines_since_save = 0;
+	m_last_save            = std::chrono::steady_clock::now();
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
-	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+	m_save_running.store(true, std::memory_order_release);
+	m_save_thread = std::thread([this, path = m_driver_cache_path, prefix = std::move(prefix),
+	                             payload = std::move(payload)] {
+		(void)WriteDriverCacheFile(path, prefix, payload);
+		m_save_running.store(false, std::memory_order_release);
+	});
+}
+
+void PipelineCache::Save() {
+	StopBackgroundWork();
+	if (m_driver_cache == nullptr) {
 		return;
 	}
-	auto temp_path = m_driver_cache_path;
-	temp_path += ".tmp";
-	Common::File file;
-	uint32_t     prefix_written  = 0;
-	uint32_t     payload_written = 0;
-	if (file.Create(temp_path)) {
-		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
-	}
-	const bool flushed = !file.IsInvalid() && file.Flush();
-	file.Close();
-	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
-		                 Common::PathToString(m_driver_cache_path));
+	std::vector<uint8_t> payload;
+	if (!ReadDriverCache(payload)) {
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
+	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+	if (!WriteDriverCacheFile(m_driver_cache_path, prefix, payload)) {
+		return;
+	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache = nullptr;
 }
@@ -889,6 +1180,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	m_pipelines_since_save++;
 
 	return *iter->second;
 }
@@ -899,6 +1191,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);
+	DrainFastFirst();
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
@@ -910,7 +1203,13 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	if (m_fast_first != nullptr) {
+		CreateComputePipelineFast(*cached, input_info, compute_program.module);
+	} else {
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+		                       m_driver_cache);
+	}
+	m_pipelines_since_save++;
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
