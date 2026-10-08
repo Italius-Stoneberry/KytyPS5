@@ -396,6 +396,8 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
+	// A new buffer may cover pages that were CPU-dirty while no buffer owned them.
+	m_memory_tracker.NoteCpuDirty(overlap.begin, overlap.end - overlap.begin);
 	return id;
 }
 
@@ -674,6 +676,21 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+bool BufferCache::SynchronizeNotedCpuDirtyRanges(const RangeSet& mapped) {
+	KYTY_PROFILER_FUNCTION();
+	if (!m_bda_notes_active) {
+		m_bda_notes_active = true;
+		m_memory_tracker.EnableCpuDirtyNotes();
+		return false;
+	}
+	m_memory_tracker.TakeCpuDirtyNotes([&](uint64_t start, uint64_t end) {
+		mapped.ForEachInRange(start, end - start, [&](uint64_t begin, uint64_t last) {
+			SynchronizeBuffersInRange(begin, last - begin);
+		});
+	});
+	return true;
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
