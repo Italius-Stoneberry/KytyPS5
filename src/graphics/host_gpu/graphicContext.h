@@ -28,6 +28,9 @@ struct GraphicContext {
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	// Vulkan 1.3 pipelineCreationCacheControl: pipelines can be created with
+	// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT (a driver-cache probe).
+	bool                               pipeline_creation_cache_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
