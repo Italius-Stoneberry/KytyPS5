@@ -135,12 +135,19 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
-void RenderContext::RunGarbageCollector() {
+void RenderContext::RunGarbageCollector(bool frame_boundary) {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+	// Age-based eviction runs once per presented frame. Running it after every submission made
+	// the LRU ages ("N ticks old") mean "a couple of frames old" in submission-heavy games, so on
+	// GPUs that stay above the memory thresholds the caches kept evicting (and downloading, with
+	// a full GPU wait) resources that were still being used every frame.
+	if (!frame_boundary) {
+		return;
+	}
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
 }
