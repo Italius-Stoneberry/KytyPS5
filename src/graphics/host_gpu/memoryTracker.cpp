@@ -63,7 +63,17 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	// New regions start with every page CPU-dirty.
+	NoteCpuDirty(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE);
 	return ptr;
+}
+
+void MemoryTracker::NoteCpuDirty(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !m_cpu_dirty_notes_enabled.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::lock_guard lock(m_cpu_dirty_notes_mutex);
+	m_cpu_dirty_notes.Add(vaddr, size);
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -88,6 +98,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	NoteCpuDirty(vaddr, size);
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -128,6 +139,8 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	locks.clear();
+	NoteCpuDirty(vaddr, size);
 }
 
 } // namespace Libs::Graphics
