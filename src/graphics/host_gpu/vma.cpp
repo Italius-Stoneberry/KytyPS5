@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 
 namespace Libs::Graphics {
@@ -132,13 +133,62 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
-	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
+	const auto* native_info = static_cast<const vk::ImageCreateInfo::NativeType*>(image_info);
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
+
+	const auto try_create = [&](const VmaAllocationCreateInfo& alloc_info) {
+		native_image     = VK_NULL_HANDLE;
+		image.allocation = nullptr;
+		return static_cast<vk::Result>(vmaCreateImage(allocator, native_info, &alloc_info,
+		                                              &native_image, &image.allocation, nullptr));
+	};
+
+	// 1) VRAM, but only while the process stays inside the driver-reported budget.
+	VmaAllocationCreateInfo vram_info {};
+	vram_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	if (memory_budget_ext_enabled) {
+		vram_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+	}
+	auto result = try_create(vram_info);
+
+	// 2) VRAM is full: place the image in system RAM (GPU reads it over PCIe). Slower, but it
+	//    keeps 8 GB cards from aborting when a game needs more than the card has.
+	if (result != vk::Result::eSuccess) {
+		uint32_t   sysmem_types = 0;
+		const auto& props       = physical_device_memory_properties;
+		for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
+			const auto heap = props.memoryTypes[i].heapIndex;
+			if (!(props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
+			    !(props.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+				sysmem_types |= 1u << i;
+			}
+		}
+		if (sysmem_types != 0) {
+			VmaAllocationCreateInfo sysmem_info {};
+			sysmem_info.memoryTypeBits = sysmem_types;
+			result                     = try_create(sysmem_info);
+			if (result == vk::Result::eSuccess) {
+				static std::atomic<uint64_t> fallback_total {0};
+				const uint64_t                fallback_count = ++fallback_total;
+				if ((fallback_count % 256) == 1) {
+					LOGF("VRAM budget exceeded: image %ux%ux%u format=%d placed in system memory "
+					     "(fallback #%" PRIu64 ")\n",
+					     image_info.extent.width, image_info.extent.height,
+					     image_info.extent.depth, static_cast<int>(image_info.format),
+					     fallback_count);
+					LogMemoryBudget();
+				}
+			}
+		}
+	}
+
+	// 3) Last resort: original behaviour (any VRAM, ignoring the budget).
+	if (result != vk::Result::eSuccess) {
+		VmaAllocationCreateInfo any_vram_info {};
+		any_vram_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		result                      = try_create(any_vram_info);
+	}
+
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
