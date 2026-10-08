@@ -1,9 +1,20 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/spirvLocalArrays.h"
+
+#include <spirv-tools/libspirv.hpp>
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <set>
+#include <string>
+#include <vector>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -124,7 +135,78 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 	}
 }
 
+namespace {
+
+// KYTY_FUNCTION_ARRAY_SHRINK (default 1 in this build; 0 turns it off), ported from Jetsku/KytyPS5:
+// shader modules get their per-invocation (Function storage) arrays shrunk to the indices they can
+// provably reach (spirvLocalArrays.h). The driver reserves local memory for the largest per-thread
+// footprint of any pipeline times every thread the GPU keeps resident and never returns it; the
+// recompiler's 8192-dword (32 KiB) LDS emulation in vertex and pixel shaders made that 3.9 GiB on
+// an RTX 3090 (about 2.3 GiB on an RTX 3070 Ti), memory an 8 GB card then lacks for textures.
+// A rewritten module that fails spirv-val is not used (logged once).
+bool FunctionArrayShrinkEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FUNCTION_ARRAY_SHRINK");
+		const bool  on    = value == nullptr || (*value != '\0' && std::strcmp(value, "0") != 0);
+		LOGF("Function-storage array shrink: %s (KYTY_FUNCTION_ARRAY_SHRINK)\n", on ? "on" : "off");
+		return on;
+	}();
+	return enabled;
+}
+
+// Returns the rewritten module, or nothing (unchanged or invalid).
+std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code) {
+	std::vector<uint32_t> shrunk;
+	const auto            result = SpirvLocalArrays::Shrink(code, shrunk);
+	if (!result.changed) {
+		return {};
+	}
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+	std::string          messages;
+	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*, const spv_position_t&,
+	                                     const char* message) {
+		if (messages.size() < 512) {
+			messages += message;
+			messages += "; ";
+		}
+	});
+	const bool valid = tools.Validate(shrunk);
+	std::string arrays;
+	for (const auto& array: result.arrays) {
+		char part[160];
+		std::snprintf(part, sizeof(part), "%s%s %u -> %u", arrays.empty() ? "" : ", ",
+		              array.name.empty() ? "array" : array.name.c_str(), array.old_length,
+		              array.new_length);
+		arrays += part;
+	}
+	static std::mutex            log_mutex;
+	static std::set<std::string> logged;
+	{
+		std::scoped_lock lock(log_mutex);
+		if (logged.insert(arrays + (valid ? "" : " invalid")).second) {
+			Log::WriteToConsoleAndLog(
+			    "Function-storage arrays shrunk: " + arrays + ", " +
+			    std::to_string(result.bytes_before) + " -> " + std::to_string(result.bytes_after) +
+			    " bytes per invocation" +
+			    (valid ? std::string {}
+			           : "; the rewritten module failed validation, the original is used: " +
+			                 messages) +
+			    "\n");
+		}
+	}
+	return valid ? shrunk : std::vector<uint32_t> {};
+}
+
+} // namespace
+
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
+	std::vector<uint32_t> shrunk;
+	if (FunctionArrayShrinkEnabled()) {
+		shrunk = ShrinkFunctionArrays(code);
+		if (!shrunk.empty()) {
+			code = shrunk;
+		}
+	}
 	vk::ShaderModuleCreateInfo create_info {};
 	create_info.codeSize    = code.size_bytes();
 	create_info.pCode       = code.data();
