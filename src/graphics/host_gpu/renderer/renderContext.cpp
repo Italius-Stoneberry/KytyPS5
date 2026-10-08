@@ -189,6 +189,11 @@ void RenderContext::RunGarbageCollector(bool frame_boundary) {
 	}
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+	{
+		// Swaps in background-optimized pipelines and writes the pipeline cache now and then.
+		Common::LockGuard lock(m_mutex);
+		m_pipeline_cache.MaybeSave();
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
