@@ -306,6 +306,10 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
+void CommandProcessor::AdvanceBdaEpoch() {
+	m_renderer.AdvanceBdaEpoch();
+}
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
@@ -315,6 +319,8 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
+	// The CPU may have written the data this wait guards just before its flag.
+	AdvanceBdaEpoch();
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
 	}
@@ -349,6 +355,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	} else {
 		memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 	}
+	// Later draws of this submission must see the write, including through addresses.
+	m_renderer.AdvanceBdaEpoch();
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -359,6 +367,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	m_renderer.AdvanceBdaEpoch(); // As WriteData.
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -637,6 +646,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	}
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
+	// A submission starting or resuming: its draws must see the CPU writes made before it.
+	AdvanceBdaEpoch();
 
 	struct ExecutionScope {
 		ExecutionScope(CommandProcessor& processor, Pm4Execution& execution)
@@ -801,6 +812,9 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
                                       const volatile void* address, uint32_t count_in_dwords) {
 	(void)count_in_dwords;
 	uint64_t value = 0;
+	if (op != 0) {
+		AdvanceBdaEpoch();
+	}
 
 	switch (op) {
 		case 0x00:
