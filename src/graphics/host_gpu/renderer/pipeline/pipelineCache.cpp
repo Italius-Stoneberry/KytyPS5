@@ -82,6 +82,30 @@ namespace {
 Live::Switch g_pipeline_prefetch("KYTY_PIPELINE_PREFETCH", Live::ParseDefaultOff);
 Live::Switch g_program_prefetch("KYTY_PIPELINE_PREFETCH_PROGRAMS", Live::ParseDefaultOff);
 
+// KYTY_PIPELINE_LOOKUP_MEMO = 0 (default) | 1: a per-thread memo answers GetComputePipeline (by
+// program id) and GetGraphicsPipeline (by key, after the last-key memo) for pipelines this thread
+// found before, without the map lock (m_mutex). With KYTY_DRAW_PREP_INDIRECT=1 the draw-prep
+// workers take that lock all the time (their plan lookups and pipeline prefetch requests), and the
+// GPU thread's lookups queue behind them: Demon's Souls gameplay (Tracy, 45 s) 11.2k compute
+// lookups/s at 4.7 us = 53 ms/s, against 13.3k/s at ~0.1 us without the switch; nearly all were
+// hits. Exact, as the existing memos (FindGraphicsPipelineForPlan, the last-key memo): the maps
+// only grow, their objects and node keys live as long as the cache, an object replaced by an
+// optimized build (pipeline libraries, fast-first) is a new object with m_pipeline_generation
+// bumped under the lock, and every cache instance counts its generations in its own range. An entry
+// records the generation read under the lock with its object, and is used only while it is still
+// current; a miss takes the locked path as before and refills the entry. Live switch: entries are
+// valid in any mode (they are checked against the generation), the flag only decides whether they
+// are used.
+Live::Switch g_lookup_memo("KYTY_PIPELINE_LOOKUP_MEMO", Live::ParseDefaultOff);
+
+struct LookupMemoCounters {
+	std::atomic<uint64_t> compute_hits {0};
+	std::atomic<uint64_t> compute_misses {0};
+	std::atomic<uint64_t> graphics_hits {0};
+	std::atomic<uint64_t> graphics_misses {0};
+};
+LookupMemoCounters g_lookup_memo_counters;
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -5294,6 +5318,14 @@ void PipelineCache::NotePlannedPipeline(const RenderDepthInfo&      depth,
 	FlushCompileStall();
 }
 
+PipelineCache::LookupMemoTotals PipelineCache::GetLookupMemoTotals() noexcept {
+	const auto& c = g_lookup_memo_counters;
+	return {c.compute_hits.load(std::memory_order_relaxed),
+	        c.compute_misses.load(std::memory_order_relaxed),
+	        c.graphics_hits.load(std::memory_order_relaxed),
+	        c.graphics_misses.load(std::memory_order_relaxed)};
+}
+
 PipelineCache::PrefetchTotals PipelineCache::GetPrefetchTotals() const {
 	if (m_prefetch == nullptr) return {};
 	return {m_prefetch->submitted.load(), m_prefetch->used.load(), m_prefetch->compile_ns.load(),
@@ -5427,13 +5459,52 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoMisses);
 	}
+	// KYTY_PIPELINE_LOOKUP_MEMO: the keys this thread found before (see g_lookup_memo). An entry
+	// points at the map's own key (nodes are never erased, keys never change).
+	struct Remembered {
+		const PipelineCache*       cache      = nullptr;
+		const GraphicsPipelineKey* key        = nullptr;
+		Pipeline*                  pipeline   = nullptr;
+		uint64_t                   generation = 0;
+		std::size_t                hash       = 0;
+	};
+	static thread_local std::array<Remembered, 1024> lookup_memo {};
+	const bool                                       lookup_enabled = g_lookup_memo.On();
+	std::size_t                                      key_hash       = 0;
+	if (lookup_enabled) {
+		key_hash            = GraphicsPipelineKeyHash {}(key);
+		const auto& entry   = lookup_memo[key_hash % lookup_memo.size()];
+		const auto  current = m_pipeline_generation.load(std::memory_order_acquire);
+		if (entry.cache == this && entry.generation == current && entry.hash == key_hash &&
+		    entry.key != nullptr && *entry.key == key) {
+			g_lookup_memo_counters.graphics_hits.fetch_add(1, std::memory_order_relaxed);
+			if (memo_enabled) {
+				// The generation verified with the object, never a later one.
+				last.cache      = this;
+				last.pipeline   = entry.pipeline;
+				last.generation = current;
+				last.key        = key;
+			}
+			FlushCompileStall();
+			return *entry.pipeline;
+		}
+		g_lookup_memo_counters.graphics_misses.fetch_add(1, std::memory_order_relaxed);
+	}
 	// Called with m_mutex held, so the generation read matches the object found.
-	const auto remember = [&](Pipeline& pipeline) -> Pipeline& {
+	const auto remember = [&](const GraphicsPipelineKey& map_key, Pipeline& pipeline) -> Pipeline& {
+		const auto generation = m_pipeline_generation.load(std::memory_order_relaxed);
 		if (memo_enabled) {
 			last.cache      = this;
 			last.pipeline   = &pipeline;
-			last.generation = m_pipeline_generation.load(std::memory_order_relaxed);
+			last.generation = generation;
 			last.key        = key;
+		}
+		if (lookup_enabled) {
+			lookup_memo[key_hash % lookup_memo.size()] = {.cache      = this,
+			                                              .key        = &map_key,
+			                                              .pipeline   = &pipeline,
+			                                              .generation = generation,
+			                                              .hash       = key_hash};
 		}
 		FlushCompileStall();
 		return pipeline;
@@ -5446,7 +5517,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		{
 			Common::LockGuard lock(m_mutex);
 			if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-				return remember(*iter->second);
+				return remember(iter->first, *iter->second);
 			}
 			// Reserve the key before releasing the map. Other preparation threads may submit
 			// independent keys while this draw waits, allowing compiles to overlap each other.
@@ -5463,7 +5534,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			                      ready.pipeline->descriptor_set_layout);
 			m_prefetch->Complete(key);
 		}
-		return remember(*iter->second);
+		return remember(iter->first, *iter->second);
 	}
 	const auto create_begin = wait_begin != 0 ? wait_begin : CompileClockNs();
 
@@ -5565,7 +5636,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	AddCompileStall(create_ns);
 	// A fast build left the driver cache untouched; its optimized build notes the creation.
 	if (!prefetched && fast_result.snapshot == nullptr) NotePipelineCreated(create_ns);
-	return remember(*iter->second);
+	return remember(iter->first, *iter->second);
 }
 
 PipelineCache::Pipeline&
@@ -5575,12 +5646,42 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
+	// KYTY_PIPELINE_LOOKUP_MEMO: the program ids this thread found before (see g_lookup_memo).
+	struct Remembered {
+		const PipelineCache* cache      = nullptr;
+		uint64_t             id         = 0;
+		Pipeline*            pipeline   = nullptr;
+		uint64_t             generation = 0;
+	};
+	static thread_local std::array<Remembered, 256> lookup_memo {};
+	const bool                                      lookup_enabled = g_lookup_memo.On();
+	auto& entry = lookup_memo[compute_program.id % lookup_memo.size()];
+	if (lookup_enabled) {
+		if (entry.cache == this && entry.pipeline != nullptr && entry.id == compute_program.id &&
+		    entry.generation == m_pipeline_generation.load(std::memory_order_acquire)) {
+			g_lookup_memo_counters.compute_hits.fetch_add(1, std::memory_order_relaxed);
+			FlushCompileStall();
+			return *entry.pipeline;
+		}
+		g_lookup_memo_counters.compute_misses.fetch_add(1, std::memory_order_relaxed);
+	}
+	// Called with m_mutex held, so the generation read matches the object found.
+	const auto remember = [&](Pipeline& pipeline) -> Pipeline& {
+		if (lookup_enabled) {
+			entry = {.cache      = this,
+			         .id         = compute_program.id,
+			         .pipeline   = &pipeline,
+			         .generation = m_pipeline_generation.load(std::memory_order_relaxed)};
+		}
+		return pipeline;
+	};
+
 	Common::LockGuard lock(m_mutex);
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
 		FlushCompileStall();
-		return *iter->second;
+		return remember(*iter->second);
 	}
 	const auto create_begin = CompileClockNs();
 
@@ -5629,6 +5730,6 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	AddCompileStall(create_ns);
 	FlushCompileStall();
 	if (fast_result.snapshot == nullptr) NotePipelineCreated(create_ns);
-	return *iter->second;
+	return remember(*iter->second);
 }
 } // namespace Libs::Graphics
