@@ -4,13 +4,14 @@ on:
   push:
     tags:
       - 'u59-windows-*'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   windows:
-    if: github.repository == 'Jetsku/KytyPS5-experimental' || github.repository == 'Jetsku/KytyPS5'
+    if: github.repository == 'Jetsku/KytyPS5-experimental' || github.repository == 'Jetsku/KytyPS5' || github.repository == 'Italius-Stoneberry/KytyPS5'
     runs-on: windows-2022
     steps:
       - name: Check out experimental source
@@ -174,7 +175,17 @@ jobs:
           Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
+      # Italius-Stoneberry fork: test builds are workflow artifacts, not GitHub releases.
+      - name: Upload test build
+        if: github.repository == 'Italius-Stoneberry/KytyPS5'
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-U59-Windows-x64-${{ github.ref_name }}
+          path: KytyPS5-U59-Windows-x64.zip
+          if-no-files-found: error
+
       - name: Publish experimental build
+        if: github.repository != 'Italius-Stoneberry/KytyPS5'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
