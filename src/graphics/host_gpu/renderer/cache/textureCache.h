@@ -269,6 +269,13 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	// KYTY_VRAM_ADAPTIVE: the budget the thresholds above are for, and GetTotalMemoryBudget() at start.
+	uint64_t m_gc_budget       = 0;
+	uint64_t m_gc_start_budget = 0;
+	// KYTY_TEXTURE_GC_TIME: when collection n ran (steady-clock ns) at [n % size]; 256 > the 160 of
+	// the longest frame-based age.
+	std::array<int64_t, 256> m_gc_tick_times {};
+	void                     UpdateGcThresholds(uint64_t budget);
 	std::atomic<uint64_t> m_frame {0};
 	struct PendingDownload {
 		uint64_t address = 0, size = 0, tick = 0;
