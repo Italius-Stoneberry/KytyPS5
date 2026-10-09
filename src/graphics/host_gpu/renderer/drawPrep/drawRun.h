@@ -152,6 +152,31 @@ struct Totals {
 };
 [[nodiscard]] Totals& GetTotals();
 
+// What one committed draw did with the run, from the totals around its commit (GPU thread: the only
+// writer of these totals). KYTY_DRAW_RUN_INDIRECT counts its committed indirect draws with it.
+struct Counts {
+	uint64_t continued = 0;
+	uint64_t misses[static_cast<uint32_t>(Miss::Count)] {};
+};
+[[nodiscard]] Counts ReadCounts() noexcept;
+enum class Outcome : uint8_t {
+	Continued, // took the delta path (verify: would have)
+	NoRun,     // no eligible previous draw, another key, or the draw reached no programs
+	Missed,    // the key matched but a certificate check refused (`miss`)
+};
+[[nodiscard]] inline Outcome Classify(const Counts& before, const Counts& after,
+                                      Miss& miss) noexcept {
+	// A late fallback (images changed during the buffer work) counted the continuation first,
+	// then Miss::Images: a miss.
+	for (uint32_t i = 0; i < static_cast<uint32_t>(Miss::Count); i++) {
+		if (after.misses[i] != before.misses[i]) {
+			miss = static_cast<Miss>(i);
+			return Outcome::Missed;
+		}
+	}
+	return after.continued != before.continued ? Outcome::Continued : Outcome::NoRun;
+}
+
 void CountMiss(Miss miss) noexcept;
 // Verify mode: one comparison, and a difference (counted, logged; exit mode stops).
 void CountVerifyCheck() noexcept;
