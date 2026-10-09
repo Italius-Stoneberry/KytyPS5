@@ -155,6 +155,24 @@ static Live::Switch g_draw_prep_indirect("KYTY_DRAW_PREP_INDIRECT", ParseDrawPre
 static_assert(static_cast<uint32_t>(DrawOffsetSource::IndirectArgs) ==
               CpSeq::OffsetSourceIndirectArgs);
 
+// KYTY_DRAW_RUN_INDIRECT = 0 (default) | 1. With KYTY_DRAW_RUN on (1, verify or exit) and
+// KYTY_DRAW_PREP_INDIRECT publishing: a published DrawIndirect op no longer ends the draw run
+// up front (ExecuteOp's DrawRun::NoteForeignActivity, drawPrep/drawRun.h); the op notes it itself
+// (ExecDrawIndirectPublished) unless it does nothing but commit its slot after a clean backing read
+// of the record, exactly what a published direct draw op does. Demon's Souls gameplay with
+// KYTY_DRAW_PREP_INDIRECT=1, per 10 s: ~439k draws, 410k eligible, 338k key matches, but 7.5k
+// continued (1.7%; 330k activity misses): every indirect op ended the run (menus continue 40-64%).
+// Live switch: read by the resolver once per op (ExecuteOp), which passes the decision on.
+// Counters: "DrawRun indirect 10s" (drawPrep.cpp) next to the "DrawRun 10s" line.
+static Live::Switch g_draw_run_indirect("KYTY_DRAW_RUN_INDIRECT", Live::ParseDefaultOff);
+
+static_assert(static_cast<uint32_t>(DrawPrep::IndirectRunEvent::Pipeline) -
+                      static_cast<uint32_t>(DrawPrep::IndirectRunEvent::Activity) + 1u ==
+                  static_cast<uint32_t>(DrawRun::Miss::Count) &&
+              static_cast<uint32_t>(DrawRun::Miss::Activity) == 0 &&
+              static_cast<uint32_t>(DrawRun::Miss::Pipeline) + 1u ==
+                  static_cast<uint32_t>(DrawRun::Miss::Count));
+
 static uint64_t IndexElementSize(uint32_t index_type_and_size) {
 	switch (index_type_and_size) {
 		case 0: return 2;
@@ -165,16 +183,24 @@ static uint64_t IndexElementSize(uint32_t index_type_and_size) {
 	return 0;
 }
 
-void ReadGuestForCp(uint64_t vaddr, uint64_t size, void* dst) {
+// ReadGuestForCp, returning whether the first clean backing read answered it: then nothing but
+// the backing bytes was read (exact GPU-ownership queries and the backing store; no
+// synchronization, wait, readback, page fault or service command).
+static bool ReadGuestForCpClean(uint64_t vaddr, uint64_t size, void* dst) {
 	EXIT_IF(vaddr == 0 || dst == nullptr);
 	if (LibKernel::Memory::TryReadGpuCleanBacking(vaddr, dst, size)) {
-		return;
+		return true;
 	}
 	if (LibKernel::Memory::SynchronizeGpuBackingForRead(vaddr, size) &&
 	    LibKernel::Memory::TryReadGpuCleanBacking(vaddr, dst, size)) {
-		return;
+		return false;
 	}
 	std::memcpy(dst, reinterpret_cast<const void*>(vaddr), size);
+	return false;
+}
+
+void ReadGuestForCp(uint64_t vaddr, uint64_t size, void* dst) {
+	(void)ReadGuestForCpClean(vaddr, size, dst);
 }
 
 class GpuMutexLock final {
@@ -271,6 +297,15 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 		                     "record the sequencer reads; the resolver commits one only if its own "
 		                     "read is the same bytes (\"DrawPrep indirect 10s\" lines)"
 		                   : "inactive: needs KYTY_CP_SEQ=1 and KYTY_DRAW_PREP=parallel");
+	}
+	if (g_draw_run_indirect.On()) {
+		std::printf(
+		    "Kyty DrawRun indirect: KYTY_DRAW_RUN_INDIRECT=1, a published indirect draw that "
+		    "only commits its slot after a clean record read keeps the draw run open%s "
+		    "(\"DrawRun indirect 10s\" lines)\n",
+		    DrawRun::Enabled() && g_draw_prep_indirect.Get() != 0
+		        ? ""
+		        : " (inactive until KYTY_DRAW_RUN and KYTY_DRAW_PREP_INDIRECT are on)");
 	}
 	if (CpWakeupsEnabled()) {
 		m_renderer.GetCommandScheduler().SetProgressHook(
@@ -2607,15 +2642,16 @@ bool CommandProcessor::PublishIndirectDraw(CpSeq::DrawIndirectOp& op) {
 	return true;
 }
 
-void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
+void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op, bool run_note_deferred) {
 	if ((op.flags & CpSeq::IndirectFlagSetInstances) != 0) {
 		m_num_instances = op.num_instances;
 		m_pending_num_instances.clear();
 	}
 	if ((op.flags & CpSeq::IndirectFlagPublished) != 0) {
-		ExecDrawIndirectPublished(op);
+		ExecDrawIndirectPublished(op, run_note_deferred);
 		return;
 	}
+	EXIT_IF(run_note_deferred);
 	ExecDrawIndirectRecord(op);
 }
 
@@ -2661,9 +2697,20 @@ void CommandProcessor::DrawCpuIndirect(const CpSeq::CpuIndirectDraw& draw, uint6
 // KYTY_DRAW_PREP_INDIRECT, resolver (g_draw_prep_indirect): the steps of ExecDrawIndirectRecord in
 // its order, with the slot's registers bound as the op's snapshot would be. The slot is committed
 // only when this read of the record is the sequencer's bytes; every other outcome is today's draw.
-void CommandProcessor::ExecDrawIndirectPublished(const CpSeq::DrawIndirectOp& op) {
+void CommandProcessor::ExecDrawIndirectPublished(const CpSeq::DrawIndirectOp& op,
+                                                 bool                         run_note_deferred) {
 	using DrawPrep::IndirectEvent;
+	using DrawPrep::IndirectRunEvent;
 	EXIT_IF(m_draw_prep == nullptr || !m_draw_prep->Parallel());
+	// KYTY_DRAW_RUN_INDIRECT: ExecuteOp left the run's activity note to this op. Everything but
+	// committing the slot after a clean read is other command-processor work for the run (as
+	// before: the note comes before the work it stands for).
+	const auto note_activity = [run_note_deferred](IndirectRunEvent reason) {
+		if (run_note_deferred) {
+			DrawRun::NoteForeignActivity();
+			DrawPrep::CountIndirectRun(reason);
+		}
+	};
 	auto&      engine    = *m_draw_prep;
 	auto&      scheduler = GetScheduler();
 	auto&      registers = engine.PublishedRegisters(op.window);
@@ -2674,6 +2721,7 @@ void CommandProcessor::ExecDrawIndirectPublished(const CpSeq::DrawIndirectOp& op
 		// GPU-owned by now (an earlier op of the stream, e.g. a dispatch, wrote the record after
 		// the sequencer read it; or the read saw a stale backing): the native path, as today.
 		DrawPrep::CountIndirect(IndirectEvent::BackGpuOwned);
+		note_activity(IndirectRunEvent::NotedFallback);
 		ExecDrawIndirectRecord(op);
 		scheduler.RestoreRegisters(previous);
 		engine.DiscardPublished(op.window);
@@ -2681,10 +2729,10 @@ void CommandProcessor::ExecDrawIndirectPublished(const CpSeq::DrawIndirectOp& op
 	}
 	// TryDrawIndirectNative returns false here without side effects: today's CPU path.
 	m_pending_num_instances.clear();
-	uint32_t record[CpSeq::IndirectRecordDwords] {};
-	ReadGuestForCp(source.args_addr, source.RecordSize(), record);
-	const auto draw  = CpuIndirectDrawOf(op, record);
-	auto       event = IndirectEvent::Committed;
+	uint32_t   record[CpSeq::IndirectRecordDwords] {};
+	const bool clean_read = ReadGuestForCpClean(source.args_addr, source.RecordSize(), record);
+	const auto draw       = CpuIndirectDrawOf(op, record);
+	auto       event      = IndirectEvent::Committed;
 	if (std::memcmp(record, op.record, source.RecordSize()) != 0) {
 		// Written since the sequencer read it (a guest CPU write, or a GPU write that was already
 		// published back): the draw must use these bytes.
@@ -2716,9 +2764,29 @@ void CommandProcessor::ExecDrawIndirectPublished(const CpSeq::DrawIndirectOp& op
 		// The draw the slot was published for: committed exactly like a published direct draw
 		// (the live back registers bound outside the commit, Validate certifies the preparation).
 		scheduler.RestoreRegisters(previous);
+		if (!run_note_deferred) {
+			DrawCpuIndirect(draw, op.window);
+			return;
+		}
+		if (!clean_read) {
+			// The read synchronized, waited or faulted (a readback may have recorded or submitted
+			// work): other command-processor work before this draw.
+			note_activity(IndirectRunEvent::NotedRead);
+		}
+		// What the commit did with the run (the only draw in between).
+		const auto before = DrawRun::ReadCounts();
 		DrawCpuIndirect(draw, op.window);
+		DrawRun::Miss miss    = DrawRun::Miss::Activity;
+		const auto    outcome = DrawRun::Classify(before, DrawRun::ReadCounts(), miss);
+		DrawPrep::CountIndirectRun(
+		    outcome == DrawRun::Outcome::Continued ? IndirectRunEvent::Continued
+		    : outcome == DrawRun::Outcome::NoRun
+		        ? IndirectRunEvent::NoRun
+		        : static_cast<IndirectRunEvent>(static_cast<uint32_t>(IndirectRunEvent::Activity) +
+		                                        static_cast<uint32_t>(miss)));
 		return;
 	}
+	note_activity(IndirectRunEvent::NotedFallback);
 	DrawCpuIndirect(draw, UINT64_MAX);
 	scheduler.RestoreRegisters(previous);
 	engine.DiscardPublished(op.window);
@@ -4080,17 +4148,24 @@ CpSeq::Result CommandProcessor::SubmitInline(CpSeq::OpKind kind, const void* pay
 CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payload,
                                           const void* data) {
 	using CpSeq::OpKind;
+	// KYTY_DRAW_RUN_INDIRECT: a published single indirect draw takes its run note itself.
+	const bool run_note_deferred = DrawRun::Enabled() && kind == OpKind::DrawIndirect &&
+	                               g_draw_run_indirect.On() &&
+	                               (static_cast<const CpSeq::DrawIndirectOp*>(payload)->flags &
+	                                CpSeq::IndirectFlagPublished) != 0;
 	// KYTY_DRAW_RUN (drawPrep/drawRun.h): every operation but a direct draw (whose commit keeps its
 	// own run bookkeeping) and pure control flow is other command-processor work, which ends a run.
 	if (DrawRun::Enabled() && kind != OpKind::DrawIndex && kind != OpKind::DrawAuto &&
-	    kind != OpKind::ReadCheck && kind != OpKind::CondExec && kind != OpKind::Branch) {
+	    kind != OpKind::ReadCheck && kind != OpKind::CondExec && kind != OpKind::Branch &&
+	    !run_note_deferred) {
 		DrawRun::NoteForeignActivity();
 	}
 	switch (kind) {
 		case OpKind::DrawIndex: ExecDrawIndex(*static_cast<const CpSeq::DrawIndexOp*>(payload)); break;
 		case OpKind::DrawAuto: ExecDrawAuto(*static_cast<const CpSeq::DrawAutoOp*>(payload)); break;
 		case OpKind::DrawIndirect:
-			ExecDrawIndirect(*static_cast<const CpSeq::DrawIndirectOp*>(payload));
+			ExecDrawIndirect(*static_cast<const CpSeq::DrawIndirectOp*>(payload),
+			                 run_note_deferred);
 			break;
 		case OpKind::DrawIndirectMulti:
 			ExecDrawIndirectMulti(*static_cast<const CpSeq::DrawIndirectOp*>(payload));
