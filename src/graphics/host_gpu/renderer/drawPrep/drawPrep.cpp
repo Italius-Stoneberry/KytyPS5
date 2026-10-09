@@ -1294,6 +1294,46 @@ void PrintDrawPrepSummary() {
 		            n(E::FrontPendingWrite), n(E::FrontPublication), n(E::FrontBacking),
 		            n(E::FrontOther));
 	}
+	// KYTY_DRAW_RUN_INDIRECT (graphicsRun.cpp), from its first event on: the committed published
+	// indirect draws that continued a run, why the others did not, and the activity notes the ops
+	// took themselves.
+	static std::array<uint64_t, static_cast<size_t>(IndirectRunEvent::Count)> last_run {};
+	std::array<uint64_t, static_cast<size_t>(IndirectRunEvent::Count)>        run {};
+	bool                                                                      run_seen = false;
+	for (size_t i = 0; i < run.size(); i++) {
+		const auto value = g_totals.indirect_run[i].load(std::memory_order_relaxed);
+		run[i]           = value - last_run[i];
+		last_run[i]      = value;
+		run_seen         = run_seen || value != 0;
+	}
+	if (run_seen) {
+		const auto n = [&](IndirectRunEvent event) { return run[static_cast<size_t>(event)]; };
+		using E      = IndirectRunEvent;
+		std::printf(
+		    "DrawRun indirect %.0fs: %" PRIu64 " committed indirect draws continued a run, %" PRIu64
+		    " had none; broken: activity=%" PRIu64 " command=%" PRIu64 " instance=%" PRIu64
+		    " programs=%" PRIu64 " validation=%" PRIu64 " images=%" PRIu64 " pipeline=%" PRIu64
+		    "; noted by the op: read=%" PRIu64 " fallback=%" PRIu64 "\n",
+		    static_cast<double>(now - last_ns) * 1e-9, n(E::Continued), n(E::NoRun), n(E::Activity),
+		    n(E::Command), n(E::Instance), n(E::Programs), n(E::Validation), n(E::Images),
+		    n(E::Pipeline), n(E::NotedRead), n(E::NotedFallback));
+	}
+	// KYTY_PIPELINE_LOOKUP_MEMO (pipelineCache.cpp), from its first lookup on: pipeline lookups
+	// answered by the per-thread memo, and those that took the pipeline cache's lock.
+	static PipelineCache::LookupMemoTotals last_lookup {};
+	const auto                             lookup = PipelineCache::GetLookupMemoTotals();
+	if (lookup.compute_hits + lookup.compute_misses + lookup.graphics_hits +
+	        lookup.graphics_misses !=
+	    0) {
+		std::printf("Pipeline lookup memo %.0fs: compute %" PRIu64 " hits, %" PRIu64
+		            " locked; graphics %" PRIu64 " hits, %" PRIu64 " locked\n",
+		            static_cast<double>(now - last_ns) * 1e-9,
+		            lookup.compute_hits - last_lookup.compute_hits,
+		            lookup.compute_misses - last_lookup.compute_misses,
+		            lookup.graphics_hits - last_lookup.graphics_hits,
+		            lookup.graphics_misses - last_lookup.graphics_misses);
+	}
+	last_lookup    = lookup;
 	last_ns        = now;
 	last_committed = committed;
 	last_fallbacks = fallbacks;
