@@ -111,6 +111,23 @@ enum class Failure : uint8_t {
 	Mismatch,
 };
 
+// KYTY_DRAW_PREP_INDIRECT (graphicsRun.cpp, CpSeq::IndirectFlagPublished): what happened to the
+// single indirect draws (DRAW_INDIRECT, DRAW_INDEX_INDIRECT) of the sequencer. Printed every 10 s
+// after the "DrawPrep 10s" line ("DrawPrep indirect 10s").
+enum class IndirectEvent : uint8_t {
+	Published,         // sequencer: the record read and the draw published to the window
+	Committed,         // resolver: same record bytes, committed through the slot
+	BackGpuOwned,      // resolver: GPU-owned by then, drawn natively; slot retired unused
+	BackChanged,       // resolver: the record changed after the sequencer read it; slot unused
+	BackArgs,          // resolver: the slot's arguments differ from the record's (never expected)
+	VerifyMatched,     // resolver, =verify: would have committed; drawn as before, slot unused
+	FrontPendingWrite, // sequencer: a CP write op over the record has not executed yet
+	FrontPublication,  // sequencer: GPU-touched record with a backing publication pending
+	FrontBacking,      // sequencer: GPU-touched record without a backing to read
+	FrontOther,        // sequencer: unmapped record, unknown index type, P3c slots, stopping
+	Count,
+};
+
 // Process-wide totals of the engine's decisions, always counted (relaxed; written on the GPU
 // thread). The DrawPrep* frame events only count with a connected profiler; tests read these.
 struct Totals {
@@ -129,8 +146,15 @@ struct Totals {
 	std::atomic<uint64_t> prefetch_published {0};
 	std::atomic<uint64_t> prefetch_adopted {0};
 	std::atomic<uint64_t> prefetch_skipped {0};
+	// KYTY_DRAW_PREP_INDIRECT (IndirectEvent): written by the sequencer (publications, refusals)
+	// and the resolver (decisions).
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(IndirectEvent::Count)> indirect {};
 };
 [[nodiscard]] Totals& GetTotals();
+
+inline void CountIndirect(IndirectEvent event) noexcept {
+	GetTotals().indirect[static_cast<size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
 
 // One draw's speculative preparation and its certificate. Reused across draws (vectors keep
 // their capacity).
@@ -250,6 +274,23 @@ public:
 	// Resolver: commits the draw at window position `position` (the head), recorded with
 	// `submit_id` and, unless UINT32_MAX, `instance_count` (resolved in order).
 	void CommitPublished(uint64_t position, uint64_t submit_id, uint32_t instance_count);
+
+	// KYTY_DRAW_PREP_INDIRECT (graphicsRun.cpp): the sequencer publishes a single indirect draw
+	// from the record bytes it read, like a direct draw (Publish). At the draw's op the resolver
+	// reads the record again and either commits the slot (CommitPublished) or draws as without
+	// the switch, with the slot's registers bound (the register snapshot the op would carry), and
+	// then retires the slot unused (DiscardPublished).
+	// Resolver: the registers of the head slot at `position` (published by the real parse, not
+	// retired). They stay unchanged until the slot retires: workers only read them, and the op ring
+	// orders the sequencer's writes before the op's execution.
+	[[nodiscard]] RegisterSnapshot& PublishedRegisters(uint64_t position);
+	// Resolver: whether the head slot's arguments are exactly these (the publish form: an inherited
+	// instance count is 1 until CommitPublished patches it). Pass one of the two.
+	[[nodiscard]] bool PublishedArgsEqual(uint64_t position, const DrawIndexArgs* index_args,
+	                                      const DrawAutoArgs* auto_args);
+	// Resolver: retires the head slot at `position` without drawing it; waits for a worker that is
+	// preparing it (its preparation is discarded, FrameEvent DrawPrepUnused).
+	void DiscardPublished(uint64_t position);
 
 	// P3c (KYTY_CP_SEQ_PREFETCH, cpOps.h): the sequencer's speculative parse past a wait publishes
 	// draws without ops. Each such slot carries the number of packets and the hash of every byte
