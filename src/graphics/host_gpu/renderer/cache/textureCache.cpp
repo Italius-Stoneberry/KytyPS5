@@ -17,10 +17,12 @@
 #include "kernel/memory.h"
 #include "live-counters.h"
 #include "native-resource-state.h"
+#include "vram-pressure.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -205,16 +207,17 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		m_gc_start_budget = m_graphics.GetTotalMemoryBudget();
+		UpdateGcThresholds(m_gc_start_budget);
 	}
+}
+
+void TextureCache::UpdateGcThresholds(uint64_t budget) {
+	const auto thresholds = VramPressure::TextureThresholds(budget);
+	m_pressure_gc_memory  = thresholds.pressure;
+	m_critical_gc_memory  = thresholds.critical;
+	m_trigger_gc_memory   = thresholds.trigger;
+	m_gc_budget           = budget;
 }
 
 TextureCache::~TextureCache() {
@@ -3172,19 +3175,41 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::RunGarbageCollector() {
+	// KYTY_VRAM_* (vram-pressure.h): the budget and pressure level of this frame.
+	m_graphics.RefreshMemoryPressure();
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	const int64_t    now  = std::chrono::steady_clock::now().time_since_epoch().count();
+	m_gc_tick_times[tick % m_gc_tick_times.size()] = now;
 	if (m_graphics.CanReportMemoryUsage()) {
+		// KYTY_VRAM_ADAPTIVE: the thresholds follow the budget the driver reports now (what other
+		// programs take included), not the one at start.
+		const auto budget = VramPressure::g_snapshot.budget != 0 && VramPressure::Active(kyty_local_vram_adaptive_mode)
+		                        ? VramPressure::g_snapshot.budget
+		                        : m_gc_start_budget;
+		if (budget != m_gc_budget) UpdateGcThresholds(budget);
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	// KYTY_TEXTURE_GC_TIME: over the critical threshold the ages are seconds, not 80-160 frames (8-16 s
+	// at 10 fps, while the budget stays spent), and more images go a pass: 64, or 128 once the budget
+	// itself is spent, until the usage is under the critical threshold again. Downloads of
+	// GPU-written images before their deletion (a copy and a guest write each) stay at 8 a frame.
+	const bool timed     = m_graphics.CanReportMemoryUsage() && VramPressure::Active(kyty_local_texture_gc_time_mode);
+	uint32_t   downloads = 8;
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		uint64_t       age        = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		const bool     timed_pass = timed && m_total_used_memory >= m_critical_gc_memory;
+		if (timed_pass) {
+			const bool spent = m_total_used_memory >= m_gc_budget;
+			age              = VramPressure::TimedAge(m_gc_tick_times, tick, now, spent ? 2.0 : 5.0, age);
+			deletions        = spent ? 128 : 64;
+		}
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
@@ -3210,8 +3235,14 @@ void TextureCache::RunGarbageCollector() {
 				if (safe && !pressured) {
 					continue;
 				}
+				if (safe && timed_pass && downloads == 0) {
+					continue;
+				}
 				if (safe && !TryDownloadImage(id)) {
 					continue;
+				}
+				if (safe && timed_pass) {
+					--downloads;
 				}
 				owner->ClearGpuModified();
 			}
@@ -3223,7 +3254,12 @@ void TextureCache::RunGarbageCollector() {
 				            static_cast<unsigned long long>(m_total_used_memory));
 				std::fflush(stdout);
 			}
+			LiveCounters::Add(LiveCounters::TextureGcDeletes);
+			LiveCounters::Add(LiveCounters::TextureGcDeleteKiB, owner->info.data.size >> 10u);
 			DeleteImage(id);
+			if (timed_pass && m_total_used_memory < m_critical_gc_memory) {
+				break;
+			}
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
