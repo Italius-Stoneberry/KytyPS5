@@ -166,8 +166,11 @@ void NormalizeForCompare(OpKind kind, void* payload) noexcept {
 		case OpKind::DrawIndirect:
 		case OpKind::DrawIndirectMulti: {
 			auto* op = static_cast<DrawIndirectOp*>(payload);
-			op->flags &= ~IndirectFlagSnapshot;
+			op->flags &=
+			    ~(IndirectFlagSnapshot | IndirectFlagPublished | IndirectFlagPublishedVerify);
 			op->snapshot = 0;
+			op->window   = 0;
+			std::memset(op->record, 0, sizeof(op->record));
 			break;
 		}
 		case OpKind::DispatchDirect: {
