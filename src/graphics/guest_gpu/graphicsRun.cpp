@@ -11,6 +11,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/cpIndirect.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/command_processor/cpSequencer.h"
 #include "graphics/guest_gpu/command_processor/cpVerify.h"
@@ -122,6 +123,38 @@ static bool IndirectValidateEnabled() {
 	return enabled;
 }
 
+// KYTY_DRAW_PREP_INDIRECT = 0 (default) | 1 | verify. Thread mode (KYTY_CP_SEQ=1) with parallel
+// draw prep only; DRAW_INDIRECT and DRAW_INDEX_INDIRECT (not the _MULTI forms).
+// Without it a single indirect draw carries a register snapshot and the resolver reads its record,
+// then draws it with the serial program preparation: draw prep never sees it. In Demon's Souls
+// ~90% of the gameplay draws are such draws with records the guest CPU wrote (Tracy demons-8: 23.5k
+// CpOpDrawIndirect/s against 2.6k direct draws/s; 440/s took the native path), so the resolver ran
+// RefreshShaders -> GetGraphicsPrograms -> ProgramCache::GetParallel for nearly every draw: 10.1 of
+// its 22.9 us per draw, the resolver at 100%, and "DrawPrep 10s" committed only ~24k per 10 s.
+// =1: the sequencer reads the record (never waiting, faulting or synchronizing: the bytes of
+// never-GPU-touched pages, else the backing when no publication is pending; any pending CP write
+// op over it, or anything else unclear, keeps today's snapshot), builds the draw the resolver
+// would build from those bytes (cpIndirect.h) and publishes it to the window like a direct draw;
+// the op carries the bytes (CpSeq::IndirectFlagPublished). At the op the resolver decides with
+// today's own predicates, in today's order: GPU-owned now (the native path's test) -> today's path
+// and the slot retired unused; otherwise it reads the record exactly as today (ReadGuestForCp)
+// and commits the slot only if the bytes equal the sequencer's (and the slot's arguments equal the
+// ones it builds), else draws the fresh record as today and retires the slot. So the sequencer's
+// read only decides what gets prepared, never what is drawn. =verify: the same, but the resolver
+// never commits (counts VerifyMatched): today's draws with the publication cost, for A/B.
+// Live switch (common/liveSwitch.h): the sequencer decides per draw; the resolver only follows
+// the op's flags. Counters: the "DrawPrep indirect 10s" console line (drawPrep.cpp).
+static int64_t ParseDrawPrepIndirect(const char* value) {
+	if (value == nullptr || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	return std::strcmp(value, "verify") == 0 ? 2 : 1;
+}
+static Live::Switch g_draw_prep_indirect("KYTY_DRAW_PREP_INDIRECT", ParseDrawPrepIndirect);
+
+static_assert(static_cast<uint32_t>(DrawOffsetSource::IndirectArgs) ==
+              CpSeq::OffsetSourceIndirectArgs);
+
 static uint64_t IndexElementSize(uint32_t index_type_and_size) {
 	switch (index_type_and_size) {
 		case 0: return 2;
@@ -228,6 +261,16 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 			            "bytes)\n",
 			            CpSeq::VerifyMode(), CpSeq::SnapshotCount(), sizeof(CpSeq::RegisterState));
 		}
+	}
+	if (const auto mode = g_draw_prep_indirect.Get(); mode != 0) {
+		const bool active =
+		    m_sequencer != nullptr && DrawPrep::GetMode() == DrawPrep::Mode::Parallel;
+		std::printf("Kyty DrawPrep indirect: KYTY_DRAW_PREP_INDIRECT=%s, %s\n",
+		            mode == 2 ? "verify (published, never committed)" : "1",
+		            active ? "single indirect draws are published to the draw-prep window from the "
+		                     "record the sequencer reads; the resolver commits one only if its own "
+		                     "read is the same bytes (\"DrawPrep indirect 10s\" lines)"
+		                   : "inactive: needs KYTY_CP_SEQ=1 and KYTY_DRAW_PREP=parallel");
 	}
 	if (CpWakeupsEnabled()) {
 		m_renderer.GetCommandScheduler().SetProgressHook(
@@ -2336,10 +2379,9 @@ void CommandProcessor::ValidateIndirectSource(const DrawIndirectSource& source) 
 	}
 }
 
-// Takes the host indirect path when the argument (or count) bytes are GPU-owned, i.e. when a CPU
-// read would page-fault and drain the GPU. CPU-clean arguments stay on the CPU path, which then
-// reads them without synchronization.
-bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
+// Whether TryDrawIndirectNative takes the host indirect path: the argument (or count) bytes are
+// GPU-owned, i.e. a CPU read would page-fault and drain the GPU. No side effects.
+bool CommandProcessor::WantsDrawIndirectNative(const DrawIndirectSource& source) {
 	if (!NativeIndirectEnabled() || !GuestRange {source.args_addr, source.ArgsSize()}.Valid() ||
 	    (source.count_addr != 0 && !GuestRange {source.count_addr, sizeof(uint32_t)}.Valid())) {
 		return false;
@@ -2349,8 +2391,15 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 		return cache.HasGpuDirtyBytes(address, size) ||
 		       cache.HasPendingBackingPublication(address, size);
 	};
-	if (!gpu_owned(source.args_addr, source.ArgsSize()) &&
-	    (source.count_addr == 0 || !gpu_owned(source.count_addr, sizeof(uint32_t)))) {
+	return gpu_owned(source.args_addr, source.ArgsSize()) ||
+	       (source.count_addr != 0 && gpu_owned(source.count_addr, sizeof(uint32_t)));
+}
+
+// Takes the host indirect path when the argument (or count) bytes are GPU-owned, i.e. when a CPU
+// read would page-fault and drain the GPU. CPU-clean arguments stay on the CPU path, which then
+// reads them without synchronization.
+bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
+	if (!WantsDrawIndirectNative(source)) {
 		return false;
 	}
 	if (!source.indexed) {
@@ -2417,47 +2466,145 @@ CpSeq::DrawIndirectOp CommandProcessor::IndirectDrawOp(uint32_t data_offset,
 		// From here on the count is back state (read from the arguments, maybe GPU data).
 		m_front_instances_known = false;
 	}
-	if (m_front_mode == FrontMode::Thread) {
-		op.flags |= CpSeq::IndirectFlagSnapshot;
-		op.snapshot = TakeSnapshot();
-	}
+	// Thread mode: the caller attaches the register snapshot, or publishes the draw (DrawIndirect).
 	return op;
 }
 
-// An indirect draw record read on the CPU, drawn as the direct path's DrawIndexAuto/DrawIndex:
-// a zero instance count takes the back's instance state (NumInstances), which the draw's own
-// record has just set.
-static CpSeq::DrawAutoOp CpuIndirectAutoDraw(uint32_t vertex_count, uint32_t instance_count,
-                                             uint32_t first_vertex, uint32_t first_instance) {
-	CpSeq::DrawAutoOp draw;
-	draw.vertex_count   = vertex_count;
-	draw.instance_count = instance_count;
-	draw.first_vertex   = first_vertex;
-	draw.first_instance = first_instance;
-	draw.offset_source  = static_cast<uint32_t>(DrawOffsetSource::IndirectArgs);
-	draw.flags          = instance_count == 0 ? CpSeq::DrawFlagInheritInstances : 0u;
-	return draw;
+static_assert(sizeof(DrawIndirectArgs) == CpSeq::IndirectRecordSize(false) &&
+              sizeof(DrawIndexedIndirectArgs) == CpSeq::IndirectRecordSize(true) &&
+              sizeof(CpSeq::DrawIndirectOp::record) ==
+                  CpSeq::IndirectRecordDwords * sizeof(uint32_t) &&
+              CpSeq::IndirectRecordDwords * sizeof(uint32_t) == sizeof(DrawIndexedIndirectArgs));
+
+// The single record of a DrawIndirect op, as TryDrawIndirectNative takes it.
+static DrawIndirectSource IndirectSourceOf(const CpSeq::DrawIndirectOp& op) {
+	const bool indexed = (op.flags & CpSeq::IndirectFlagIndexed) != 0;
+	return {.args_addr           = op.args_base + op.data_offset,
+	        .stride              = CpSeq::IndirectRecordSize(indexed),
+	        .max_count           = 1,
+	        .count_addr          = 0,
+	        .indexed             = indexed,
+	        .index_base_addr     = op.index_base_addr,
+	        .index_buffer_size   = op.index_buffer_size,
+	        .index_type_and_size = op.index_type_and_size};
 }
 
-static CpSeq::DrawIndexOp CpuIndirectIndexDraw(uint64_t index_addr, uint32_t index_count,
-                                               uint32_t instance_count, int32_t base_vertex,
-                                               uint32_t first_instance,
-                                               uint32_t index_type_and_size) {
-	CpSeq::DrawIndexOp draw;
-	draw.index_addr          = index_addr;
-	draw.index_count         = index_count;
-	draw.instance_count      = instance_count;
-	draw.index_type_and_size = index_type_and_size;
-	draw.base_vertex         = base_vertex;
-	draw.first_instance      = first_instance;
-	draw.offset_source       = static_cast<uint32_t>(DrawOffsetSource::IndirectArgs);
-	draw.flags               = instance_count == 0 ? CpSeq::DrawFlagInheritInstances : 0u;
-	return draw;
+// The direct path's draw of a record read on the CPU (an unknown index type stops here, after
+// the read, as it always did).
+static CpSeq::CpuIndirectDraw CpuIndirectDrawOf(const CpSeq::DrawIndirectOp& op,
+                                                const uint32_t*              record) {
+	const bool indexed = (op.flags & CpSeq::IndirectFlagIndexed) != 0;
+	return CpSeq::MakeCpuIndirectDraw(op, record,
+	                                  indexed ? IndexElementSize(op.index_type_and_size) : 0u);
+}
+
+// The arguments a publish of the draw passes (AttachDrawRegisters): an inherited instance count
+// is resolved at the commit, the preparation assumes the draw draws.
+template <typename Op>
+static auto PublishArgsOf(const Op& op) {
+	auto args = DrawArgsOf(op);
+	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
+		args.instance_count = 1;
+	}
+	return args;
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
-	const auto op = IndirectDrawOp(data_offset, draw_initiator, indexed);
+	auto op = IndirectDrawOp(data_offset, draw_initiator, indexed);
+	if (m_front_mode == FrontMode::Thread) {
+		// The op that retires a published slot (the sequencer's window-full wake threshold).
+		const auto draw_op = m_ops->Emitted();
+		if (PublishIndirectDraw(op)) {
+			m_published_ops.push_back(draw_op);
+			if (m_published_ops.size() > 256u) {
+				(void)OldestPendingOp(m_published_ops);
+			}
+		} else {
+			op.flags |= CpSeq::IndirectFlagSnapshot;
+			op.snapshot = TakeSnapshot();
+		}
+	}
 	(void)Submit(CpSeq::OpKind::DrawIndirect, &op, sizeof(op));
+}
+
+DrawPrep::IndirectEvent CommandProcessor::ReadIndirectRecordForPublish(uint64_t address,
+                                                                       uint32_t size, void* dst) {
+	using DrawPrep::IndirectEvent;
+	if (!m_renderer.IsMapped(address, size)) {
+		return IndirectEvent::FrontOther;
+	}
+	// A CP write op over the record that the resolver has not executed yet: the bytes are not
+	// final (AwaitPendingWrites would wait; a draw is not worth a stop of the sequencer).
+	const auto end      = address + size;
+	const auto executed = m_sequencer->Executed();
+	for (const auto& write: m_pending_writes) {
+		if (write.begin < end && address < write.end && write.op >= executed) {
+			return IndirectEvent::FrontPendingWrite;
+		}
+	}
+	if (!GpuTouched::g_pages.AnyTouched(address, end)) {
+		// Never GPU-touched: the backing is authoritative and the read cannot fault, as for
+		// register pairs and command bytes (ReadGuestForFront).
+		std::memcpy(dst, reinterpret_cast<const void*>(address), size);
+		return IndirectEvent::Published;
+	}
+	// GPU-touched pages: whether these bytes are GPU-owned now is the resolver's state (exact
+	// dirty ranges); a pending backing publication is visible from here. The backing may be stale
+	// otherwise; the resolver's read decides either way (the backing read never faults).
+	if (m_renderer.GetBufferCache().HasPendingBackingPublication(address, size)) {
+		return IndirectEvent::FrontPublication;
+	}
+	if (!LibKernel::Memory::TryReadBacking(address, dst, size)) {
+		return IndirectEvent::FrontBacking;
+	}
+	return IndirectEvent::Published;
+}
+
+bool CommandProcessor::PublishIndirectDraw(CpSeq::DrawIndirectOp& op) {
+	using DrawPrep::IndirectEvent;
+	const auto mode   = g_draw_prep_indirect.Get();
+	auto*      engine = m_draw_prep.get();
+	if (mode == 0 || engine == nullptr || !engine->Parallel()) {
+		return false;
+	}
+	const bool indexed    = (op.flags & CpSeq::IndirectFlagIndexed) != 0;
+	const auto index_size = CpSeq::IndexElementBytes(op.index_type_and_size);
+	// P3c speculative slots go to the real parse's direct draws in order (a publish would drop
+	// them); an unknown index type stops the resolver after its read, as it always did.
+	if (engine->SpeculativeSlots() != 0 || (indexed && index_size == 0)) {
+		DrawPrep::CountIndirect(IndirectEvent::FrontOther);
+		return false;
+	}
+	uint32_t record[CpSeq::IndirectRecordDwords] {};
+	if (const auto read = ReadIndirectRecordForPublish(op.args_base + op.data_offset,
+	                                                   CpSeq::IndirectRecordSize(indexed), record);
+	    read != IndirectEvent::Published) {
+		DrawPrep::CountIndirect(read);
+		return false;
+	}
+	// The draw the resolver builds from the same bytes (cpIndirect.h).
+	const auto                  draw     = CpSeq::MakeCpuIndirectDraw(op, record, index_size);
+	const std::function<bool()> wait     = [this] { return WaitForWindowSpace(); };
+	uint64_t                    position = UINT64_MAX;
+	if (indexed) {
+		const auto args = PublishArgsOf(draw.index);
+		position        = engine->Publish(&args, nullptr, m_ctx, m_ucfg, m_sh_ctx, wait);
+	} else {
+		const auto args = PublishArgsOf(draw.automatic);
+		position        = engine->Publish(nullptr, &args, m_ctx, m_ucfg, m_sh_ctx, wait);
+	}
+	if (position == UINT64_MAX) {
+		DrawPrep::CountIndirect(IndirectEvent::FrontOther); // stopping
+		return false;
+	}
+	op.flags |= CpSeq::IndirectFlagPublished;
+	if (mode == 2) {
+		op.flags |= CpSeq::IndirectFlagPublishedVerify;
+	}
+	op.window = position;
+	std::memcpy(op.record, record, sizeof(op.record));
+	DrawPrep::CountIndirect(IndirectEvent::Published);
+	return true;
 }
 
 void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
@@ -2465,53 +2612,116 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 		m_num_instances = op.num_instances;
 		m_pending_num_instances.clear();
 	}
-	const bool indexed     = (op.flags & CpSeq::IndirectFlagIndexed) != 0;
-	const auto args_addr   = op.args_base + op.data_offset;
-	const auto record_size = static_cast<uint32_t>(indexed ? sizeof(DrawIndexedIndirectArgs)
-	                                                       : sizeof(DrawIndirectArgs));
-	if (TryDrawIndirectNative({.args_addr           = args_addr,
-	                           .stride              = record_size,
-	                           .max_count           = 1,
-	                           .count_addr          = 0,
-	                           .indexed             = indexed,
-	                           .index_base_addr     = op.index_base_addr,
-	                           .index_buffer_size   = op.index_buffer_size,
-	                           .index_type_and_size = op.index_type_and_size})) {
+	if ((op.flags & CpSeq::IndirectFlagPublished) != 0) {
+		ExecDrawIndirectPublished(op);
 		return;
 	}
+	ExecDrawIndirectRecord(op);
+}
 
+void CommandProcessor::ExecDrawIndirectRecord(const CpSeq::DrawIndirectOp& op) {
+	const auto source = IndirectSourceOf(op);
+	if (TryDrawIndirectNative(source)) {
+		return;
+	}
 	m_pending_num_instances.clear();
-	if (!indexed) {
-		const auto args = ReadGuestForCp<DrawIndirectArgs>(args_addr);
-		m_num_instances = args.instance_count;
-		ExecDrawAuto(CpuIndirectAutoDraw(args.vertex_count_per_instance, args.instance_count,
-		                                 args.start_vertex_location,
-		                                 args.start_instance_location));
+	uint32_t record[CpSeq::IndirectRecordDwords] {};
+	ReadGuestForCp(source.args_addr, source.RecordSize(), record);
+	DrawCpuIndirect(CpuIndirectDrawOf(op, record), UINT64_MAX);
+}
+
+void CommandProcessor::DrawCpuIndirect(const CpSeq::CpuIndirectDraw& draw, uint64_t window) {
+	if (!draw.indexed) {
+		m_num_instances = draw.instance_count;
+		auto automatic  = draw.automatic;
+		if (window != UINT64_MAX) {
+			automatic.flags |= CpSeq::DrawFlagPublished;
+			automatic.window = window;
+		}
+		ExecDrawAuto(automatic);
 		return;
 	}
-
-	const auto args       = ReadGuestForCp<DrawIndexedIndirectArgs>(args_addr);
-	const auto index_size = IndexElementSize(op.index_type_and_size);
-
-	const auto index_addr =
-	    op.index_base_addr + static_cast<uint64_t>(args.start_index_location) * index_size;
-
-	const uint32_t index_count =
-	    (op.index_buffer_size != 0 ? std::min(args.index_count_per_instance, op.index_buffer_size)
-	                               : args.index_count_per_instance);
-	if (GraphicsRunDebugDumpEnabled() && index_count != args.index_count_per_instance) {
+	if (GraphicsRunDebugDumpEnabled() && draw.index.index_count != draw.record_index_count) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 			LOGF("\t DrawIndexIndirect: clamped index_count from %" PRIu32 " to %" PRIu32
 			     " using INDEX_BUFFER_SIZE\n",
-			     args.index_count_per_instance, index_count);
+			     draw.record_index_count, draw.index.index_count);
 		}
 	}
+	m_num_instances = draw.instance_count;
+	auto index      = draw.index;
+	if (window != UINT64_MAX) {
+		index.flags |= CpSeq::DrawFlagPublished;
+		index.window = window;
+	}
+	ExecDrawIndex(index);
+}
 
-	m_num_instances = args.instance_count;
-	ExecDrawIndex(CpuIndirectIndexDraw(index_addr, index_count, args.instance_count,
-	                                   static_cast<int32_t>(args.base_vertex_location),
-	                                   args.start_instance_location, op.index_type_and_size));
+// KYTY_DRAW_PREP_INDIRECT, resolver (g_draw_prep_indirect): the steps of ExecDrawIndirectRecord in
+// its order, with the slot's registers bound as the op's snapshot would be. The slot is committed
+// only when this read of the record is the sequencer's bytes; every other outcome is today's draw.
+void CommandProcessor::ExecDrawIndirectPublished(const CpSeq::DrawIndirectOp& op) {
+	using DrawPrep::IndirectEvent;
+	EXIT_IF(m_draw_prep == nullptr || !m_draw_prep->Parallel());
+	auto&      engine    = *m_draw_prep;
+	auto&      scheduler = GetScheduler();
+	auto&      registers = engine.PublishedRegisters(op.window);
+	const auto previous =
+	    scheduler.BindRegisters(registers.context, registers.user_config, registers.shaders);
+	const auto source = IndirectSourceOf(op);
+	if (WantsDrawIndirectNative(source)) {
+		// GPU-owned by now (an earlier op of the stream, e.g. a dispatch, wrote the record after
+		// the sequencer read it; or the read saw a stale backing): the native path, as today.
+		DrawPrep::CountIndirect(IndirectEvent::BackGpuOwned);
+		ExecDrawIndirectRecord(op);
+		scheduler.RestoreRegisters(previous);
+		engine.DiscardPublished(op.window);
+		return;
+	}
+	// TryDrawIndirectNative returns false here without side effects: today's CPU path.
+	m_pending_num_instances.clear();
+	uint32_t record[CpSeq::IndirectRecordDwords] {};
+	ReadGuestForCp(source.args_addr, source.RecordSize(), record);
+	const auto draw  = CpuIndirectDrawOf(op, record);
+	auto       event = IndirectEvent::Committed;
+	if (std::memcmp(record, op.record, source.RecordSize()) != 0) {
+		// Written since the sequencer read it (a guest CPU write, or a GPU write that was already
+		// published back): the draw must use these bytes.
+		event = IndirectEvent::BackChanged;
+	} else {
+		bool same_args = false;
+		if (draw.indexed) {
+			const auto args = PublishArgsOf(draw.index);
+			same_args       = engine.PublishedArgsEqual(op.window, &args, nullptr);
+		} else {
+			const auto args = PublishArgsOf(draw.automatic);
+			same_args       = engine.PublishedArgsEqual(op.window, nullptr, &args);
+		}
+		if (!same_args) {
+			// Both sides build the draw with MakeCpuIndirectDraw from the same op and bytes.
+			event = IndirectEvent::BackArgs;
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("DrawPrep indirect: the published slot's arguments differ from the record's "
+				     "(args=0x%016" PRIx64 ", indexed=%d); drawn without the slot\n",
+				     source.args_addr, draw.indexed ? 1 : 0);
+			}
+		} else if ((op.flags & CpSeq::IndirectFlagPublishedVerify) != 0) {
+			event = IndirectEvent::VerifyMatched;
+		}
+	}
+	DrawPrep::CountIndirect(event);
+	if (event == IndirectEvent::Committed) {
+		// The draw the slot was published for: committed exactly like a published direct draw
+		// (the live back registers bound outside the commit, Validate certifies the preparation).
+		scheduler.RestoreRegisters(previous);
+		DrawCpuIndirect(draw, op.window);
+		return;
+	}
+	DrawCpuIndirect(draw, UINT64_MAX);
+	scheduler.RestoreRegisters(previous);
+	engine.DiscardPublished(op.window);
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
@@ -2522,6 +2732,11 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	op.count_addr         = reinterpret_cast<uint64_t>(count_addr);
 	op.max_count_or_count = max_count_or_count;
 	op.stride             = stride_in_bytes;
+	if (m_front_mode == FrontMode::Thread) {
+		// Never published (KYTY_DRAW_PREP_INDIRECT covers single records only).
+		op.flags |= CpSeq::IndirectFlagSnapshot;
+		op.snapshot = TakeSnapshot();
+	}
 	(void)Submit(CpSeq::OpKind::DrawIndirectMulti, &op, sizeof(op));
 }
 
@@ -2577,9 +2792,9 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 		if (!indexed) {
 			const auto args = ReadGuestForCp<DrawIndirectArgs>(args_addr);
 			m_num_instances = args.instance_count;
-			ExecDrawAuto(CpuIndirectAutoDraw(args.vertex_count_per_instance, args.instance_count,
-			                                 args.start_vertex_location,
-			                                 args.start_instance_location));
+			ExecDrawAuto(CpSeq::CpuIndirectAutoDraw(args.vertex_count_per_instance,
+			                                        args.instance_count, args.start_vertex_location,
+			                                        args.start_instance_location));
 			continue;
 		}
 
@@ -2602,9 +2817,10 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 		}
 
 		m_num_instances = args.instance_count;
-		ExecDrawIndex(CpuIndirectIndexDraw(index_addr, index_count, args.instance_count,
-		                                   static_cast<int32_t>(args.base_vertex_location),
-		                                   args.start_instance_location, op.index_type_and_size));
+		ExecDrawIndex(CpSeq::CpuIndirectIndexDraw(index_addr, index_count, args.instance_count,
+		                                          static_cast<int32_t>(args.base_vertex_location),
+		                                          args.start_instance_location,
+		                                          op.index_type_and_size));
 	}
 }
 
