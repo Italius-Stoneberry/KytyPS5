@@ -8,6 +8,7 @@
 #include "native-resource-state.h"
 #include "async-upload.h"
 #include "readback-queue.h"
+#include "vram-pressure.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "gpu_tiler_shaders/lod_stats_pack_spv.h"
 
@@ -1084,15 +1085,20 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
+	m_gc_start_budget = m_graphics.GetTotalMemoryBudget();
+	UpdateGcThresholds(m_gc_start_budget);
+}
+
+void BufferCache::UpdateGcThresholds(uint64_t total_budget) {
 	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
 	constexpr int64_t target_threshold = 8 * GiB;
-	const auto        budget =
-	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
+	const auto        budget           = static_cast<int64_t>(std::min<uint64_t>(total_budget, INT64_MAX));
 	const auto threshold = std::min(budget, target_threshold);
 	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
 	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
 	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+	m_gc_budget          = total_budget;
 }
 
 BufferCache::~BufferCache() {
@@ -1776,6 +1782,12 @@ void BufferCache::RunGarbageCollector(bool collect) {
 		return;
 	}
 	if (m_graphics.CanReportMemoryUsage()) {
+		// KYTY_VRAM_ADAPTIVE (vram-pressure.h): the budget the driver reports now, refreshed this frame
+		// by the texture cache's collection; otherwise the one at start.
+		const auto budget = VramPressure::g_snapshot.budget != 0 && VramPressure::Active(kyty_local_vram_adaptive_mode)
+		                        ? VramPressure::g_snapshot.budget
+		                        : m_gc_start_budget;
+		if (budget != m_gc_budget) UpdateGcThresholds(budget);
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
