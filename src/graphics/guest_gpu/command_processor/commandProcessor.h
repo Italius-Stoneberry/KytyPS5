@@ -334,7 +334,9 @@ private:
 	CpSeq::Result ExecuteOp(CpSeq::OpKind kind, const void* payload, const void* data);
 	void          ExecDrawIndex(const CpSeq::DrawIndexOp& op);
 	void          ExecDrawAuto(const CpSeq::DrawAutoOp& op);
-	void          ExecDrawIndirect(const CpSeq::DrawIndirectOp& op);
+	// run_note_deferred (KYTY_DRAW_RUN_INDIRECT): ExecuteOp left the draw run's activity note to a
+	// published op (ExecDrawIndirectPublished).
+	void          ExecDrawIndirect(const CpSeq::DrawIndirectOp& op, bool run_note_deferred = false);
 	void          ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op);
 	void          ExecDispatchDirect(const CpSeq::DispatchDirectOp& op);
 	void          ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op);
@@ -367,7 +369,7 @@ private:
 	// when GPU-owned, else the record read on the CPU); a published one (commit or that path); one
 	// CPU-read record's draw, committed from window position `window` unless UINT64_MAX.
 	void ExecDrawIndirectRecord(const CpSeq::DrawIndirectOp& op);
-	void ExecDrawIndirectPublished(const CpSeq::DrawIndirectOp& op);
+	void ExecDrawIndirectPublished(const CpSeq::DrawIndirectOp& op, bool run_note_deferred);
 	void DrawCpuIndirect(const CpSeq::CpuIndirectDraw& draw, uint64_t window);
 	// Reference front: one step of the parse of `execution` (KYTY_CP_SEQ_VERIFY). Returns whether
 	// the step left it suspended.
