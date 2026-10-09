@@ -207,6 +207,13 @@ inline constexpr uint32_t IndirectFlagIndexed      = 1u << 0u;
 inline constexpr uint32_t IndirectFlagSetInstances = 1u << 1u; // apply num_instances first (the
                                                                // front's SET_NUM_INSTANCES value)
 inline constexpr uint32_t IndirectFlagSnapshot     = 1u << 2u; // thread mode: `snapshot` is bound
+// KYTY_DRAW_PREP_INDIRECT (thread mode, DrawIndirect only; graphicsRun.cpp): the sequencer read the
+// record (`record`) and published the draw it describes to the draw-prep window at `window`; the
+// op carries no snapshot (the slot holds the same registers). The resolver commits the slot only
+// if its own read of the record is the same bytes; otherwise it runs the draw as without the flag
+// and retires the slot unused. PublishedVerify (KYTY_DRAW_PREP_INDIRECT=verify): it never commits.
+inline constexpr uint32_t IndirectFlagPublished       = 1u << 3u;
+inline constexpr uint32_t IndirectFlagPublishedVerify = 1u << 4u;
 
 // DRAW_INDIRECT / DRAW_INDEX_INDIRECT (multi: DRAW_INDIRECT_MULTI / DRAW_INDEX_INDIRECT_MULTI).
 // The front's draw state at the packet travels with the op: the resolver reads the arguments.
@@ -224,6 +231,11 @@ struct DrawIndirectOp {
 	uint32_t num_instances       = 0; // IndirectFlagSetInstances
 	uint32_t snapshot            = 0; // IndirectFlagSnapshot
 	uint32_t reserved            = 0;
+	// IndirectFlagPublished (transport fields: the verifier ignores them): the window position
+	// and the record bytes the sequencer read (16 of the 20 for a DrawIndirectArgs record).
+	uint64_t window    = 0;
+	uint32_t record[5] = {};
+	uint32_t reserved2 = 0;
 };
 
 // Dispatch op flags.
