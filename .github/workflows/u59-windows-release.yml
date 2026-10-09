@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'u59-windows-*'
+    # Italius-Stoneberry fork: a push to a u59-* test branch builds it (workflow_dispatch only lists
+    # workflows of the default branch).
+    branches:
+      - 'u59-*'
   workflow_dispatch:
 
 permissions:
