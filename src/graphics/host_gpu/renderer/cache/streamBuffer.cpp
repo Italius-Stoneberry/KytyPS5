@@ -4,6 +4,8 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "live-counters.h"
+#include "vram-pressure.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -174,6 +176,24 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		if (!create()) graphics.ReportMemoryFallback("a buffer could not be created", size);
 	}
 	EXIT_NOT_IMPLEMENTED(native_buffer == VK_NULL_HANDLE);
+	// KYTY_IMAGE_POOL_TRIM (vram-pressure.h): a device-local buffer VMA placed in system memory, the
+	// budget being spent, stays there for its whole life (every GPU read crosses PCIe: ~13 GB/s on
+	// PCIe 3.0). The freed images kept for reuse count against that budget: free them and place the
+	// buffer once more (nothing has its handle or address yet).
+	if (usage == MemoryUsage::DeviceLocal && VramPressure::Active(kyty_local_image_pool_trim_mode)) {
+		VkMemoryPropertyFlags placed = 0;
+		vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &placed);
+		if ((placed & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0 && graphics.TrimImagePool() != 0) {
+			vmaDestroyBuffer(graphics.allocator, native_buffer, m_allocation);
+			native_buffer = VK_NULL_HANDLE;
+			m_allocation  = nullptr;
+			if (!create()) {
+				allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+				if (!create()) graphics.ReportMemoryFallback("a buffer could not be created", size);
+			}
+			EXIT_NOT_IMPLEMENTED(native_buffer == VK_NULL_HANDLE);
+		}
+	}
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -188,6 +208,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 	if (usage == MemoryUsage::DeviceLocal && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
 		graphics.ReportMemoryFallback("a GPU buffer is in system memory", size);
+		LiveCounters::Add(LiveCounters::SysmemFallbacks);
+		LiveCounters::Add(LiveCounters::SysmemFallbackKiB, size >> 10u);
 	}
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
