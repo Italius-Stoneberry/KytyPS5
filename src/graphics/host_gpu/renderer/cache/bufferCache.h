@@ -247,6 +247,10 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// KYTY_VRAM_ADAPTIVE: the budget the thresholds above are for, and GetTotalMemoryBudget() at start.
+	uint64_t m_gc_budget          = 0;
+	uint64_t m_gc_start_budget    = 0;
+	void     UpdateGcThresholds(uint64_t total_budget);
 
 	// KYTY_READBACK_QUEUE: GPU writes that may still be in flight, oldest first. An entry's
 	// tick is set at the next point between commands (every write noted by then is recorded
