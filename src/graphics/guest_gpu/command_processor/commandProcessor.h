@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/command_processor/cpIndirect.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -18,6 +19,7 @@ namespace Libs::Graphics {
 
 namespace DrawPrep {
 class Engine;
+enum class IndirectEvent : uint8_t;
 } // namespace DrawPrep
 
 namespace CpSeq {
@@ -355,6 +357,18 @@ private:
 	// The front's state of an indirect draw packet.
 	[[nodiscard]] CpSeq::DrawIndirectOp IndirectDrawOp(uint32_t data_offset,
 	                                                   uint32_t draw_initiator, bool indexed);
+	// KYTY_DRAW_PREP_INDIRECT (graphicsRun.cpp, g_draw_prep_indirect). Sequencer: publishes the
+	// draw of a single indirect draw op from its record (IndirectFlagPublished); false: the op
+	// takes a register snapshot as before. The record read: Published, or why it was refused.
+	[[nodiscard]] bool                    PublishIndirectDraw(CpSeq::DrawIndirectOp& op);
+	[[nodiscard]] DrawPrep::IndirectEvent ReadIndirectRecordForPublish(uint64_t address,
+	                                                                   uint32_t size, void* dst);
+	// Resolver: a single indirect draw after its SET_NUM_INSTANCES, as without the switch (native
+	// when GPU-owned, else the record read on the CPU); a published one (commit or that path); one
+	// CPU-read record's draw, committed from window position `window` unless UINT64_MAX.
+	void ExecDrawIndirectRecord(const CpSeq::DrawIndirectOp& op);
+	void ExecDrawIndirectPublished(const CpSeq::DrawIndirectOp& op);
+	void DrawCpuIndirect(const CpSeq::CpuIndirectDraw& draw, uint64_t window);
 	// Reference front: one step of the parse of `execution` (KYTY_CP_SEQ_VERIFY). Returns whether
 	// the step left it suspended.
 	[[nodiscard]] bool ReferenceStep(Pm4Execution& execution);
@@ -415,6 +429,8 @@ private:
 	// The source's index state (index_base_addr, index_buffer_size, index_type_and_size) is the
 	// packet's (front state carried by the op).
 	[[nodiscard]] bool  TryDrawIndirectNative(DrawIndirectSource source);
+	// TryDrawIndirectNative's choice of the native path, without side effects.
+	[[nodiscard]] bool  WantsDrawIndirectNative(const DrawIndirectSource& source);
 	void                ValidateIndirectSource(const DrawIndirectSource& source);
 	[[nodiscard]] uint32_t NumInstances();
 	// Draw-prep (drawPrep.h): the engine of the graphics processor, created on first use when
