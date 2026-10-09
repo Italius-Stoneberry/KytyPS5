@@ -170,34 +170,103 @@ static bool WriteRangeImageStatsEnabled() {
 	return enabled;
 }
 
+// KYTY_STORAGE_OFFSET_FALLBACK = 1 (default) | 0 (startup flag). A storage buffer the native
+// binding cannot express used to stop the emulator ("storage buffer offset adjustment is
+// unsupported", "storage buffer range is unsupported"); Demon's Souls reached the first one while
+// entering a new area. The shaders index storage buffers in dwords: the binding's byte adjustment
+// (below the device's offset alignment, packed in 8 bits) is shifted right by 2 and added to every
+// dword index (EmitMemoryOffsets, PrepareMemoryResourceAccess), so a V# base that is not dword
+// aligned has no correct binding (buffers start on caching pages, so the adjustment's low bits are
+// the guest address's). Such a buffer is bound empty instead, as FindBuffers already binds a V#
+// that points at unmapped memory: reads see zeros (OpArrayLength and robustBufferAccess2 bound
+// them), writes are dropped and nothing becomes GPU-owned. A range above maxStorageBufferRange is
+// bound clamped to what the device can address (accesses past it read zeros); a proven write range
+// is then ignored (the clamped range counts as written whole). Each case is counted and logged (the
+// first 8, then every 1024th). =0 restores the exits, for comparison.
+static bool StorageOffsetFallbackEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_STORAGE_OFFSET_FALLBACK");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+static void NoteStorageFallback(const char* what, ShaderType stage, uint64_t shader_hash,
+                                uint32_t slot, uint64_t address, uint64_t size, uint64_t offset,
+                                uint64_t adjustment) {
+	static std::atomic<uint64_t> count {0};
+	const auto                   n = count.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (n <= 8u || (n & 1023u) == 0u) {
+		std::printf("Warning: %s (#%" PRIu64
+		            ", KYTY_STORAGE_OFFSET_FALLBACK): stage=%s shader=0x%016" PRIx64
+		            " slot=%u guest=0x%016" PRIx64 " size=0x%" PRIx64 " offset=0x%" PRIx64
+		            " adjustment=%" PRIu64 "\n",
+		            what, n, ShaderStageResourceName(stage), shader_hash, slot, address, size,
+		            offset, adjustment);
+		std::fflush(stdout);
+	}
+}
+
+static vk::DescriptorBufferInfo EmptyStorageBuffer(RenderContext& context) {
+	return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
-                    uint32_t slot, uint32_t& buffer_offset,
+                    uint64_t shader_hash, uint32_t slot, uint32_t& buffer_offset,
                     const std::vector<GuestRange>* written_ranges) {
 	buffer_offset = 0;
 
-	const auto& [address, size, id] = source;
+	const auto address = source.address;
+	auto       size    = source.size;
+	const auto id      = source.id;
+	const auto empty   = [&context] { return EmptyStorageBuffer(context); };
 	if (address == 0 || size == 0) {
-		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+		return empty();
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
-	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
-		EXIT("storage buffer range is unsupported\n");
+	const auto  max_range = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+	bool        clamped   = false;
+	if (size > max_range) {
+		if (!StorageOffsetFallbackEnabled() || max_range < alignment + sizeof(uint32_t)) {
+			EXIT("storage buffer range is unsupported\n");
+		}
+		NoteStorageFallback("storage buffer range above maxStorageBufferRange, bound clamped",
+		                    stage, shader_hash, slot, address, size, 0, 0);
+		// Room for any adjustment below the offset alignment, in whole dwords.
+		size    = Common::AlignDown(uint64_t {max_range} - alignment, uint64_t {4});
+		clamped = true;
+	}
+	// The binding's adjustment (below) is the guest address's offset within the device's storage
+	// offset alignment: the cache's buffers begin on caching pages.
+	const auto expected_adjustment = address % alignment;
+	if (StorageOffsetFallbackEnabled() &&
+	    (expected_adjustment % sizeof(uint32_t) != 0 || expected_adjustment >= 256)) {
+		NoteStorageFallback("storage buffer offset adjustment is unsupported, bound empty", stage,
+		                    shader_hash, slot, address, size, 0, expected_adjustment);
+		return empty();
 	}
 	// A proven write range narrows what becomes GPU-owned and which images go stale; everything
 	// else about the binding (synchronization, descriptor range) is unchanged.
-	const bool narrowed = resource.written && written_ranges != nullptr;
+	const bool narrowed = resource.written && written_ranges != nullptr && !clamped;
 	auto [buffer, offset] =
 	    narrowed ? context.GetBufferCache().ObtainWrittenBuffer(address, size, *written_ranges, id)
 	             : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
 	                                                     resource.formatted, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
-	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+		if (!StorageOffsetFallbackEnabled()) {
+			EXIT("storage buffer offset adjustment is unsupported\n");
+		}
+		// Not expected (the check above sees the same adjustment); the buffer was obtained, which
+		// only synchronized it (a written one is tracked as GPU-written with unchanged contents).
+		NoteStorageFallback("storage buffer offset adjustment is unsupported after obtaining it, "
+		                    "bound empty",
+		                    stage, shader_hash, slot, address, size, offset, adjustment);
+		return empty();
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	// Shaders bounds-check storage buffers in whole dwords (OpArrayLength floors the range), and
@@ -1832,9 +1901,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		uint32_t   buffer_offset = 0;
 		const auto* written      = ResolveWrittenRanges(m_context, *prepared.runtime, prepared, i,
 		                                                write_ranges_evaluated, write_scratch);
-		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
-		                                               program.info.buffers[i], program.stage, i,
-		                                               buffer_offset, written));
+		prepared.buffers.push_back(
+		    NativeStorageBuffer(m_context, prepared.buffer_sources[i], program.info.buffers[i],
+		                        program.stage, program.shader_hash, i, buffer_offset, written));
 		pack_memory_offset(i, buffer_offset);
 	}
 	prepared.mip_stats_canary = false;
