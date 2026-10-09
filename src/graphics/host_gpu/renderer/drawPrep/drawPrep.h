@@ -128,6 +128,25 @@ enum class IndirectEvent : uint8_t {
 	Count,
 };
 
+// KYTY_DRAW_RUN_INDIRECT (graphicsRun.cpp): with KYTY_DRAW_RUN on, what the published indirect
+// draws the resolver committed did with the run (DrawRun::Classify), and the run-ending activity
+// notes the op took itself instead of ExecuteOp. Printed as "DrawRun indirect 10s".
+enum class IndirectRunEvent : uint8_t {
+	Continued, // continued the run (verify: would have)
+	NoRun,     // no eligible previous draw, another structure key, or no programs reached
+	// The key matched, a certificate check refused (DrawRun::Miss order).
+	Activity,
+	Command,
+	Instance,
+	Programs,
+	Validation,
+	Images,
+	Pipeline,
+	NotedRead,     // committed, but the record read was not a clean backing read: noted first
+	NotedFallback, // not committed (gpuowned, changed, args, verify): noted, drawn as before
+	Count,
+};
+
 // Process-wide totals of the engine's decisions, always counted (relaxed; written on the GPU
 // thread). The DrawPrep* frame events only count with a connected profiler; tests read these.
 struct Totals {
@@ -149,11 +168,16 @@ struct Totals {
 	// KYTY_DRAW_PREP_INDIRECT (IndirectEvent): written by the sequencer (publications, refusals)
 	// and the resolver (decisions).
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(IndirectEvent::Count)> indirect {};
+	// KYTY_DRAW_RUN_INDIRECT (IndirectRunEvent), resolver.
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(IndirectRunEvent::Count)> indirect_run {};
 };
 [[nodiscard]] Totals& GetTotals();
 
 inline void CountIndirect(IndirectEvent event) noexcept {
 	GetTotals().indirect[static_cast<size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+inline void CountIndirectRun(IndirectRunEvent event) noexcept {
+	GetTotals().indirect_run[static_cast<size_t>(event)].fetch_add(1, std::memory_order_relaxed);
 }
 
 // One draw's speculative preparation and its certificate. Reused across draws (vectors keep
