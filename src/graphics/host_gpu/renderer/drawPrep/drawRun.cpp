@@ -112,6 +112,15 @@ Totals& GetTotals() {
 	return g_totals;
 }
 
+Counts ReadCounts() noexcept {
+	Counts counts;
+	counts.continued = g_totals.continued.load(std::memory_order_relaxed);
+	for (uint32_t i = 0; i < static_cast<uint32_t>(Miss::Count); i++) {
+		counts.misses[i] = g_totals.misses[i].load(std::memory_order_relaxed);
+	}
+	return counts;
+}
+
 void CountMiss(Miss miss) noexcept {
 	g_totals.misses[static_cast<uint32_t>(miss)].fetch_add(1, std::memory_order_relaxed);
 }
