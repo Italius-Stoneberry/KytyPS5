@@ -235,6 +235,16 @@ public:
 		uint64_t programs = 0;
 	};
 	[[nodiscard]] PrefetchTotals GetPrefetchTotals() const;
+	// KYTY_PIPELINE_LOOKUP_MEMO (process-wide, relaxed): lookups GetComputePipeline and
+	// GetGraphicsPipeline answered from the per-thread memo without the map lock, and those that
+	// took the lock (memo on); "Pipeline lookup memo 10s" line (drawPrep.cpp).
+	struct LookupMemoTotals {
+		uint64_t compute_hits    = 0;
+		uint64_t compute_misses  = 0;
+		uint64_t graphics_hits   = 0;
+		uint64_t graphics_misses = 0;
+	};
+	[[nodiscard]] static LookupMemoTotals GetLookupMemoTotals() noexcept;
 	// KYTY_PIPELINE_FAST_FIRST counters (all zero when it is off); tests and diagnostics.
 	[[nodiscard]] FastFirstSnapshot GetFastFirstTotals() const;
 	void NoteProgramPrefetchWait(uint64_t ns);
