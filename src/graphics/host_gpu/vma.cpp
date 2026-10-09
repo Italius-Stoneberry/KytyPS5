@@ -25,11 +25,24 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "live-counters.h"
+#include "vram-pressure.h"
 
 #include <cstdio>
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
+#include <cstddef>
+#include <utility>
+
+extern "C" {
+// 8 GB GPUs (vram-pressure.h): 0 off, 1 on, 2 auto (the default: on when the device-local budget at
+// start is under 10 GiB on a discrete GPU; a 16 GB or larger GPU keeps the previous behaviour).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_vram_adaptive_mode {VramPressure::Auto};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_image_pool_trim_mode {VramPressure::Auto};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_texture_gc_time_mode {VramPressure::Auto};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_vram_log_mode {VramPressure::Auto};
+}
 
 namespace Libs::Graphics {
 
@@ -39,6 +52,13 @@ void FlushBufferReclaimer(); // streamBuffer.cpp (KYTY_BUFFER_RECLAIM)
 static VmaAllocator g_report_allocator = nullptr;
 // Freed images kept for reuse (KYTY_IMAGE_POOL): at most 1 GiB, and a 16th of the GPU's memory budget.
 static uint64_t g_image_pool_limit = 1024ull << 20;
+// KYTY_VRAM_ADAPTIVE / KYTY_IMAGE_POOL_TRIM: the pool's limit this frame (RefreshMemoryPressure),
+// UINT64_MAX while both are off (g_image_pool_limit then). DeleteImage reads it on whatever thread
+// retires the image.
+static std::atomic<uint64_t> g_image_pool_frame_limit {UINT64_MAX};
+// The device-local heaps' budget and GetTotalMemoryBudget() when the allocator was created.
+static uint64_t g_start_heap_budget  = 0;
+static uint64_t g_start_total_budget = 0;
 static void WriteVmaReport(const char* path) {
 	if (g_report_allocator == nullptr) return;
 	char* json = nullptr;
@@ -90,6 +110,22 @@ bool GraphicContext::CreateAllocator() {
 	g_report_allocator          = allocator;
 	LiveCounters::g_vma_report = WriteVmaReport;
 	g_image_pool_limit         = std::min<uint64_t>(1024ull << 20, GetTotalMemoryBudget() / 16);
+	// KYTY_VRAM_* "auto" (vram-pressure.h): an RTX 3070 Ti reports 7011 MiB for heap 0 (plus a small
+	// BAR heap), 16 GB GPUs about 15 GiB. KYTY_VRAM_LIMIT_MB counts (VMA caps the budget with it).
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	uint64_t heap_budget = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		if (physical_device_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+			heap_budget += memory_budget_ext_enabled ? budgets[heap].budget
+			                                         : physical_device_memory_properties.memoryHeaps[heap].size;
+		}
+	}
+	g_start_heap_budget  = heap_budget;
+	g_start_total_budget = GetTotalMemoryBudget();
+	VramPressure::g_small.store(memory_budget_ext_enabled &&
+	                            physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu &&
+	                            g_start_heap_budget < VramPressure::SmallBudget);
 	return true;
 }
 
@@ -226,8 +262,175 @@ static void DestroyImagePool(VmaAllocator allocator) {
 	g_image_pool_bytes = 0;
 }
 
-void GraphicContext::TrimImagePool() {
-	if (allocator != nullptr) DestroyImagePool(allocator);
+// The oldest pooled images until the pool holds at most `limit` bytes; the bytes freed. A pooled
+// image is one the GPU is done with (DeleteImage), so it can go at any time.
+static uint64_t ShrinkImagePool(VmaAllocator allocator, uint64_t limit) {
+	std::scoped_lock lock(g_image_pool_mutex);
+	uint64_t         freed = 0;
+	size_t           count = 0;
+	while (g_image_pool_bytes > limit && count < g_image_pool.size()) {
+		const auto& oldest = g_image_pool[count++];
+		vmaDestroyImage(allocator, oldest.image, oldest.allocation);
+		g_image_pool_bytes -= oldest.bytes;
+		freed += oldest.bytes;
+	}
+	g_image_pool.erase(g_image_pool.begin(), g_image_pool.begin() + static_cast<std::ptrdiff_t>(count));
+	if (freed != 0) {
+		LiveCounters::Add(LiveCounters::ImagePoolTrims);
+		LiveCounters::Add(LiveCounters::ImagePoolTrimKiB, freed >> 10u);
+	}
+	return freed;
+}
+
+uint64_t GraphicContext::TrimImagePool() {
+	return allocator != nullptr ? ShrinkImagePool(allocator, 0) : 0;
+}
+
+// The device-local heaps' usage and budget as VMA reports them (the log's numbers).
+static void DeviceLocalHeaps(VmaAllocator allocator, const vk::PhysicalDeviceMemoryProperties& properties,
+                             uint64_t& usage, uint64_t& budget) {
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	usage = budget = 0;
+	for (uint32_t heap = 0; heap < properties.memoryHeapCount; heap++) {
+		if (properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+			usage += budgets[heap].usage;
+			budget += budgets[heap].budget;
+		}
+	}
+}
+
+// KYTY_VRAM_ADAPTIVE, KYTY_IMAGE_POOL_TRIM, KYTY_TEXTURE_GC_TIME, KYTY_VRAM_LOG (vram-pressure.h):
+// once a frame on the render thread, before the texture cache's collection (which reads the
+// snapshot, as does the buffer cache's after it).
+void GraphicContext::RefreshMemoryPressure() {
+	using Clock = std::chrono::steady_clock;
+	using VramPressure::Active;
+	if (allocator == nullptr) return;
+	const auto mode_text = [](const volatile std::atomic_uint32_t& mode) {
+		const auto value = mode.load(std::memory_order_relaxed);
+		return value == 0 ? "0" : value == 1 ? "1" : Active(mode) ? "auto(on)" : "auto(off)";
+	};
+	static bool announced = false;
+	if (!std::exchange(announced, true)) {
+		std::printf("VRAM: device-local budget %" PRIu64 " MiB at start%s: KYTY_VRAM_ADAPTIVE=%s KYTY_IMAGE_POOL_TRIM=%s "
+		            "(KYTY_IMAGE_POOL=%u) KYTY_TEXTURE_GC_TIME=%s KYTY_VRAM_LOG=%s\n",
+		            g_start_heap_budget >> 20u,
+		            !memory_budget_ext_enabled ? " (no VK_EXT_memory_budget: the switches have no effect)"
+		            : VramPressure::g_small.load() ? " (small GPU: auto is on)" : " (auto is off)",
+		            mode_text(kyty_local_vram_adaptive_mode), mode_text(kyty_local_image_pool_trim_mode),
+		            kyty_local_image_pool_mode.load(std::memory_order_relaxed), mode_text(kyty_local_texture_gc_time_mode),
+		            mode_text(kyty_local_vram_log_mode));
+		std::fflush(stdout);
+	}
+	auto&      snapshot = VramPressure::g_snapshot;
+	const bool adaptive = Active(kyty_local_vram_adaptive_mode);
+	const bool trim     = Active(kyty_local_image_pool_trim_mode);
+	const bool log      = Active(kyty_local_vram_log_mode);
+	if (!memory_budget_ext_enabled ||
+	    (!adaptive && !trim && !log && !Active(kyty_local_texture_gc_time_mode))) {
+		// All off (also after a live switch back): the pool's own limit, the caches' budget at start.
+		snapshot = {};
+		g_image_pool_frame_limit.store(UINT64_MAX, std::memory_order_relaxed);
+		return;
+	}
+	const auto now = Clock::now();
+	// VMA asks the driver for the budget only every 30 allocations and frees; other programs taking
+	// video memory (a browser, the compositor) would show up late or never. At most every 100 ms,
+	// here: one vkGetPhysicalDeviceMemoryProperties2.
+	static Clock::time_point fetched {};
+	static uint32_t          frame_index = 0;
+	if (adaptive && now - fetched >= std::chrono::milliseconds(100)) {
+		frame_index = (frame_index + 1) & 0x7fffffffu;
+		vmaSetCurrentFrameIndex(allocator, frame_index);
+		fetched = now;
+	}
+	snapshot.budget          = adaptive ? GetTotalMemoryBudget() : g_start_total_budget;
+	snapshot.usage           = GetDeviceMemoryUsage();
+	const auto thresholds    = VramPressure::TextureThresholds(snapshot.budget);
+	snapshot.level           = snapshot.usage >= snapshot.budget       ? VramPressure::Critical
+	                           : snapshot.usage >= thresholds.critical ? VramPressure::High
+	                           : snapshot.usage >= thresholds.pressure ? VramPressure::Pressured
+	                                                                   : VramPressure::Normal;
+	// The freed-image pool: KYTY_VRAM_ADAPTIVE keeps its 16th of the budget (at most 1 GiB) to the
+	// budget of now. KYTY_IMAGE_POOL_TRIM: on an 8 GB GPU 191 MiB (a 32nd of the 6135 MiB budget; the
+	// 16th was 383 MiB), 47 MiB under high pressure and nothing past the collections' budget (the
+	// driver's less an eighth: from there 876 MiB are left before buffers go to system memory).
+	uint64_t pool_limit = UINT64_MAX;
+	if (adaptive || trim) {
+		pool_limit = adaptive ? std::min<uint64_t>(1024ull << 20, snapshot.budget / 16) : g_image_pool_limit;
+		if (trim) {
+			pool_limit = std::min(pool_limit, snapshot.level == VramPressure::Critical ? 0
+			                                  : snapshot.level == VramPressure::High   ? snapshot.budget / 128
+			                                                                           : snapshot.budget / 32);
+		}
+		ShrinkImagePool(allocator, pool_limit);
+	}
+	g_image_pool_frame_limit.store(pool_limit, std::memory_order_relaxed);
+
+	// The level's changes (at most one line every 2 s, with how many there were) and, with
+	// KYTY_VRAM_LOG, a line every KYTY_VRAM_LOG_SECONDS: what the A/B of these switches reads.
+	static VramPressure::Level printed = VramPressure::Levels;
+	static Clock::time_point   printed_at {};
+	static uint32_t            changes = 0;
+	static VramPressure::Level last    = VramPressure::Levels;
+	if (snapshot.level != last) {
+		last = snapshot.level;
+		++changes;
+	}
+	const auto heaps = [&] {
+		uint64_t usage = 0, budget = 0;
+		DeviceLocalHeaps(allocator, physical_device_memory_properties, usage, budget);
+		size_t   images = 0;
+		uint64_t pooled = 0;
+		{
+			std::scoped_lock lock(g_image_pool_mutex);
+			images = g_image_pool.size();
+			pooled = g_image_pool_bytes;
+		}
+		std::printf("device-local usage %" PRIu64 " of %" PRIu64 " MiB (collection budget %" PRIu64 ", pressure %" PRIu64
+		            ", critical %" PRIu64 " MiB), image pool %" PRIu64 " MiB, %zu images",
+		            usage >> 20u, budget >> 20u, snapshot.budget >> 20u, thresholds.pressure >> 20u,
+		            thresholds.critical >> 20u, pooled >> 20u, images);
+	};
+	if ((adaptive || log) && snapshot.level != printed && now - printed_at >= std::chrono::seconds(2)) {
+		std::printf("VRAM: pressure %s -> %s (%u change%s): ", printed == VramPressure::Levels ? "start" : VramPressure::LevelNames[printed],
+		            VramPressure::LevelNames[snapshot.level], changes, changes == 1 ? "" : "s");
+		heaps();
+		std::printf("\n");
+		std::fflush(stdout);
+		printed    = snapshot.level;
+		printed_at = now;
+		changes    = 0;
+	}
+	static const double log_seconds = [] {
+		const char* text  = std::getenv("KYTY_VRAM_LOG_SECONDS");
+		const double value = text != nullptr ? std::atof(text) : 10.0;
+		return value >= 1.0 ? value : 10.0;
+	}();
+	static Clock::time_point                  logged_at = now;
+	static std::array<uint64_t, 6>            logged {};
+	static constexpr std::array<LiveCounters::Id, 6> counted {
+	    LiveCounters::TextureGcDeletes, LiveCounters::TextureGcDeleteKiB, LiveCounters::ImagePoolTrims,
+	    LiveCounters::ImagePoolTrimKiB, LiveCounters::SysmemFallbacks,    LiveCounters::SysmemFallbackKiB};
+	if (log && now - logged_at >= std::chrono::duration<double>(log_seconds)) {
+		std::array<uint64_t, 6> delta {};
+		for (size_t i = 0; i < counted.size(); ++i) {
+			const auto value = LiveCounters::Value(counted[i]);
+			delta[i]         = value - logged[i];
+			logged[i]        = value;
+		}
+		std::printf("VRAM %.0f s: %s, ", std::chrono::duration<double>(now - logged_at).count(),
+		            VramPressure::LevelNames[snapshot.level]);
+		heaps();
+		std::printf(" (limit %" PRIu64 " MiB); texture collection deleted %" PRIu64 " (%" PRIu64
+		            " MiB), pool trims %" PRIu64 " (%" PRIu64 " MiB), system-memory fallbacks %" PRIu64 " (%" PRIu64
+		            " MiB, %" PRIu64 " in all)\n",
+		            (pool_limit != UINT64_MAX ? pool_limit : g_image_pool_limit) >> 20u, delta[0], delta[1] >> 10u,
+		            delta[2], delta[3] >> 10u, delta[4], delta[5] >> 10u, logged[4]);
+		std::fflush(stdout);
+		logged_at = now;
+	}
 }
 
 // Out of video memory: the first few times say so in the log, with the heaps' budgets.
@@ -298,6 +501,12 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			ReportMemoryFallback(created ? "an image is in system memory" : "an image could not be created",
 			                     allocated.size);
 			if (!created) return false;
+			VkMemoryPropertyFlags placed = 0;
+			vmaGetAllocationMemoryProperties(allocator, image.allocation, &placed);
+			if ((placed & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+				LiveCounters::Add(LiveCounters::SysmemFallbacks);
+				LiveCounters::Add(LiveCounters::SysmemFallbackKiB, allocated.size >> 10u);
+			}
 		}
 	}
 
@@ -325,7 +534,9 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		std::scoped_lock lock(g_image_pool_mutex);
 		g_image_pool.push_back({ImagePoolKey(image), image.image, image.allocation, allocation_info.size});
 		g_image_pool_bytes += allocation_info.size;
-		while (g_image_pool_bytes > g_image_pool_limit && !g_image_pool.empty()) {
+		const auto frame_limit = g_image_pool_frame_limit.load(std::memory_order_relaxed);
+		const auto limit       = frame_limit != UINT64_MAX ? frame_limit : g_image_pool_limit;
+		while (g_image_pool_bytes > limit && !g_image_pool.empty()) {
 			auto& oldest = g_image_pool.front();
 			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
 			g_image_pool_bytes -= oldest.bytes;
