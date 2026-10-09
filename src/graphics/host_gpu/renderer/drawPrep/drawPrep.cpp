@@ -1072,6 +1072,66 @@ void Engine::CommitPublished(uint64_t position, uint64_t submit_id, uint32_t ins
 	CommitHead(&patch);
 }
 
+// KYTY_DRAW_PREP_INDIRECT: the head slot of a published indirect draw's op.
+static Engine::Slot& PublishedHead(Window<Engine::Slot>& window, uint64_t position) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	EXIT_IF(window.Empty() || window.Head() != position);
+	auto& slot = window.HeadPayload();
+	// Published by the real parse (its publish fields reached this thread with the op).
+	EXIT_IF(slot.speculative);
+	return slot;
+}
+
+RegisterSnapshot& Engine::PublishedRegisters(uint64_t position) {
+	EXIT_IF(m_workers == nullptr);
+	return PublishedHead(m_workers->window, position).registers;
+}
+
+bool Engine::PublishedArgsEqual(uint64_t position, const DrawIndexArgs* index_args,
+                                const DrawAutoArgs* auto_args) {
+	EXIT_IF(m_workers == nullptr);
+	EXIT_IF((index_args == nullptr) == (auto_args == nullptr));
+	// Workers read the arguments; only CommitPublished writes them, after every worker is done.
+	const auto& slot = PublishedHead(m_workers->window, position);
+	if (index_args != nullptr) {
+		const auto& a = slot.index_args;
+		const auto& b = *index_args;
+		return slot.kind == DrawKind::Index && a.index_count == b.index_count &&
+		       a.index_addr == b.index_addr && a.instance_count == b.instance_count &&
+		       a.index_type_and_size == b.index_type_and_size && a.base_vertex == b.base_vertex &&
+		       a.first_instance == b.first_instance && a.offset_source == b.offset_source &&
+		       a.render_target_slice_offset == b.render_target_slice_offset;
+	}
+	const auto& a = slot.auto_args;
+	const auto& b = *auto_args;
+	return slot.kind == DrawKind::Auto && a.vertex_count == b.vertex_count &&
+	       a.instance_count == b.instance_count && a.first_vertex == b.first_vertex &&
+	       a.first_instance == b.first_instance && a.offset_source == b.offset_source &&
+	       a.render_target_slice_offset == b.render_target_slice_offset;
+}
+
+void Engine::DiscardPublished(uint64_t position) {
+	EXIT_IF(m_workers == nullptr);
+	auto& window = m_workers->window;
+	auto& slot   = PublishedHead(window, position);
+	if (!window.TryClaimHead()) {
+		// A worker prepares it (or has): the slot is reused only after its Done store, so wait.
+		// As in CommitHead, pending cross-thread commands are serviced only as a deadlock guard
+		// after 2 ms (workers never fault into a request of this thread).
+		const auto start = NowNs();
+		for (uint32_t spins = 0; !window.HeadDone(); spins++) {
+			CpuRelax();
+			if ((spins & 1023u) == 1023u && m_service_commands && NowNs() - start > 2'000'000u) {
+				m_service_commands();
+			}
+		}
+	}
+	// Claimed or done (acquired): the slot is this thread's until it retires.
+	slot.plan.Reset();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepUnused);
+	window.Retire();
+}
+
 void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 	auto& window = m_workers->window;
 	EXIT_IF(window.Empty());
@@ -1210,6 +1270,30 @@ void PrintDrawPrepSummary() {
 	            " fell back to the serial path;%s\n",
 	            static_cast<double>(now - last_ns) * 1e-9, committed - last_committed,
 	            fallbacks - last_fallbacks, reasons.empty() ? " none" : reasons.c_str());
+	// KYTY_DRAW_PREP_INDIRECT (graphicsRun.cpp), from its first event on: the single indirect
+	// draws the sequencer published and what the resolver did with them, and why the others were
+	// not published (they carry a register snapshot and take the serial path, as without it).
+	static std::array<uint64_t, static_cast<size_t>(IndirectEvent::Count)> last_indirect {};
+	std::array<uint64_t, static_cast<size_t>(IndirectEvent::Count)>        indirect {};
+	bool                                                                   indirect_seen = false;
+	for (size_t i = 0; i < indirect.size(); i++) {
+		const auto value = g_totals.indirect[i].load(std::memory_order_relaxed);
+		indirect[i]      = value - last_indirect[i];
+		last_indirect[i] = value;
+		indirect_seen    = indirect_seen || value != 0;
+	}
+	if (indirect_seen) {
+		const auto n = [&](IndirectEvent event) { return indirect[static_cast<size_t>(event)]; };
+		using E      = IndirectEvent;
+		std::printf("DrawPrep indirect %.0fs: %" PRIu64 " published, %" PRIu64
+		            " committed; resolver fallbacks: gpuowned=%" PRIu64 " changed=%" PRIu64
+		            " args=%" PRIu64 " verify=%" PRIu64 "; not published: pendingwrite=%" PRIu64
+		            " publication=%" PRIu64 " backing=%" PRIu64 " other=%" PRIu64 "\n",
+		            static_cast<double>(now - last_ns) * 1e-9, n(E::Published), n(E::Committed),
+		            n(E::BackGpuOwned), n(E::BackChanged), n(E::BackArgs), n(E::VerifyMatched),
+		            n(E::FrontPendingWrite), n(E::FrontPublication), n(E::FrontBacking),
+		            n(E::FrontOther));
+	}
 	last_ns        = now;
 	last_committed = committed;
 	last_fallbacks = fallbacks;
