@@ -8,7 +8,10 @@
 #include "vram-pressure.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -16,6 +19,7 @@
 #include <thread>
 #include <vector>
 #include <vk_mem_alloc.h>
+#include <x86intrin.h>
 
 extern "C" {
 // KYTY_BUFFER_RECLAIM: 1: a retired buffer's memory is freed on a worker thread. Freeing a
@@ -392,8 +396,41 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	auto invalidation_mark =
 	    wrap ? std::optional<size_t> {m_current_watch_cursor} : m_invalidation_mark;
 	auto& pending_watches = wrap ? m_current_watches : m_previous_watches;
-	if (!WaitPendingOperations(pending_watches, invalidation_mark, aligned_offset + mapped_size,
-	                           allow_wait, wait_cursor, wait_bound)) {
+	// A large image can wrap the upload ring and wait for an older GPU tick. Keep timing
+	// entirely out of the normal path; this reports only meaningful waits when requested.
+	static const bool staging_diagnostics = [] {
+		const char* value = std::getenv("KYTY_STAGING_DIAGNOSTICS");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	const auto first_wait_cursor = wait_cursor;
+	const bool may_wait = staging_diagnostics && allow_wait && invalidation_mark.has_value() &&
+	                      aligned_offset + mapped_size > wait_bound && wait_cursor < *invalidation_mark;
+	using Clock = std::chrono::steady_clock;
+	const auto wait_start = may_wait ? Clock::now() : Clock::time_point {};
+	const bool available = WaitPendingOperations(pending_watches, invalidation_mark,
+	                                             aligned_offset + mapped_size, allow_wait,
+	                                             wait_cursor, wait_bound);
+	if (may_wait && wait_cursor > first_wait_cursor) {
+		const auto now = Clock::now();
+		const auto wait_ms = std::chrono::duration<double, std::milli>(now - wait_start).count();
+		// Cap ordinary diagnostics to one per second per thread. Always show a severe stall.
+		static thread_local Clock::time_point last_log {};
+		if (wait_ms >= 10.0 &&
+		    (wait_ms >= 100.0 || last_log == Clock::time_point {} || now - last_log >= std::chrono::seconds(1))) {
+			std::printf("[tsc %llu] STAGING MAP wait=%.1f ms usage=%u request=%llu capacity=%llu offset=%llu "
+			            "mapped=%llu wrap=%u watches=%zu tick_first=%llu tick_last=%llu\n",
+			            static_cast<unsigned long long>(__rdtsc()), wait_ms, static_cast<unsigned>(Usage()),
+			            static_cast<unsigned long long>(size),
+			            static_cast<unsigned long long>(Size()), static_cast<unsigned long long>(m_offset),
+			            static_cast<unsigned long long>(mapped_size), wrap ? 1u : 0u,
+			            wait_cursor - first_wait_cursor,
+			            static_cast<unsigned long long>(pending_watches[first_wait_cursor].tick),
+			            static_cast<unsigned long long>(pending_watches[wait_cursor - 1].tick));
+			std::fflush(stdout);
+			last_log = now;
+		}
+	}
+	if (!available) {
 		return {nullptr, 0};
 	}
 

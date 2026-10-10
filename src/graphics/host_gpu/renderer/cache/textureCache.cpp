@@ -24,6 +24,7 @@
 #include <bit>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -1483,6 +1484,79 @@ static bool PartialFail(const char* why) {
 	return false;
 }
 
+// One trace per large upload or first dirty transition, capped across threads so a
+// repeatedly bound streamed image cannot turn the diagnostic into a frame-time cost.
+static bool ImageUploadDiagnosticSlot(const Image& image) {
+	struct Settings {
+		bool     enabled = false;
+		bool     address_filter = false;
+		uint64_t address = 0;
+	};
+	static const Settings settings = [] {
+		Settings settings;
+		const char* value = std::getenv("KYTY_IMAGE_UPLOAD_DIAGNOSTICS");
+		settings.enabled = value != nullptr && std::strcmp(value, "1") == 0;
+		if (const char* address = std::getenv("KYTY_IMAGE_UPLOAD_DIAGNOSTICS_ADDR"); address != nullptr) {
+			char* end = nullptr;
+			const auto parsed = std::strtoull(address, &end, 0);
+			if (end != address && *end == '\0') {
+				settings.address_filter = true;
+				settings.address = parsed;
+			}
+		}
+		return settings;
+	}();
+	if (!settings.enabled || image.info.data.size < PartialDirtyMinSize ||
+	    (settings.address_filter && image.info.data.address != settings.address)) return false;
+	static std::mutex mutex;
+	static auto       window = std::chrono::steady_clock::now();
+	static uint32_t   emitted = 0;
+	std::scoped_lock lock(mutex);
+	const auto now = std::chrono::steady_clock::now();
+	if (now - window >= std::chrono::seconds(1)) {
+		window  = now;
+		emitted = 0;
+	}
+	if (emitted >= 32) return false;
+	++emitted;
+	return true;
+}
+
+static const char* PartialDirtyDiagnosticReason(const Image& image) {
+	const auto& info = image.info;
+	if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 0) return "mode_off";
+	if (info.data.size < PartialDirtyMinSize) return "small";
+	if (image.depth_id) return "stencil_association";
+	if (image.backing.image == nullptr) return "no_backing";
+	if (info.samples != 1) return "multisample";
+	if (info.IsVolume()) return "volume";
+	if (info.HasStencil()) return "stencil";
+	if (info.metadata.compression != VideoOutCompression::Uncompressed) return "compression";
+	if (!image.registered) return "unregistered";
+	if (!image.IsTracked()) return "untracked";
+	if (image.track_addr != info.data.address || image.track_addr_end != info.data.End()) return "partial_tracking";
+	if (!image.CanTakePartialDirty()) return "dirty_state";
+	if (image.IsGpuModified()) return "gpu_modified";
+	if (image.IsBufferModified()) return "buffer_modified";
+	if (image.IsStencilModified()) return "stencil_modified";
+	return "eligible";
+}
+
+static void LogImageUploadInvalidation(const Image& image, const char* source, uint64_t address,
+	                                   uint64_t size, const char* forced_reason = nullptr) {
+	if (!ImageUploadDiagnosticSlot(image)) return;
+	std::printf("[tsc %llu] IMAGE-UPLOAD-DIAG invalidate source=%s result=%s serial=%" PRIu64
+	            " addr=0x%" PRIx64 " bytes=%" PRIu64 " write=0x%" PRIx64 "+%" PRIu64
+	            " partial=%d buffer=%d cpu=%d gpu=%d tracked=%d\n",
+	            static_cast<unsigned long long>(__rdtsc()), source,
+	            forced_reason != nullptr ? forced_reason : PartialDirtyDiagnosticReason(image),
+	            image.serial, image.info.data.address, image.info.data.size,
+	            address, size, image.IsPartiallyCpuDirty() ? 1 : 0,
+	            image.IsBufferModified() ? 1 : 0, image.IsCpuDirty() ? 1 : 0,
+	            image.IsGpuModified() ? 1 : 0, image.IsTracked() ? 1 : 0);
+	std::fflush(stdout);
+}
+
 void TextureCache::InitializeImage(ImageId id) {
 	using Clock = std::chrono::steady_clock;
 	auto&             image = m_slot_images[id];
@@ -1520,7 +1594,9 @@ void TextureCache::InitializeImage(ImageId id) {
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
 		bool uploaded = false;
+		bool partial_attempted = false;
 		if (image.IsPartiallyCpuDirty() && !image.IsBufferModified()) {
+			partial_attempted = true;
 			g_partial_fail = "";
 			uploaded = UploadImagePartial(image);
 			if (!uploaded) {
@@ -1528,6 +1604,26 @@ void TextureCache::InitializeImage(ImageId id) {
 			}
 		}
 		if (!uploaded) {
+			if (ImageUploadDiagnosticSlot(image)) {
+				uint64_t dirty_bytes = 0;
+				for (const auto& [begin, end]: image.CpuDirtyRanges()) dirty_bytes += end - begin;
+				std::printf("[tsc %llu] IMAGE-UPLOAD-DIAG full serial=%" PRIu64 " addr=0x%" PRIx64
+				            " bytes=%" PRIu64 " kind=%s reason=%s eligibility=%s partial_mode=%u row_bands=%u"
+				            " dirty_ranges=%zu dirty_bytes=%" PRIu64 " registered=%d tracked=%d"
+				            " backing=%d fmt=%u extent=%ux%u layers=%u levels=%u\n",
+				            static_cast<unsigned long long>(__rdtsc()), image.serial,
+				            image.info.data.address, image.info.data.size, kind,
+				            partial_attempted ? g_partial_fail
+				                              : image.IsBufferModified() ? "buffer_modified" : "whole_dirty",
+				            PartialDirtyDiagnosticReason(image),
+				            kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed),
+				            kyty_local_partial_row_bands_mode.load(std::memory_order_relaxed),
+				            image.CpuDirtyRanges().size(), dirty_bytes, image.registered ? 1 : 0,
+				            image.IsTracked() ? 1 : 0, image.backing.image != nullptr ? 1 : 0,
+				            static_cast<uint32_t>(image.info.guest_format), image.info.extent.width,
+				            image.info.extent.height, image.info.resources.layers, image.info.resources.levels);
+				std::fflush(stdout);
+			}
 			const auto [source, source_offset] =
 			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 			marks[2] = Clock::now();
@@ -1555,6 +1651,12 @@ void TextureCache::InitializeImage(ImageId id) {
 			    PartialDirtyCandidate(image)) {
 				UpdatePartialHashes(image, true);
 			}
+		} else if (ImageUploadDiagnosticSlot(image)) {
+			std::printf("[tsc %llu] IMAGE-UPLOAD-DIAG partial serial=%" PRIu64 " addr=0x%" PRIx64
+			            " bytes=%" PRIu64 " dirty_ranges=%zu\n",
+			            static_cast<unsigned long long>(__rdtsc()), image.serial,
+			            image.info.data.address, image.info.data.size, image.CpuDirtyRanges().size());
+			std::fflush(stdout);
 		}
 		image.ClearBufferModified();
 	}
@@ -2934,6 +3036,9 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			if (TryInvalidatePartial(*owner, address, size, PartialDirtyGranule)) {
 				continue;
 			}
+			if (!owner->IsDefinitelyCpuDirty()) {
+				LogImageUploadInvalidation(*owner, "cpu_alias", address, size);
+			}
 			if (SlowLog::Threshold() > 0.0 && owner->info.data.size >= PartialDirtyMinSize &&
 			    owner->IsTracked() &&
 			    kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) != 0) {
@@ -3097,6 +3202,9 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 		if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
 			continue;
 		}
+		if (!owner->IsDefinitelyCpuDirty()) {
+			LogImageUploadInvalidation(*owner, "map", address, size);
+		}
 		owner->InvalidateCpuWrite(address, size);
 		UntrackImage(id, "map");
 	}
@@ -3161,6 +3269,10 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 			++slow_partial;
 			continue;
 		}
+		const bool full_unmap = address <= owner->info.data.address &&
+		                        address + size >= owner->info.data.End();
+		LogImageUploadInvalidation(*owner, "unmap", address, size,
+		                           full_unmap ? "full_unmap" : nullptr);
 		++slow_deleted;
 		slow_bytes += owner->info.data.size;
 		if (owner->info.data.size > slow_largest) {
