@@ -57,9 +57,9 @@ jobs:
             $pinned = (git ls-tree HEAD 3rdparty/LibAtrac9) -split '\s+' | Select-Object -Index 2
             Write-Host "::warning title=LibAtrac9::the pinned $pinned is not in its repository; building with $fallback"
             git -C 3rdparty/LibAtrac9 fetch --depth=1 origin $fallback
-            if ($LASTEXITCODE -ne 0) { throw "LibAtrac9 $fallback: fetch failed" }
+            if ($LASTEXITCODE -ne 0) { throw "LibAtrac9 ${fallback}: fetch failed" }
             git -C 3rdparty/LibAtrac9 checkout --quiet --detach FETCH_HEAD
-            if ($LASTEXITCODE -ne 0) { throw "LibAtrac9 $fallback: checkout failed" }
+            if ($LASTEXITCODE -ne 0) { throw "LibAtrac9 ${fallback}: checkout failed" }
           }
           git submodule status --recursive
 
@@ -92,7 +92,16 @@ jobs:
           $toolsets = @($toolsets | Sort-Object Version -Descending)
           $toolsets | ForEach-Object { Write-Host "$($_.Vs.installationVersion) MSVC $($_.Name): its STL needs Clang $($_.Needs)+" }
           $pick = $toolsets | Where-Object Needs -le $clang | Select-Object -First 1
-          if (!$pick) { throw "no installed MSVC toolset takes clang-cl $env:LLVM_VERSION" }
+          if (!$pick) {
+            # Only toolsets newer than clang-cl 19 (a Visual Studio 2026 image without the 2022 toolset):
+            # the oldest of them, with the STL's version check off (the STL then may use what clang 19
+            # lacks; the compile says so if it does).
+            $pick = $toolsets | Select-Object -Last 1
+            if (!$pick) { throw 'no MSVC toolset installed' }
+            Write-Host "::warning title=MSVC STL::no toolset accepts clang-cl $env:LLVM_VERSION; MSVC $($pick.Name) with _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+            "CXXFLAGS=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH" >> $env:GITHUB_ENV
+            "CFLAGS=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH" >> $env:GITHUB_ENV
+          }
           $default = Get-Content "$($pick.Vs.installationPath)\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt" -ErrorAction SilentlyContinue
           # Always the Visual Studio (several may be installed); the toolset only when not its default.
           "vsversion=$(([version]$pick.Vs.installationVersion).Major).0" >> $env:GITHUB_OUTPUT
