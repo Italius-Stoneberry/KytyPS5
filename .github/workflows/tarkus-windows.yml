@@ -1,0 +1,289 @@
+# Windows build of this fork for other PCs: what build-windows.cmd does (VS 2022 x64 environment,
+# clang-cl from LLVM 19.1.7, Ninja, Release, -O3 and ThinLTO), with -DKYTY_MARCH=x86-64-v3 as
+# package-windows.ps1 builds it (-march=native would use the build machine's GFNI/AVX-VNNI). No PGO.
+# The artifact holds only the two programs and their DLLs: srt-aot.dll, seeds.seeds, launch.json and
+# the scripts of an existing portable package stay as they are (see docs/PORTABLE-README.md).
+name: Tarkus Windows build
+
+on:
+  push:
+    branches: ['tarkus-*']
+  workflow_dispatch:
+    inputs:
+      thin_lto:
+        description: 'ThinLTO (as the portable package); off: about a quarter less build time, a slower emulator'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tarkus-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # LLVM 23.1.2's clang-cl crashes compiling agc.cpp (docs/CURRENT-PLAYABLE.md); the dev builds with 19.1.7.
+  LLVM_VERSION: '19.1.7'
+  # Only glslangValidator is used (the GPU tiler, blit and fault-buffer shaders).
+  VULKAN_SDK_VERSION: '1.4.309.0'
+
+jobs:
+  windows:
+    name: Build kyty_emulator and kyty_shader_precompile (x86-64-v3)
+    runs-on: windows-latest
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # As actions/checkout's `submodules: recursive`, except that a LibAtrac9 pin its repository lacks
+      # (b5bb3233, e5738de's: only its author's clone has it) falls back to ec8899da, an ancestor of
+      # upstream master, with a warning. A file-by-file upload cannot change the gitlink; the build is
+      # then labelled -dirty (the launcher's KYTY_DRIVER_CACHE_KEY keeps the driver cache in use).
+      - name: Submodules
+        run: |
+          $fallback = 'ec8899dadf393f655f2871a94e0fe4b3d6220c9a'
+          git submodule sync --recursive
+          $paths = git config -f .gitmodules --get-regexp '\.path$' | ForEach-Object { ($_ -split ' ', 2)[1] }
+          $others = @($paths | Where-Object { $_ -ne '3rdparty/LibAtrac9' })
+          git -c protocol.version=2 submodule update --init --force --depth=1 --recursive -- @others
+          if ($LASTEXITCODE -ne 0) { throw 'submodule update failed' }
+          git -c protocol.version=2 submodule update --init --force --depth=1 -- 3rdparty/LibAtrac9
+          if ($LASTEXITCODE -ne 0) {
+            $pinned = (git ls-tree HEAD 3rdparty/LibAtrac9) -split '\s+' | Select-Object -Index 2
+            Write-Host "::warning title=LibAtrac9::the pinned $pinned is not in its repository; building with $fallback"
+            git -C 3rdparty/LibAtrac9 fetch --depth=1 origin $fallback
+            if ($LASTEXITCODE -ne 0) { throw "LibAtrac9 $fallback: fetch failed" }
+            git -C 3rdparty/LibAtrac9 checkout --quiet --detach FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw "LibAtrac9 $fallback: checkout failed" }
+          }
+          git submodule status --recursive
+
+      - name: Python 3
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # The MSVC STL refuses a clang older than it was made for (error STL1000). Should the image's
+      # newest Visual Studio be past what LLVM 19 supports, the newest installed toolset whose STL
+      # accepts it, in whichever Visual Studio has it.
+      - name: Pick the MSVC toolset for clang-cl ${{ env.LLVM_VERSION }}
+        id: toolset
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installs = & $vswhere -all -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json |
+            ConvertFrom-Json
+          $clang = [int]($env:LLVM_VERSION -split '\.')[0]
+          $toolsets = foreach ($vs in $installs) {
+            foreach ($tools in Get-ChildItem "$($vs.installationPath)\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue) {
+              if ($tools.Name -notmatch '^\d+(\.\d+)+$') { continue }
+              $match = Select-String -Path "$($tools.FullName)\include\yvals_core.h" -Pattern 'expected Clang (\d+)' |
+                Select-Object -First 1
+              [pscustomobject]@{
+                Vs = $vs; Name = $tools.Name; Version = [version]$tools.Name
+                Needs = if ($match) { [int]$match.Matches[0].Groups[1].Value } else { 0 }
+              }
+            }
+          }
+          $toolsets = @($toolsets | Sort-Object Version -Descending)
+          $toolsets | ForEach-Object { Write-Host "$($_.Vs.installationVersion) MSVC $($_.Name): its STL needs Clang $($_.Needs)+" }
+          $pick = $toolsets | Where-Object Needs -le $clang | Select-Object -First 1
+          if (!$pick) { throw "no installed MSVC toolset takes clang-cl $env:LLVM_VERSION" }
+          $default = Get-Content "$($pick.Vs.installationPath)\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt" -ErrorAction SilentlyContinue
+          # Always the Visual Studio (several may be installed); the toolset only when not its default.
+          "vsversion=$(([version]$pick.Vs.installationVersion).Major).0" >> $env:GITHUB_OUTPUT
+          "toolset=$(if ($pick.Name -eq "$default".Trim()) { '' } else { $pick.Name })" >> $env:GITHUB_OUTPUT
+          Write-Host "Visual Studio $($pick.Vs.installationVersion), MSVC $($pick.Name)"
+
+      - name: Visual Studio x64 environment (vcvars64)
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+          vsversion: ${{ steps.toolset.outputs.vsversion }}
+          toolset: ${{ steps.toolset.outputs.toolset }}
+
+      - name: Cache the LLVM installer
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}\llvm-installer
+          key: llvm-installer-${{ env.LLVM_VERSION }}-win64
+
+      - name: LLVM ${{ env.LLVM_VERSION }} (clang-cl, lld-link, llvm-lib)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $installer = "$env:RUNNER_TEMP\llvm-installer\LLVM-$env:LLVM_VERSION-win64.exe"
+          if (!(Test-Path $installer)) {
+            New-Item -ItemType Directory -Force (Split-Path $installer) | Out-Null
+            curl.exe -fsSL --retry 3 -o $installer `
+              "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
+          }
+          # Unpacked next to the image's own LLVM, not over it.
+          $llvm = "$env:RUNNER_TEMP\llvm-$env:LLVM_VERSION"
+          7z x -y "-o$llvm" $installer | Out-Null
+          $version = & "$llvm\bin\clang-cl.exe" --version
+          $version | Write-Host
+          if (-not ($version -match "clang version $([regex]::Escape($env:LLVM_VERSION))\b")) { throw "not clang $env:LLVM_VERSION" }
+          "$llvm\bin" >> $env:GITHUB_PATH
+          "KYTY_LLVM=$($llvm -replace '\\', '/')" >> $env:GITHUB_ENV
+
+      - name: Cache the Vulkan SDK
+        id: vulkan-cache
+        uses: actions/cache@v5
+        with:
+          path: C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}-windows
+
+      # LunarG's installer in its documented unattended mode. Should it fail, the next step builds
+      # glslangValidator with vcpkg instead (what .github/workflows/build.yml does).
+      - name: Vulkan SDK ${{ env.VULKAN_SDK_VERSION }} (glslangValidator)
+        id: vulkan
+        continue-on-error: true
+        run: |
+          $root = "C:\VulkanSDK\$env:VULKAN_SDK_VERSION"
+          if (!(Test-Path "$root\Bin\glslangValidator.exe")) {
+            $installer = "$env:RUNNER_TEMP\vulkan_sdk.exe"
+            curl.exe -fsSL --retry 3 -o $installer `
+              "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/vulkan_sdk.exe?Human=true"
+            $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList `
+              '--root', $root, '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+            if ($process.ExitCode -ne 0) { throw "Vulkan SDK installer: exit code $($process.ExitCode)" }
+          }
+          & "$root\Bin\glslangValidator.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'glslangValidator does not run' }
+          "$root\Bin" >> $env:GITHUB_PATH
+          "VULKAN_SDK=$root" >> $env:GITHUB_ENV
+
+      - name: glslangValidator from vcpkg (the Vulkan SDK failed)
+        if: steps.vulkan.outcome == 'failure'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          vcpkg install 'glslang[tools,opt]:x64-windows'
+          "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\tools\glslang" >> $env:GITHUB_PATH
+
+      # build-windows.cmd takes xbyak and zydis from _Build\deps\*-src: cloned here at the commits
+      # 3rdparty/CMakeLists.txt pins, and cached by that file.
+      - name: Cache xbyak and zydis
+        uses: actions/cache@v5
+        with:
+          path: _Build/deps
+          key: fetchcontent-${{ hashFiles('3rdparty/CMakeLists.txt') }}
+
+      - name: xbyak and zydis at their pinned commits
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $lists = Get-Content 3rdparty/CMakeLists.txt -Raw
+          foreach ($name in 'xbyak', 'zydis') {
+            $declare = [regex]::Match($lists, "FetchContent_Declare\(\s*$name\s+GIT_REPOSITORY\s+(\S+)\s+GIT_TAG\s+(\S+)")
+            if (!$declare.Success) { throw "3rdparty/CMakeLists.txt: no FetchContent_Declare($name ...)" }
+            $url, $commit = $declare.Groups[1].Value, $declare.Groups[2].Value
+            $source = "_Build/deps/$name-src"
+            if ((Test-Path "$source/.git") -and (git -C $source rev-parse HEAD) -eq $commit) {
+              Write-Host "$name $commit (cached)"
+              continue
+            }
+            if (Test-Path $source) { Remove-Item -Recurse -Force $source }
+            git clone --quiet $url $source
+            git -C $source checkout --quiet $commit
+            git -C $source submodule update --init --recursive --quiet
+            Write-Host "$name $commit"
+          }
+
+      # Ninja and CMake: Visual Studio's (vcvars puts them on PATH); Ninja from Chocolatey if missing.
+      - name: Toolchain
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (!(Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          Get-Command clang-cl, lld-link, llvm-lib, glslangValidator, ninja, cmake, python |
+            Format-Table Name, Source -AutoSize | Out-String -Width 200 | Write-Host
+          clang-cl --version
+          cmake --version
+          ninja --version
+          python --version
+          Write-Host "VCToolsVersion=$env:VCToolsVersion WindowsSDKVersion=$env:WindowsSDKVersion"
+
+      # As build-windows.cmd (lld-link and llvm-lib come from clang-cl's directory: CMake looks there
+      # first), plus x86-64-v3 and the provenance shown in the window title and crash reports.
+      - name: Configure
+        env:
+          THIN_LTO: ${{ github.event_name == 'workflow_dispatch' && !inputs.thin_lto && 'OFF' || 'ON' }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $root = (Get-Location).Path -replace '\\', '/'
+          cmake -S . -B _Build/windows -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_C_COMPILER=$env:KYTY_LLVM/bin/clang-cl.exe" `
+            "-DCMAKE_CXX_COMPILER=$env:KYTY_LLVM/bin/clang-cl.exe" `
+            -DKYTY_BUILD_LAUNCHER=OFF `
+            -DKYTY_MARCH=x86-64-v3 `
+            "-DKYTY_THIN_LTO=$env:THIN_LTO" `
+            -DKYTY_BUILD_ORIGIN=Fork `
+            "-DKYTY_BUILD_REPOSITORY=$env:REPOSITORY" `
+            "-DFETCHCONTENT_SOURCE_DIR_XBYAK=$root/_Build/deps/xbyak-src" `
+            "-DFETCHCONTENT_SOURCE_DIR_ZYDIS=$root/_Build/deps/zydis-src"
+          Select-String -Path _Build/windows/CMakeCache.txt -Pattern '^(CMAKE_LINKER|CMAKE_AR|CMAKE_MT|KYTY_MARCH|KYTY_THIN_LTO|KYTY_NATIVE_OPT|KYTY_PGO_USE)[:=]' |
+            ForEach-Object { $_.Line } | Write-Host
+
+      - name: Build kyty_emulator
+        run: cmake --build _Build/windows --target kyty_emulator
+
+      - name: Build kyty_shader_precompile
+        run: cmake --build _Build/windows --target kyty_shader_precompile
+
+      - name: Assemble the artifact
+        id: artifact
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $build = '_Build/windows'
+          $out = '_Build/artifact'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item "$build/kyty_emulator.exe", "$build/kyty_shader_precompile.exe", "$build/libwinpthread-1.dll" $out
+          # The VC++ runtime this build was linked against. The package's copies may be older than this
+          # toolset's STL needs (an older msvcp140.dll next to a newer exe has crashed in std::mutex);
+          # newer ones also serve srt-aot.dll.
+          $crt = Get-ChildItem "$env:VCToolsRedistDir\x64\Microsoft.VC14*.CRT" -Directory | Select-Object -First 1
+          if (!$crt) { throw "no VC++ runtime under $env:VCToolsRedistDir" }
+          Copy-Item "$($crt.FullName)\msvcp140*.dll", "$($crt.FullName)\vcruntime140*.dll" $out
+          # Symbols when they are small (no /Z7: publics and line tables only).
+          Get-ChildItem "$build/*.pdb" | Where-Object Length -lt 100MB | Copy-Item -Destination $out
+          foreach ($exe in 'kyty_emulator.exe', 'kyty_shader_precompile.exe') {
+            Write-Host "== $exe imports"
+            dumpbin /nologo /dependents "$out/$exe" | Select-String '\.dll' | ForEach-Object { $_.Line.Trim() } | Write-Host
+          }
+          @(
+            "KytyPS5 Windows build of $env:REPOSITORY $env:REF_NAME $(git rev-parse HEAD)"
+            "Workflow run: $env:RUN_URL"
+            "clang-cl $env:LLVM_VERSION, MSVC $env:VCToolsVersion, Windows SDK $env:WindowsSDKVersion, Vulkan SDK $env:VULKAN_SDK_VERSION"
+            (Select-String -Path _Build/windows/CMakeCache.txt -Pattern '^(KYTY_MARCH|KYTY_THIN_LTO|KYTY_NATIVE_OPT|CMAKE_BUILD_TYPE)[:=]' |
+              ForEach-Object { $_.Line })
+            ''
+            'Copy these files over those of the portable package (keep its srt-aot.dll, seeds.seeds, launch.json,'
+            'scripts and _PipelineCache). The static pipeline store (_PipelineCache\static\<title>.binaries) is keyed'
+            'by the GPU and driver only, not by the build.'
+          ) | Set-Content "$out/BUILD-INFO.txt"
+          Get-ChildItem $out | Format-Table Name, Length -AutoSize | Out-String | Write-Host
+          # Artifact names cannot hold '/'.
+          "name=KytyPS5-tarkus-dev-$($env:REF_NAME -replace '[\\/:*?<>|"]', '-')" >> $env:GITHUB_OUTPUT
+
+      - name: Smoke test (--help)
+        continue-on-error: true
+        run: |
+          $process = Start-Process -FilePath _Build/artifact/kyty_emulator.exe -ArgumentList '--help' -NoNewWindow -PassThru
+          $null = $process.Handle # keeps the exit code readable
+          if (!$process.WaitForExit(60000)) { $process.Kill(); throw 'kyty_emulator --help did not exit in 60 s' }
+          if ($process.ExitCode -ne 0) { throw "kyty_emulator --help: exit code $($process.ExitCode)" }
+
+      - name: Upload
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: _Build/artifact/
+          if-no-files-found: error
