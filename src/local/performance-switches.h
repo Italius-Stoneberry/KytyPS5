@@ -1,11 +1,13 @@
 #pragma once
 // Runtime switches of the performance paths. Every path keeps the original
-// behaviour unless its environment variable is set; the GPU thread applies them
-// once, before it consumes commands. Values outside a switch's range abort.
+// behaviour unless its environment variable is set (but the KYTY_VRAM_* ones,
+// "auto" by default: on for GPUs under 10 GiB, vram-pressure.h); the GPU thread
+// applies them once, before it consumes commands. Values outside a switch's range abort.
 
 #include "native-buffer-residency.h"
 #include "local-platform.h"
 #include "native-resource-state.h"
+#include "vram-pressure.h"
 
 #include <array>
 #include <atomic>
@@ -88,6 +90,12 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
+	    // Video memory on 8 GB GPUs (vram-pressure.h): 0 off, 1 on, 2 auto (the default: on when the
+	    // device-local budget at start is under 10 GiB on a discrete GPU).
+	    Switch {"KYTY_VRAM_ADAPTIVE", &kyty_local_vram_adaptive_mode, 0, 2},
+	    Switch {"KYTY_IMAGE_POOL_TRIM", &kyty_local_image_pool_trim_mode, 0, 2},
+	    Switch {"KYTY_TEXTURE_GC_TIME", &kyty_local_texture_gc_time_mode, 0, 2},
+	    Switch {"KYTY_VRAM_LOG", &kyty_local_vram_log_mode, 0, 2},
 	    // Dispatches recorded per submission.
 	    Switch {"KYTY_DISPATCH_BATCH", &kyty_local_dispatch_batch, 1, 65536},
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
