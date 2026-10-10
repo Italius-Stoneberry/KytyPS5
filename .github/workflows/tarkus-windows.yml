@@ -107,13 +107,30 @@ jobs:
           "vsversion=$(([version]$pick.Vs.installationVersion).Major).0" >> $env:GITHUB_OUTPUT
           "toolset=$(if ($pick.Name -eq "$default".Trim()) { '' } else { $pick.Name })" >> $env:GITHUB_OUTPUT
           Write-Host "Visual Studio $($pick.Vs.installationVersion), MSVC $($pick.Name)"
-
-      - name: Visual Studio x64 environment (vcvars64)
-        uses: ilammy/msvc-dev-cmd@v1.13.0
-        with:
-          arch: x64
-          vsversion: ${{ steps.toolset.outputs.vsversion }}
-          toolset: ${{ steps.toolset.outputs.toolset }}
+          # The x64 developer environment (what vcvars64 sets) for the following steps. Done here, not with
+          # ilammy/msvc-dev-cmd: v1.13.0 does not find Visual Studio 2026 (18.x) on windows-latest.
+          $vcvars = Join-Path $pick.Vs.installationPath 'VC\Auxiliary\Build\vcvarsall.bat'
+          if (!(Test-Path -LiteralPath $vcvars)) { throw "no $vcvars" }
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          $lines = cmd /c "`"$vcvars`" x64 -vcvars_ver=$($pick.Name) >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw "vcvarsall x64 -vcvars_ver=$($pick.Name): exit code $LASTEXITCODE" }
+          $oldPath = $env:PATH -split ';'
+          $added = 0
+          foreach ($line in $lines) {
+            if ($line -notmatch '^([^=]+)=(.*)$') { continue }
+            $name, $value = $Matches[1], $Matches[2]
+            if ($name -ieq 'PATH') {
+              $new = @($value -split ';' | Where-Object { $_ -and $oldPath -notcontains $_ })
+              [array]::Reverse($new)
+              $new | ForEach-Object { $_ >> $env:GITHUB_PATH }
+              $added = $new.Count
+              continue
+            }
+            if ($before[$name] -ne $value) { "$name=$value" >> $env:GITHUB_ENV }
+          }
+          if (!($lines | Select-String -SimpleMatch 'VCToolsVersion=')) { throw 'vcvarsall set no VCToolsVersion' }
+          Write-Host "vcvarsall x64 -vcvars_ver=$($pick.Name): $added PATH entries"
 
       - name: Cache the LLVM installer
         uses: actions/cache@v5
